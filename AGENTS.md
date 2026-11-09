@@ -138,6 +138,8 @@ patterns, GPU ABIs, and jailbreak trust behavior are version-specific.
 | iPad13,7, iPadOS 16.6 | NathanLR | Ventura rootfs experiment | Unsupported: runtime-confirmed CoreTrust signing cannot admit the patched macOS shared-cache closure and AMFI rejects the helper; package install fails closed without `/var/jb/usr/bin/jbctl` |
 | Any other device/build | unknown | unknown | Porting target, not supported until its identities, ABI and runtime witnesses are added |
 
+iPad14,5 / iPadOS 16.5 (20F66) field notes (signing, CydiaSubstrate, `var/jb/usr` bind rules, `mount_bindfs`, WindowServer jetsam): see `docs/field-notes-ipad14-5-ipados16.5.md`.
+
 The current package structurally requires a Dopamine-compatible dynamic
 trustcache backend. Do not install or replace a user's jailbreak, and do not
 weaken the postinstall refusal on NathanLR to make installation appear to
