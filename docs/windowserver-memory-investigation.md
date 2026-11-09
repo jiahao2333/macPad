@@ -1,6 +1,8 @@
 # WindowServer 内存暴涨：代码调查（iPad14,5 / iPadOS 16.5）
 
 > 范围：只读源码，没有碰设备。下面的 GB/MB 数字只引用 `docs/field-notes-ipad14-5-ipados16.5.md` 里已经记下的现象，不是这次测的。代码能说明的是“哪些路径有上界、谁负责释放”，说不清那次 12.7–18.1 GB 每一页归谁。行号对应本分支的 HEAD。
+>
+> 例外：“实测结论 2026-11-09”一节是设备实测，数字来自那次的 MEMDIAG 日志和 jetsam 报告。
 
 ## 现象（引用 field notes）
 
@@ -8,7 +10,90 @@
 - 早期 `task_info` RSS 只有一百多 MB。也就是说增长主要落在 compressor 和 footprint 记账里，而不是常驻页。
 - plain-texture lease pool 峰值约 191 MB。整段会话 `MACWS-MEMORY-REAP` 一共只回收了几十到几百 MB。
 
+## 实测结论 2026-11-09
+
+> 来源：iPad14,5 上一次 `MACWS_MEMDIAG=1` 会话的 `WindowServer.err`（WindowServer pid 37803，10 秒一组采样）和随后的三份 `JetsamEvent-*.ips`。下表数字逐字摘自日志，没有换算。tick 10/11/18 是 memory-pressure 事件触发的额外采样。
+
+### 趋势（`MACWS-MEMDIAG` 主行 + `caches` 行 + `metal-total` 行）
+
+| tick | reason | phys_footprint | peak | internal | compressed | graphics_footprint | malloc_in_use | composite_stage_depth | owned_scanout | wscd_map | shadow_surfaces |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | start | 19.4MB | 25.4MB | 18.8MB | 0.0MB | 0.0MB | 15.1MB | 0 | 0.0MB | 0 | 0 |
+| 2 | timer | 21.2MB | 25.4MB | 20.4MB | 0.0MB | 0.0MB | 9.0MB | 0 | 0.0MB | 0 | 0 |
+| 3 | timer | 342.4MB | 353.7MB | 39.0MB | 0.0MB | 13.1MB | 16.6MB | 4 | 21.5MB | 0 | 0 |
+| 4 | timer | 431.0MB | 433.6MB | 88.4MB | 0.0MB | 32.3MB | 17.8MB | 18 | 21.5MB | 0 | 0 |
+| 5 | timer | 443.2MB | 445.1MB | 88.4MB | 0.0MB | 30.3MB | 18.8MB | 27 | 21.5MB | 0 | 0 |
+| 6 | timer | 540.4MB | 540.4MB | 91.8MB | 0.0MB | 34.8MB | 19.5MB | 37 | 21.5MB | 0 | 0 |
+| 7 | timer | 2724.9MB | 2724.9MB | 61.6MB | 44.6MB | 39.7MB | 21.3MB | 88 | 25.8MB | 0 | 0 |
+| 8 | timer | 9199.7MB | 9206.9MB | 46.1MB | 47.4MB | 33.9MB | 20.5MB | 319 | 25.8MB | 0 | 0 |
+| 9 | timer | 9192.4MB | 9206.9MB | 45.5MB | 46.9MB | 26.7MB | 20.3MB | 319 | 25.8MB | 0 | 0 |
+| 10 | pressure-critical | 9192.7MB | 9206.9MB | 45.9MB | 46.6MB | 26.7MB | 20.3MB | 320 | 25.8MB | 0 | 0 |
+| 11 | pressure-normal | 9192.6MB | 9206.9MB | 46.0MB | 46.4MB | 26.7MB | 20.1MB | 320 | 25.8MB | 0 | 0 |
+| 14 | timer | 9210.2MB | 9213.5MB | 64.4MB | 45.9MB | 35.7MB | 20.3MB | 329 | 25.8MB | 0 | 0 |
+| 18 | pressure-warn | 9201.8MB | 9213.5MB | 63.9MB | 45.9MB | 33.2MB | 20.3MB | 329 | 25.8MB | 0 | 0 |
+
+所有 tick 的 `composite_stage_contexts=1`、`composite_pending=0`、`shadow=0.0MB`、`disp_tracked=0`。
+
+被 hook 的 Metal 资源（`metal-total`）在暴涨区间里一直只有几百 MB：
+
+```
+tick=6 nonlease_live=109 nonlease=202.5MB lease_live=64 lease=18.4MB plain_native=17/0.0MB iosurf=15/90.8MB iosurf_owned=4/86.0MB buffer=73/25.7MB heap=0/0.0MB tracked=669 freed=496 bucket_overflow=0
+tick=7 nonlease_live=154 nonlease=218.8MB lease_live=102 lease=198.0MB plain_native=21/0.0MB iosurf=15/90.8MB iosurf_owned=7/99.0MB buffer=111/29.0MB heap=0/0.0MB tracked=1768 freed=1512 bucket_overflow=0
+tick=8 nonlease_live=224 nonlease=312.3MB lease_live=107 lease=199.0MB plain_native=62/0.0MB iosurf=40/184.2MB iosurf_owned=7/99.0MB buffer=115/29.0MB heap=0/0.0MB tracked=4297 freed=3966 bucket_overflow=0
+```
+
+读法：
+- `phys_footprint` 从 540.4MB（tick 6）到 9199.7MB（tick 8），同期能分项记账的部分（graphics ledger、malloc、compressed、被 hook 的 texture/buffer/heap）合计都在 500MB 以内。
+- 唯一同步暴涨的是 `composite_stage_depth`：37 → 88 → 319 → 329。tick 7→8 多了 231 层、footprint 多了 6474.8MB，约 28MB/层；tick 6→7 多了 51 层、footprint 多了 2184.5MB，约 43MB/层。一个 2388×1668 的 pf550（8 字节/像素）目标是 31,866,336 字节 ≈ 30.4MB，量级吻合。
+- `wscd_map=0`、`shadow_surfaces=0`：原 H1 里的 `g_wscd_tex` 和 H3 的 `shadowCache` 都被排除。
+- 被钉住的是 IOSurface 后备内存，记在 IOKit/footprint 上，不进 `graphics_footprint`，MACWS-MEMORY-REAP 也看不到，所以每次回收只回收一点。
+
+### Jetsam 报告（逐字）
+
+| 报告 | timestamp | largestProcess | WindowServer rpages | lifetimeMax | 被杀进程数（reason） |
+|---|---|---|---|---|---|
+| JetsamEvent-181827.ips | 2026-11-09 18:18:27.00 +0800 | WindowServer | 588467 | 589239 | 683（vm-compressor-space-shortage） |
+| JetsamEvent-181830.ips | 2026-11-09 18:18:30.00 +0800 | WindowServer | 588921 | 589661 | 155（vm-compressor-space-shortage） |
+| JetsamEvent-181840.ips | 2026-11-09 18:18:40.00 +0800 | WindowServer | 588912 | 589661 | 134（vm-compressor-space-shortage） |
+
+- `pageSize=16384`，所以 588912 页 = 9201.8MB，`lifetimeMax` 589661 页 = 9213.5MB，和 MEMDIAG 的 `peak=9213.5MB` 一致。
+- 最后一份里 WindowServer 自己被杀：`"reason" : "vm-compressor-space-shortage"`，`killDelta` 6326549。
+- 同一份里 rpages 第二名是 backboardd（3645 页），WindowServer 一个进程占了绝大部分。
+- 时间换算：18:18:27 +0800 = 02:18:27 PST。
+
+### 根因状态
+
+- **确认**：`g_vnc_composite_stages` 只压不弹。
+  - 压栈在 `macws_vnc_stage_composite`，从 `mac_hooks.m` 的三个 StartComposite hook（2483、2643、2694 行）调用，不受 VNC share 开关控制，`--no-vnc` 也会走。
+  - 弹栈只发生在 hook 过的 `MetalContext::EndCurrentComposite(bool)`（`mac_hooks.m:2707` → `macws_vnc_complete_composite`）。
+  - 最外层 `EndUpdate` 调的 `macws_vnc_finish_update` 以前只清 `g_vnc_composite_pending`，不清栈。
+- **推断**：SkyLight 有一部分 composite 不经过被 hook 的 `EndCurrentComposite` 就结束了，可能是另一个结束入口、内联路径，或者 bail 后直接 pop `_state_stack`。具体是哪条路径**还不知道**，需要后续用 LLDB 或者给 StartComposite/EndCurrentComposite 计数配对来定位。
+
+### 修复（默认开启）
+
+`libmachook/Metal_hooks.x`：
+- `macws_vnc_finish_update`（约 9989 行起）：在清 pending 的同一个 `@synchronized(g_vnc_composite_stages)` 里，把这个 MetalContext 的整个 stage 栈 `removeObjectForKey:` 掉，然后在锁外释放。数量累加到 `g_vnc_stages_drained_at_endupdate`。理由是最外层 EndUpdate 已经 Flush，这个 update 里的 composite 不可能还开着。
+- `macws_vnc_stage_composite`（约 9617 行起）：每个 context 的栈硬上限，默认 8。超出时先丢最旧的一层，因为配对的 End 弹的是最新的那层。被丢的层在锁外释放，数量累加到 `g_vnc_stages_capped`。
+- 新环境变量（`docs/runtime-switches.tsv` 登记为 production=off，`macws_diagnostic_flags.sh` 已用 `audit_runtime_switches.py --write-cleanup` 重新生成）：
+  - `MACWS_VNC_STAGE_DRAIN=0`：A/B 回滚，恢复旧的无界行为（不 drain、不封顶）。不设就是修复开启。
+  - `MACWS_VNC_STAGE_CAP=N`：1–4096 的十进制，覆盖默认上限 8；非法值仍用 8。
+  - 两个值都只在进程里读一次。和 `MACWS_MEMDIAG` 一样，`production_preflight` 会拒绝 WindowServer plist 里出现它们，所以只能在 preflight 之后临时加，用完删掉。正常启动不需要设置任何变量。
+- MEMDIAG 新增输出：
+  - `caches` 行：`stages_drained_at_endupdate=`、`stages_capped=`、`stage_drain=`、`stage_cap=`。
+  - 主行：`ledger_purgeable_nonvolatile=`、`ledger_purgeable_novolatile_compressed=`、`media_footprint=`、`media_footprint_compressed=`、`media_nofootprint=`、`neural_footprint=`、`neural_footprint_compressed=`、`neural_nofootprint=`、`vm_info_count=`。这些都是 TASK_VM_INFO REV3 的字段，内核返回的 count 小于 `TASK_VM_INFO_REV3_COUNT` 时打 0。
+
+**验证预期**：开 MEMDIAG 跑同样的会话，`composite_stage_depth` 应该一直 ≤ 8，`stages_drained_at_endupdate` 持续增长，`phys_footprint` 不再随它线性涨。如果 `stages_capped` 也一直在涨，说明单个 update 内的泄漏就超过 8 层，值得继续追那条不走 EndCurrentComposite 的路径。
+
+**要盯的回归**：macwsdisplayd 的 final-composite replay。这次日志里能看到 `#### FINAL-COMPOSITE replay-request ... freshness=source-fresh-replay-copy-completed published=YES sequence=8`。修复后要确认：
+- `published=YES` 照常出现，sequence 继续递增；
+- 不出现长时间的 `published=NO`、`source=unavailable` 或 `source-stale`；
+- 画面不冻结、不黑屏。
+
+原因是 pending 候选仍然只在 `macws_vnc_complete_composite` 里选，drain 只丢掉从来没被 End 配对的栈项。但如果 SkyLight 在 EndUpdate 之后才补 End，那一帧的候选就会丢。出现回归时先用 `MACWS_VNC_STAGE_DRAIN=0` 做 A/B 对照。
+
 ## 结论速览（按可能性排序）
+
+> 下面是实测之前只读代码时的排序，保留作记录。实测结果见上一节：H1 里的 `g_wscd_tex` 被排除，真正的泄漏是 H1 第 3 项 `g_vnc_composite_stages`，当时只读代码判断它可能性低，判断错了。
 
 | # | 假设 | 置信度 | 关键证据 |
 |---|---|---|---|
@@ -18,7 +103,7 @@
 | H4 | lease pool 在条目 busy 时超出预算 | 低（不是主因） | `Metal_hooks.x:13688`、`13724`；field notes 记的峰值约 191 MB |
 | H5 | 小块 heap 泄漏（`[desc copy]`、REDIRECT `self`、没有 autorelease pool 的线程） | 低 | `Metal_hooks.x:13163`、`24166-24205`、`12580` |
 
-**没有一条能单独被代码证明就是那 18 GB**，所以本分支没有加 mitigation，只加了诊断 `MACWS_MEMDIAG`（见后文）。要先用诊断把增长定位到一个桶，再决定改哪里。
+**没有一条能单独被代码证明就是那 18 GB**，所以本分支没有加 mitigation，只加了诊断 `MACWS_MEMDIAG`（见后文）。要先用诊断把增长定位到一个桶，再决定改哪里。（更新：2026-11-09 实测已经定位到 composite stage 栈，修复见“实测结论 2026-11-09”。）
 
 ## H1：composite 交接路径（中）
 
@@ -37,9 +122,10 @@ libmachook hook 了 SkyLight 的 `StartComposite*`、`EndCurrentComposite` 和 `
    - 每次 StartComposite 成功都会压栈（`Metal_hooks.x:9550`、`9560/9574`），只在 `EndCurrentComposite` 里弹出（`Metal_hooks.x:9578-9588`）。
    - `EndCurrentComposite` 和 `EndUpdate` 的 hook 在找不到符号时按 fallback offset 安装（`mac_hooks.m:~2880-2940`）。我在这台设备 rootfs 的 dyld cache 里核对过：SkyLight `__TEXT` 在 0x1850e5000，EndCurrentComposite 在 +0x14753c，EndUpdate 在 +0x1470b0，和 fallback offset 一致。
    - assert bypass 默认关闭（`mac_hooks.m:7639-7651`）。SkyLight 会在 `EndUpdate` 断言 `_state_stack.empty()`（`mac_hooks.m:2544`），composite 不配对就会 abort。所以这一项泄漏的可能性**低**，列出来只是因为它也是只靠配对来释放的 retain。
+   - **2026-11-09 更新：实测证明这一项就是主泄漏**（深度到 329，footprint 9.2 GB），说明 SkyLight 并不总经过被 hook 的 `EndCurrentComposite`，上面基于断言的推理不成立。见“实测结论 2026-11-09”。
 4. 被以上路径 retain 住的纹理，如果来自 lease pool，会一直处于 busy 状态，reaper 不会回收（`Metal_hooks.x:13565`）。这和“REAP 只回收几十 MB”的现象吻合，但不能证明就是这个原因。
 
-**候选修复（未实现，UNTESTED ON DEVICE）：**
+**候选修复（stage 那条已实现，见“实测结论 2026-11-09”；设备上未验证）：**
 - 在最外层 `EndUpdate` 把该 context 剩下的 stage 条目清掉。SkyLight 自己保证那时 state stack 为空，所以这样做是安全的。
 - 给 `g_wscd_tex` 加老化：按代数或时间淘汰，或者在 dest 释放时清理。
 
@@ -97,8 +183,8 @@ libmachook hook 了 SkyLight 的 `StartComposite*`、`EndCurrentComposite` 和 `
 所有输出都在 `/var/jb/var/mobile/WindowServer.err`，每 10 秒打一组，收到 memory pressure 事件时也打一组：
 
 ```
-#### MACWS-MEMDIAG tick=N reason=timer|pressure-* phys_footprint= peak= internal= compressed= resident= purgeable_volatile_resident= graphics_footprint= graphics_compressed= malloc_in_use= malloc_allocated=
-#### MACWS-MEMDIAG caches owned_scanout= wscd_map= composite_stage_contexts= composite_stage_depth= composite_pending= shadow_surfaces= shadow= disp_tracked=
+#### MACWS-MEMDIAG tick=N reason=timer|pressure-* phys_footprint= peak= internal= compressed= resident= purgeable_volatile_resident= graphics_footprint= graphics_compressed= malloc_in_use= malloc_allocated= ledger_purgeable_nonvolatile= ledger_purgeable_novolatile_compressed= media_footprint= media_footprint_compressed= media_nofootprint= neural_footprint= neural_footprint_compressed= neural_nofootprint= vm_info_count=
+#### MACWS-MEMDIAG caches owned_scanout= wscd_map= composite_stage_contexts= composite_stage_depth= composite_pending= shadow_surfaces= shadow= disp_tracked= stages_drained_at_endupdate= stages_capped= stage_drain= stage_cap=
 #### MACWS-MEMDIAG agx_life live=... full=...
 #### MACWS-MEMDIAG metal-total nonlease_live= nonlease= lease_live= ... tracked= freed= bucket_overflow=
 #### MACWS-MEMDIAG metal kind= storage= pf= live= bytes= created=     (前 24 个桶)
@@ -128,6 +214,7 @@ libmachook hook 了 SkyLight 的 `StartComposite*`、`EndCurrentComposite` 和 `
 
 ## 下一步
 
-1. 打开诊断跑一次会话，记下 footprint 上涨期间哪一行在跟着涨。
-2. 如果是 H1，实现上面的 `EndUpdate` 清理和 `g_wscd_tex` 老化，放在单独的 flag 后面，并在设备上验证。
-3. 如果是 H2，查 CA 的 purgeable 和 `SetPurgeable` 路径。
+1. ~~打开诊断跑一次会话~~（2026-11-09 已完成，定位到 composite stage 栈）。
+2. 装上带 stage drain/cap 的 libmachook，开 MEMDIAG 复跑同样的会话，确认 `composite_stage_depth ≤ 8`、footprint 平稳、final-composite 仍然 `published=YES`。
+3. 定位 SkyLight 不经过 `EndCurrentComposite` 就结束 composite 的那条路径，看能不能在源头配对。
+4. 如果修复后 footprint 仍然在涨，再看新增的 purgeable/media/neural ledger，以及 H2（CA 的 purgeable 和 `SetPurgeable` 路径）。

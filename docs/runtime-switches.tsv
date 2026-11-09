@@ -80,6 +80,8 @@ env	MACWS_AGX_KEEP_VALIDATE	off	A/B control	Retains an old validation branch whe
 env	MACWS_AGX_LIFE_STACK_LARGE	off	diagnostic	Large lifecycle backtraces.
 env	MACWS_AGX_LIFE_VERBOSE	off	diagnostic	Per-resource lifecycle logging.
 env	MACWS_MEMDIAG	off	diagnostic	When exactly 1 in WindowServer: periodic (10 s) and memory-pressure MACWS-MEMDIAG lines with TASK_VM_INFO footprint, malloc usage, libmachook cache sizes, AGX_LIFE totals and live Metal resource buckets; observation only.
+env	MACWS_VNC_STAGE_DRAIN	off	WindowServer leak-fix A/B rollback	Exactly 0 disables the VNC composite stage-stack bound (EndUpdate drain plus hard cap) and restores the old unbounded stack that leaked ~30 MB pf550 destinations per stage; absent means the fix is on.
+env	MACWS_VNC_STAGE_CAP	off	WindowServer leak-fix tuning override	Decimal 1-4096 overriding the default per-MetalContext VNC composite stage-stack cap of 8 (oldest entry dropped first); read once; invalid values keep 8; ignored when MACWS_VNC_STAGE_DRAIN=0.
 env	MACWS_AGX_NATIVE	on	macOS chroot native Metal	Defaults on without environment; all consumers share the cached native-driver policy. Explicit zero is a diagnostic opt-out.
 env	MACWS_AGX_NATIVE_NON2D	off	A/B control	Broad non-2D native texture allocation experiment.
 env	MACWS_AGX_NATIVE_PLAIN	off	inverse A/B control	Variable is absent in production; absence enables the validated native-plain policy.

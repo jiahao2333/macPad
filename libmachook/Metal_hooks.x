@@ -9557,6 +9557,63 @@ static _Atomic uint64_t g_vnc_poll_accept_count = 0;
 static _Atomic uint64_t g_vnc_poll_drop_count = 0;
 static _Atomic uint64_t g_vnc_poll_clean_count = 0;
 static _Atomic uint64_t g_vnc_poll_error_count = 0;
+
+// Composite stage-stack leak fix (2026-11-09, iPad14,5 MACWS_MEMDIAG run).
+// SkyLight closes some composites without reaching the hooked
+// MetalContext::EndCurrentComposite(bool), so the per-context stack only grew:
+// composite_stage_depth reached 329 and every entry retained a display-sized
+// pf550 destination (~30 MB IOSurface), driving WindowServer phys_footprint to
+// 9.2 GB and a vm-compressor-space-shortage jetsam.  Two bounds now apply:
+//   * the outermost EndUpdate (Flush) drains the context's whole stack, since
+//     no composite of that update can still be open after Flush;
+//   * the stack is hard-capped (default 8, MACWS_VNC_STAGE_CAP) and the oldest
+//     entry is dropped first, because the matching End pops the newest entry.
+// MACWS_VNC_STAGE_DRAIN=0 restores the old unbounded behaviour (A/B rollback
+// only).  Both environment values are read once per process.
+static _Atomic uint64_t g_vnc_stages_drained_at_endupdate = 0;
+static _Atomic uint64_t g_vnc_stages_capped = 0;
+#define MACWS_VNC_STAGE_CAP_DEFAULT 8u
+#define MACWS_VNC_STAGE_CAP_MAX 4096u
+
+static BOOL macws_vnc_stage_drain_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        const char *flag = getenv("MACWS_VNC_STAGE_DRAIN");
+        value = !(flag && strcmp(flag, "0") == 0);
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static NSUInteger macws_vnc_stage_cap(void) {
+    static _Atomic long cached = -1;
+    long value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = MACWS_VNC_STAGE_CAP_DEFAULT;
+        const char *text = getenv("MACWS_VNC_STAGE_CAP");
+        if (text && *text) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long parsed = strtoul(text, &end, 10);
+            if (errno == 0 && end && *end == '\0' && parsed >= 1 &&
+                parsed <= MACWS_VNC_STAGE_CAP_MAX)
+                value = (long)parsed;
+        }
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return (NSUInteger)value;
+}
+
+static uint64_t macws_vnc_stages_drained_at_endupdate(void) {
+    return atomic_load_explicit(&g_vnc_stages_drained_at_endupdate,
+                                memory_order_relaxed);
+}
+
+static uint64_t macws_vnc_stages_capped(void) {
+    return atomic_load_explicit(&g_vnc_stages_capped, memory_order_relaxed);
+}
+
 void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
     if (!context || !texture) return;
     static dispatch_once_t once;
@@ -9564,6 +9621,9 @@ void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
         g_vnc_composite_stages = [NSMutableDictionary new];
         g_vnc_composite_pending = [NSMutableDictionary new];
     });
+    BOOL bounded = macws_vnc_stage_drain_enabled();
+    NSUInteger cap = bounded ? macws_vnc_stage_cap() : 0;
+    NSMutableArray *dropped = nil;
     NSValue *key = [NSValue valueWithPointer:context];
     @synchronized(g_vnc_composite_stages) {
         NSMutableArray *stack = g_vnc_composite_stages[key];
@@ -9572,6 +9632,18 @@ void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
             g_vnc_composite_stages[key] = stack;
         }
         [stack addObject:texture];
+        if (bounded && [stack count] > cap) {
+            NSRange oldest = NSMakeRange(0, [stack count] - cap);
+            // Release the dropped destinations outside the lock: a texture
+            // dealloc can re-enter libmachook's allocator/lease hooks.
+            dropped = macws_vnc_retain([stack subarrayWithRange:oldest]);
+            [stack removeObjectsInRange:oldest];
+        }
+    }
+    if (dropped) {
+        atomic_fetch_add_explicit(&g_vnc_stages_capped, [dropped count],
+                                  memory_order_relaxed);
+        macws_vnc_release(dropped);
     }
 }
 
@@ -9923,9 +9995,26 @@ void macws_vnc_finish_update(void *context) {
         ? atomic_fetch_add(&g_vnc_finish_count, 1) + 1 : 0;
     NSValue *key = [NSValue valueWithPointer:context];
     id<MTLTexture> texture = nil;
+    NSMutableArray *drainedStages = nil;
+    BOOL drain = macws_vnc_stage_drain_enabled();
     @synchronized(g_vnc_composite_stages) {
         texture = macws_vnc_retain(g_vnc_composite_pending[key]);
         [g_vnc_composite_pending removeObjectForKey:key];
+        // Outermost EndUpdate has flushed this context; any stage still on
+        // its stack belongs to a composite SkyLight closed without the hooked
+        // EndCurrentComposite.  Drop it here (see macws_vnc_stage_composite).
+        if (drain) {
+            drainedStages = macws_vnc_retain(g_vnc_composite_stages[key]);
+            if (drainedStages)
+                [g_vnc_composite_stages removeObjectForKey:key];
+        }
+    }
+    if (drainedStages) {
+        NSUInteger drainedCount = [drainedStages count];
+        if (drainedCount)
+            atomic_fetch_add_explicit(&g_vnc_stages_drained_at_endupdate,
+                                      drainedCount, memory_order_relaxed);
+        macws_vnc_release(drainedStages);
     }
     if (!texture) {
         uint64_t missing = diagnostics
@@ -23448,6 +23537,10 @@ static double macws_memdiag_mb(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0);
 }
 
+static uint64_t macws_memdiag_ledger(BOOL available, int64_t value) {
+    return available && value > 0 ? (uint64_t)value : 0;
+}
+
 static void macws_memdiag_log(const char *reason) {
     @autoreleasepool {
         uint64_t tick = ++g_macws_memdiag_tick;
@@ -23464,7 +23557,13 @@ static void macws_memdiag_log(const char *reason) {
             "compressed=%.1fMB resident=%.1fMB "
             "purgeable_volatile_resident=%.1fMB "
             "graphics_footprint=%.1fMB graphics_compressed=%.1fMB "
-            "malloc_in_use=%.1fMB malloc_allocated=%.1fMB\n",
+            "malloc_in_use=%.1fMB malloc_allocated=%.1fMB "
+            "ledger_purgeable_nonvolatile=%.1fMB "
+            "ledger_purgeable_novolatile_compressed=%.1fMB "
+            "media_footprint=%.1fMB media_footprint_compressed=%.1fMB "
+            "media_nofootprint=%.1fMB neural_footprint=%.1fMB "
+            "neural_footprint_compressed=%.1fMB neural_nofootprint=%.1fMB "
+            "vm_info_count=%u\n",
             (unsigned long long)tick, reason, kr,
             macws_memdiag_mb(vm.phys_footprint),
             macws_memdiag_mb(ledgers && vm.ledger_phys_footprint_peak > 0
@@ -23479,7 +23578,26 @@ static void macws_memdiag_log(const char *reason) {
                 vm.ledger_tag_graphics_footprint_compressed > 0
                 ? (uint64_t)vm.ledger_tag_graphics_footprint_compressed : 0),
             macws_memdiag_mb(heap.size_in_use),
-            macws_memdiag_mb(heap.size_allocated));
+            macws_memdiag_mb(heap.size_allocated),
+            // REV3 ledgers (purgeable and tagged media/neural); zero when the
+            // kernel returned a shorter TASK_VM_INFO.
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_purgeable_nonvolatile)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_purgeable_novolatile_compressed)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_media_footprint)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_media_footprint_compressed)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_media_nofootprint)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_neural_footprint)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_neural_footprint_compressed)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_neural_nofootprint)),
+            (unsigned)count);
 
         // libmachook-owned caches outside MACWS-MEMORY-REAP.
         NSUInteger ownedBytes = 0, wscd = 0, stageContexts = 0;
@@ -23521,12 +23639,19 @@ static void macws_memdiag_log(const char *reason) {
             "#### MACWS-MEMDIAG caches tick=%llu owned_scanout=%.1fMB "
             "wscd_map=%lu composite_stage_contexts=%lu "
             "composite_stage_depth=%lu composite_pending=%lu "
-            "shadow_surfaces=%lu shadow=%.1fMB disp_tracked=%lu\n",
+            "shadow_surfaces=%lu shadow=%.1fMB disp_tracked=%lu "
+            "stages_drained_at_endupdate=%llu stages_capped=%llu "
+            "stage_drain=%d stage_cap=%lu\n",
             (unsigned long long)tick, macws_memdiag_mb(ownedBytes),
             (unsigned long)wscd, (unsigned long)stageContexts,
             (unsigned long)stageDepth, (unsigned long)pending,
             (unsigned long)shadowCount, macws_memdiag_mb(shadowBytes),
-            (unsigned long)dispTracked);
+            (unsigned long)dispTracked,
+            (unsigned long long)macws_vnc_stages_drained_at_endupdate(),
+            (unsigned long long)macws_vnc_stages_capped(),
+            macws_vnc_stage_drain_enabled() ? 1 : 0,
+            (unsigned long)(macws_vnc_stage_drain_enabled()
+                ? macws_vnc_stage_cap() : 0));
 
         char agx[384] = {0};
         if (macws_agx_life_memdiag_format(agx, sizeof(agx)) > 0) {
