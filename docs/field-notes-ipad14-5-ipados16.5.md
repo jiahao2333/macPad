@@ -235,4 +235,21 @@
    - 回滚：`/var/mobile/macws-rollback/launchdchrootexec.pre-ssl-*`、`macos_gui.sh.pre-ssl-*`、`bashrc.pre-ssl-*`。
    - 未决：SecureTransport 本身仍 -9808（仅影响 ST 客户端；GUI 走 Network.framework）。完整修 ST 需 macOS securityd/keychain/trustd 私有名栈，另开。
 
+## 14. HTTPS defaults + Safari WebKit transport (2026-11-10 Asia/Shanghai)
 
+### HTTPS (done — commit `a868f70`)
+- Plain `curl https://www.baidu.com` in chroot returns HTTP 200 with validation ON.
+- Mechanism: `launchdchrootexec` sets `SSL_CERT_FILE=/etc/ssl/cert.pem` + `CURL_SSL_BACKEND=openssl` when unset; `/etc/curlrc` / ensure script wired from `macos_gui.sh`.
+- NSURLSession/GUI already OK. SecureTransport `SSLHandshake` still `errSSLBadCert` (-9808); full securityd/trustd/keychain repair remains open (do **not** disable validation).
+
+### Safari WebKit (partial — this commit)
+Root causes found while bringing up WebKitChrootProxy:
+1. Fat `libmachook` DYLD_INSERT kills Safari (need thin arm64e + arm64).
+2. Cryptex WebKit XPC binaries: AMFI `unsuitable CT policy 0x8` / `Unrecoverable CT signature issue` after ldid — copy **thin arm64e** into non-cryptex `/usr/local/libexec/macws-webkit/*.xpc/Contents/...` with stock Info.plist, project+native entitlements merge, trustcache.
+3. Geod-style LaunchDaemon MachServices are wrong for Application-type WebKit (`NSRunLoop` / `ServiceType=Application`): exits `An XPC Service cannot be run directly.` Use DockHelper-style `xpc_add_bundle` + `xpc_connection_create(macosbooter.*)`.
+4. Proxies must be `root:wheel` setuid (mobile-owned setuid → euid mobile → chroot exit 111).
+
+Working now: Safari launches with remapped hooks; **SandboxBroker runs inside chroot** at `macws-webkit/.../SandboxBroker`. open-documents delivers `.webloc` URLs.
+Still open: macOS **WebContent/Networking/GPU** do not stay up — page chrome/load incomplete. `GIGACAGE_ENABLED=0` is only a **temporary diagnostic** in the WebKit proxy env (and was on unloaded LaunchDaemon plists); real JSC Gigacage reservation fix still required. Safari mach-lookup entitlement expansion via ldid previously SIGKILL'd Safari before AppKit window — revisit carefully.
+
+Rollback: `/var/mobile/macws-rollback/` + NOTES.txt (libmachook pre-webkit/pre-thin, Safari.pre-webkit-*, `*.pre-webkit-resign-*`, macws-webkit copies).

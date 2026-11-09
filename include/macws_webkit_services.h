@@ -12,12 +12,12 @@ typedef struct {
 } MacWSWebKitService;
 static const MacWSWebKitService MacWSWebKitServices[] = {
     {"com.apple.WebKit.WebContent", "com.apple.macosbooter.WebKit.WebContent", "WebContentProxy",
-     "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent"},
+     "/usr/local/libexec/macws-webkit/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent"},
     {"com.apple.WebKit.Networking", "com.apple.macosbooter.WebKit.Networking", "WebNetworkingProxy",
-     "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking"},
+     "/usr/local/libexec/macws-webkit/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking"},
     {"com.apple.WebKit.GPU", "com.apple.macosbooter.WebKit.GPU", "WebGPUProxy",
-     "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"},
+     "/usr/local/libexec/macws-webkit/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"},
     {"com.apple.Safari.SandboxBroker", "com.apple.macosbooter.Safari.SandboxBroker", "SafariSandboxProxy",
-     "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app/Contents/XPCServices/com.apple.Safari.SandboxBroker.xpc/Contents/MacOS/com.apple.Safari.SandboxBroker"},
+     "/usr/local/libexec/macws-webkit/com.apple.Safari.SandboxBroker.xpc/Contents/MacOS/com.apple.Safari.SandboxBroker"},
 };
 #endif

@@ -319,6 +319,23 @@ int main(int argc, char *argv[], char *envp[]) {
     } else {
         targetEnvironment[environmentCount++] = insertLibrary;
     }
+    // TEMPORARY diagnostic for WebKit JSC Gigacage reservation failure on
+    // iPadOS (see WebKitChrootProxy/README). Real cage/allocator fix still
+    // required; remove once Gigacage maps succeed without this guard.
+#if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
+    {
+        static char gigacageOff[] = "GIGACAGE_ENABLED=0";
+        int isWebKit = 0;
+        for (unsigned i = 0; i < sizeof(MacWSWebKitServices) / sizeof(MacWSWebKitServices[0]); ++i) {
+            if (target && MacWSStringContains(target, MacWSWebKitServices[i].target))
+                isWebKit = 1;
+        }
+        if (isWebKit) {
+            if (environmentCount + 1 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
+            targetEnvironment[environmentCount++] = gigacageOff;
+        }
+    }
+#endif
     targetEnvironment[environmentCount++] = home;
     targetEnvironment[environmentCount++] = temporaryDirectory;
     targetEnvironment[environmentCount++] = nanoZone;

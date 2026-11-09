@@ -14210,8 +14210,47 @@ static void macws_register_dock_helper_bundle_if_needed(void) {
              "/var/jb/usr/macOS/Frameworks");
     xpc_add_bundle(path, 2);
 }
+
+// Safari WebKit XPC services are Application-type (_MultipleInstances +
+// NSRunLoop), same activation class as DockHelper. A permanent launchd Mach
+// listener cannot preserve xpcproxy's per-instance NSApplication context and
+// exits with "An XPC Service cannot be run directly." Register the freestanding
+// chroot proxy bundles so xpc_connection_create activates them on demand.
+static void macws_register_webkit_bundle_if_needed(const char *proxyLeaf) {
+    if (!proxyLeaf) return;
+    typedef struct {
+        const char *leaf;
+        _Atomic bool registered;
+    } MacWSWebKitBundleSlot;
+    static MacWSWebKitBundleSlot slots[] = {
+        {"WebContentProxy.xpc", false},
+        {"WebNetworkingProxy.xpc", false},
+        {"WebGPUProxy.xpc", false},
+        {"SafariSandboxProxy.xpc", false},
+    };
+    for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); i++) {
+        if (strcmp(slots[i].leaf, proxyLeaf) != 0) continue;
+        if (atomic_exchange_explicit(&slots[i].registered, true,
+                                     memory_order_acq_rel))
+            return;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path),
+                 "%s/WebKit.framework/Versions/A/XPCServices/%s",
+                 "/var/jb/usr/macOS/Frameworks", proxyLeaf);
+        xpc_add_bundle(path, 2);
+        return;
+    }
+}
 #define GEOD_XPC_SERVICE "com.apple.geod"
 #define GEOD_XPC_SERVICE_NEW "com.apple.macosbooter.geod"
+#define WEBKIT_WEBCONTENT_SERVICE "com.apple.WebKit.WebContent"
+#define WEBKIT_WEBCONTENT_SERVICE_NEW "com.apple.macosbooter.WebKit.WebContent"
+#define WEBKIT_NETWORKING_SERVICE "com.apple.WebKit.Networking"
+#define WEBKIT_NETWORKING_SERVICE_NEW "com.apple.macosbooter.WebKit.Networking"
+#define WEBKIT_GPU_SERVICE "com.apple.WebKit.GPU"
+#define WEBKIT_GPU_SERVICE_NEW "com.apple.macosbooter.WebKit.GPU"
+#define SAFARI_SANDBOX_BROKER_SERVICE "com.apple.Safari.SandboxBroker"
+#define SAFARI_SANDBOX_BROKER_SERVICE_NEW "com.apple.macosbooter.Safari.SandboxBroker"
 #define DISKARBITRATIOND_SERVICE_ORIG \
     "com.apple.DiskArbitration.diskarbitrationd"
 #define DISKARBITRATIOND_SERVICE_NEW \
@@ -14449,6 +14488,14 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
     // com.apple.geod executable.
     if (!strcmp(name, GEOD_XPC_SERVICE))
         return GEOD_XPC_SERVICE_NEW;
+    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
+        return WEBKIT_WEBCONTENT_SERVICE_NEW;
+    if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
+        return WEBKIT_NETWORKING_SERVICE_NEW;
+    if (!strcmp(name, WEBKIT_GPU_SERVICE))
+        return WEBKIT_GPU_SERVICE_NEW;
+    if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
+        return SAFARI_SANDBOX_BROKER_SERVICE_NEW;
     // CoreFoundation's Ventura _CFVolumeObserver asks DiskArbitration for the
     // initial mounted-volume set and a terminal "existing events received"
     // event.  Runtime sampling of the stock Ventura sharedfilelistd on
@@ -15411,6 +15458,26 @@ xpc_connection_t macws_xpc_connection_create_early(
         return macws_xpc_connection_create_mach_service_raw(
             GEOD_XPC_SERVICE_NEW, targetq, 0);
     }
+    // Safari WebKit XPC services: iPadOS owns the public WebKit names for
+    // MobileSafari. Application-type proxies (WebKitChrootProxy) are activated
+    // via xpc_add_bundle like DockHelper so xpcproxy preserves the one-shot
+    // per-instance NSRunLoop/NSApplication context across chroot+exec.
+    if (name && !strcmp(name, WEBKIT_WEBCONTENT_SERVICE)) {
+        macws_register_webkit_bundle_if_needed("WebContentProxy.xpc");
+        return xpc_connection_create(WEBKIT_WEBCONTENT_SERVICE_NEW, targetq);
+    }
+    if (name && !strcmp(name, WEBKIT_NETWORKING_SERVICE)) {
+        macws_register_webkit_bundle_if_needed("WebNetworkingProxy.xpc");
+        return xpc_connection_create(WEBKIT_NETWORKING_SERVICE_NEW, targetq);
+    }
+    if (name && !strcmp(name, WEBKIT_GPU_SERVICE)) {
+        macws_register_webkit_bundle_if_needed("WebGPUProxy.xpc");
+        return xpc_connection_create(WEBKIT_GPU_SERVICE_NEW, targetq);
+    }
+    if (name && !strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE)) {
+        macws_register_webkit_bundle_if_needed("SafariSandboxProxy.xpc");
+        return xpc_connection_create(SAFARI_SANDBOX_BROKER_SERVICE_NEW, targetq);
+    }
     return xpc_connection_create(name, targetq);
 }
 
@@ -15552,6 +15619,31 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                     "com.macwsguide.quicklook-satellite") == 0) {
         privateMachService = QUICKLOOK_SATELLITE_NEW;
         (void)macws_install_qlsatellite_connection_owner();
+    } else if (program &&
+               (!strcmp(program, "com.apple.WebKit.WebContent") ||
+                !strcmp(program, "com.apple.WebKit.Networking") ||
+                !strcmp(program, "com.apple.WebKit.GPU") ||
+                !strcmp(program, "com.apple.Safari.SandboxBroker")) &&
+               service &&
+               (!strcmp(service, "com.macwsguide.webkit.webcontent") ||
+                !strcmp(service, "com.macwsguide.webkit.networking") ||
+                !strcmp(service, "com.macwsguide.webkit.gpu") ||
+                !strcmp(service, "com.macwsguide.safari.sandboxbroker") ||
+                !strcmp(service, WEBKIT_WEBCONTENT_SERVICE_NEW) ||
+                !strcmp(service, WEBKIT_NETWORKING_SERVICE_NEW) ||
+                !strcmp(service, WEBKIT_GPU_SERVICE_NEW) ||
+                !strcmp(service, SAFARI_SANDBOX_BROKER_SERVICE_NEW))) {
+        // Application-type WebKit proxies usually keep xpcproxy context via
+        // xpc_add_bundle. Adapt xpc_main as a fallback when that context is
+        // lost across chroot+exec (same pattern as HIServices).
+        if (!strcmp(program, "com.apple.WebKit.WebContent"))
+            privateMachService = WEBKIT_WEBCONTENT_SERVICE_NEW;
+        else if (!strcmp(program, "com.apple.WebKit.Networking"))
+            privateMachService = WEBKIT_NETWORKING_SERVICE_NEW;
+        else if (!strcmp(program, "com.apple.WebKit.GPU"))
+            privateMachService = WEBKIT_GPU_SERVICE_NEW;
+        else
+            privateMachService = SAFARI_SANDBOX_BROKER_SERVICE_NEW;
     }
     if (privateMachService && getuid() == 0 && geteuid() == 0) {
         xpc_connection_t listener =

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- NOT the default activation path: WebKit/Safari SandboxBroker are Application-type XPC; libmachook uses xpc_add_bundle like DockHelper. These Geod-style MachServices plists are retained for experiments only; GIGACAGE_ENABLED=0 here is a temporary diagnostic guard, not the Gigacage fix. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.macwsguide.webkit.gpu</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/var/jb/usr/macOS/Frameworks/WebKit.framework/Versions/A/XPCServices/WebGPUProxy.xpc/WebGPUProxy</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.macosbooter.WebKit.GPU</key>
+        <true/>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XPC_SERVICE_NAME</key><string>com.macwsguide.webkit.gpu</string>
+        <key>MACWS_AGX_NATIVE</key><string>1</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/var/jb/var/mobile/com.macwsguide.webkit.gpu.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/jb/var/mobile/com.macwsguide.webkit.gpu.log</string>
+</dict>
+</plist>
