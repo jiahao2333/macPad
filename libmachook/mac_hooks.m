@@ -16640,6 +16640,14 @@ DYLD_INTERPOSE(macws_IOSurfaceGetAddressFormatOfPlane,
 // CFGetTypeID == CFDictionaryGetTypeID, and (b) gate the rewrite on the
 // IOSurfaceName key being EXACTLY "CA Framebuffer" plus the FourCC's high byte
 // being 0x26 (Apple compression marker), which excludes every other surface.
+// MACWS_MEMDIAG purgeable census (Diagnostics/MacWSPurgeableDiag.m).
+extern IOSurfaceRef macws_purgediag_api_surface(IOSurfaceRef surface);
+extern void macws_purgediag_ioconnect(io_connect_t c, uint32_t selector,
+    const uint64_t *in, uint32_t inCnt, const uint64_t *out,
+    const uint32_t *outCnt, const void *outStruct, const size_t *outStructCnt,
+    IOReturn r, int isIOGPU, void *returnAddress);
+extern void macws_purgediag_release(io_connect_t c, uint32_t surfaceID,
+    IOReturn r);
 IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     bool traceIOSurfaceCreate = getenv("MACWS_IOSURF_TRACE") != NULL;
     if (traceIOSurfaceCreate) {
@@ -16779,7 +16787,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     // CoreImage sometimes passes a CFDictionary whose -objectForKey: is not a
     // real NSDictionary bridge — fall back to the raw CFDictionaryGetValue.
     if (CFGetTypeID(properties_cf) != CFDictionaryGetTypeID()) {
-        return IOSurfaceCreate(properties_cf);
+        return macws_purgediag_api_surface(IOSurfaceCreate(properties_cf));
     }
     CFNumberRef pfNum = (CFNumberRef)CFDictionaryGetValue(properties_cf,
         (const void *)CFSTR("IOSurfacePixelFormat"));
@@ -16795,7 +16803,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
         is_ca_fb = (CFStringCompare(name, CFSTR("CA Framebuffer"), 0) == kCFCompareEqualTo);
     }
     if (!(is_apple_compressed && is_ca_fb)) {
-        return IOSurfaceCreate(properties_cf);
+        return macws_purgediag_api_surface(IOSurfaceCreate(properties_cf));
     }
     // Rebuild as plain BGRA8 — drop the compression-metadata plane and the
     // private FourCC so MTLSimDriverHost can wrap it as MTLPixelFormatBGRA8Unorm.
@@ -16805,7 +16813,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     if (wNum && CFGetTypeID(wNum) == CFNumberGetTypeID()) CFNumberGetValue(wNum, kCFNumberSInt32Type, &w);
     if (hNum && CFGetTypeID(hNum) == CFNumberGetTypeID()) CFNumberGetValue(hNum, kCFNumberSInt32Type, &h);
     if (w <= 0 || h <= 0) {
-        return IOSurfaceCreate(properties_cf);
+        return macws_purgediag_api_surface(IOSurfaceCreate(properties_cf));
     }
     const int bpe = 4;                         // BGRA8 = 4 bytes/pixel
     size_t bytesPerRow = (size_t)w * (size_t)bpe;
@@ -16840,7 +16848,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     IOSurfaceRef result = IOSurfaceCreate((CFDictionaryRef)np);
     fprintf(stderr, "#### IOSURF/CA_FB rewrote %dx%d pf=0x%x->BGRA8 result=%p\n",
         w, h, pf, (void *)result);
-    return result;
+    return macws_purgediag_api_surface(result);
 }
 DYLD_INTERPOSE(IOSurfaceCreate_safe, IOSurfaceCreate);
 
@@ -22223,6 +22231,14 @@ struct macws_iosurface_release_pair {
 static __thread struct macws_iosurface_release_pair
     g_macws_iosurface_release_pair;
 
+enum {
+    MACWS_IOSURFACE_RELEASE_UNKNOWN = 0,
+    MACWS_IOSURFACE_RELEASE_SELECTOR1 = 1,
+    MACWS_IOSURFACE_RELEASE_NATIVE = 2,
+};
+static _Atomic int g_macws_iosurface_release_mode =
+    MACWS_IOSURFACE_RELEASE_UNKNOWN;
+
 static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
                                      const uint8_t expected[16]) {
     if (!header || header->magic != MH_MAGIC_64)
@@ -22373,11 +22389,49 @@ kern_return_t IOConnectTrap1_new(io_connect_t connect, uint32_t index,
     BOOL exact_second = exact_image && return_offset == 0x4bf4 &&
         call_instruction == 0x940035fe && index == 5;
 
+    // The selector-1 translation is only correct for kernels whose own
+    // IOSurface framework releases with IOConnectCallMethod(conn, 1, ...).
+    // iOS 16.5 (iPad14,5 20F66; static disasm of its dyld cache 2026-11-09)
+    // uses exactly the macOS trap pair, IOConnectTrap1(conn, 4/5, surfaceID),
+    // and rejects selector 1 for every surface: MACWS_MEMDIAG recorded
+    // 476/476 failed releases while WindowServer's mapped nonvolatile
+    // IOSurface memory grew to 4.5 GB within 20 s of opening Weather.
+    // Decide once, functionally: the first pair tries selector 1; if the
+    // kernel rejects it, the same surface is released with the native
+    // traps and, when trap 5 succeeds, every later pair is passed through
+    // unchanged.  A kernel that accepts selector 1 keeps the translation.
+    int release_mode = atomic_load_explicit(&g_macws_iosurface_release_mode,
+                                            memory_order_acquire);
+    if (release_mode == MACWS_IOSURFACE_RELEASE_NATIVE &&
+        (exact_first || exact_second)) {
+        // A pair whose first half was swallowed before the mode was decided
+        // still owes the kernel its trap 4.
+        if (exact_second && g_macws_iosurface_release_pair.armed &&
+            g_macws_iosurface_release_pair.connect == connect &&
+            g_macws_iosurface_release_pair.surface_id == p1)
+            IOConnectTrap1(connect, 4, p1);
+        g_macws_iosurface_release_pair.armed = NO;
+        kern_return_t result = IOConnectTrap1(connect, index, p1);
+        if (exact_second)
+            macws_purgediag_release(connect, (uint32_t)p1, result);
+        if (result != KERN_SUCCESS) {
+            static _Atomic unsigned long native_failures = 0;
+            unsigned long n = atomic_fetch_add(&native_failures, 1) + 1;
+            if (n <= 16 || (n % 500) == 0)
+                dprintf(STDERR_FILENO,
+                    "#### IOSURFACE-RELEASE-ABI native trap%u failure #%lu: "
+                    "conn=%u surfaceID=%llu -> %#x\n", index, n, connect,
+                    (unsigned long long)p1, result);
+        }
+        return result;
+    }
+
     if (exact_first) {
         g_macws_iosurface_release_pair =
             (struct macws_iosurface_release_pair){connect, p1, YES};
-        // iOS has no first operation.  Its sole release selector belongs at
-        // the second call site, after macOS has released client+0x60.
+        // iOS 16.3 has no first operation.  Its sole release selector
+        // belongs at the second call site, after macOS has released
+        // client+0x60.
         return KERN_SUCCESS;
     }
 
@@ -22388,16 +22442,44 @@ kern_return_t IOConnectTrap1_new(io_connect_t connect, uint32_t index,
         uint64_t surface_id = p1;
         kern_return_t result = IOConnectCallScalarMethod(
             connect, 1, &surface_id, 1, NULL, NULL);
+        if (release_mode == MACWS_IOSURFACE_RELEASE_UNKNOWN) {
+            if (result == KERN_SUCCESS) {
+                atomic_store_explicit(&g_macws_iosurface_release_mode,
+                    MACWS_IOSURFACE_RELEASE_SELECTOR1, memory_order_release);
+                dprintf(STDERR_FILENO,
+                    "#### IOSURFACE-RELEASE-ABI mode=selector1 (sel=1 accepted "
+                    "for surfaceID=%llu)\n", (unsigned long long)p1);
+            } else {
+                kern_return_t trap4 = IOConnectTrap1(connect, 4, p1);
+                kern_return_t trap5 = IOConnectTrap1(connect, 5, p1);
+                if (trap5 == KERN_SUCCESS) {
+                    atomic_store_explicit(&g_macws_iosurface_release_mode,
+                        MACWS_IOSURFACE_RELEASE_NATIVE, memory_order_release);
+                }
+                dprintf(STDERR_FILENO,
+                    "#### IOSURFACE-RELEASE-ABI probe surfaceID=%llu sel=1 -> "
+                    "%#x; native trap4 -> %#x trap5 -> %#x; mode=%s\n",
+                    (unsigned long long)p1, result, trap4, trap5,
+                    trap5 == KERN_SUCCESS ? "native-traps" : "undecided");
+                if (trap5 == KERN_SUCCESS) result = KERN_SUCCESS;
+            }
+        }
+        macws_purgediag_release(connect, (uint32_t)p1, result);
         static _Atomic unsigned long release_count = 0;
         unsigned long release_n = macws_runtime_diagnostics_enabled()
             ? atomic_fetch_add(&release_count, 1) + 1 : 0;
         if ((release_n &&
              (release_n <= 16 || (release_n % 250) == 0)) ||
             result != KERN_SUCCESS) {
-            fprintf(stderr,
-                "#### IOSURFACE-RELEASE-ABI pair #%lu: conn=%u "
-                "surfaceID=%llu sel=1 -> %#x\n",
-                release_n, connect, (unsigned long long)p1, result);
+            static _Atomic unsigned long failure_count = 0;
+            unsigned long failure_n = result != KERN_SUCCESS
+                ? atomic_fetch_add(&failure_count, 1) + 1 : 0;
+            if (release_n || failure_n <= 16 || (failure_n % 500) == 0)
+                dprintf(STDERR_FILENO,
+                    "#### IOSURFACE-RELEASE-ABI pair #%lu: conn=%u "
+                    "surfaceID=%llu sel=1 -> %#x (failures=%lu)\n",
+                    release_n, connect, (unsigned long long)p1, result,
+                    failure_n);
         }
         return result;
     }
@@ -23727,6 +23809,11 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         }
     }
     if (qbuf) free(qbuf);
+    if (macws_memdiag_enabled())
+        macws_purgediag_ioconnect(client, selector, in, inCnt, out, outCnt,
+                                  outStruct, outStructCnt, r,
+                                  IOConnectIsIOGPU(client) ? 1 : 0,
+                                  __builtin_return_address(0));
     return r;
 }
 IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt) {

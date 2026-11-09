@@ -23541,6 +23541,7 @@ static uint64_t macws_memdiag_ledger(BOOL available, int64_t value) {
     return available && value > 0 ? (uint64_t)value : 0;
 }
 
+extern void macws_purgediag_log(unsigned long long tick);
 static void macws_memdiag_log(const char *reason) {
     @autoreleasepool {
         uint64_t tick = ++g_macws_memdiag_tick;
@@ -23729,6 +23730,7 @@ static void macws_memdiag_log(const char *reason) {
                 (unsigned long long)snapshot[best].created);
             snapshot[best].live = 0;
         }
+        macws_purgediag_log((unsigned long long)tick);
     }
 }
 
@@ -23784,8 +23786,8 @@ static void macws_memdiag_install(Class agx) {
         dispatch_source_t timer = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
         dispatch_source_set_timer(timer,
-            dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
-            10 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+            dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+            5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
         dispatch_source_set_event_handler(timer, ^{
             macws_memdiag_log("timer");
         });
@@ -23806,7 +23808,7 @@ static void macws_memdiag_install(Class agx) {
             dispatch_resume(pressure);
         }
         dprintf(STDERR_FILENO,
-            "#### MACWS-MEMDIAG enabled pid=%d prog=%s agx=%s interval=10s "
+            "#### MACWS-MEMDIAG enabled pid=%d prog=%s agx=%s interval=5s "
             "pressure=%s\n", getpid(), getprogname() ?: "?",
             class_getName(agx), pressure ? "yes" : "no");
         macws_memdiag_log("start");
