@@ -86,6 +86,8 @@ int main(int argc, char *argv[], char *envp[]) {
     // use its LibreSSL backend instead, which validates against the system
     // PEM bundle without disabling verification. Only set when unset so an
     // explicit caller override still wins.
+    // Harmless fallback after system trustd/securityd remap (field notes §15):
+    // SecureTransport should work without these; LibreSSL PEM path remains available.
     if (!getenv("SSL_CERT_FILE"))
         setenv("SSL_CERT_FILE", "/etc/ssl/cert.pem", 0);
     if (!getenv("CURL_SSL_BACKEND"))

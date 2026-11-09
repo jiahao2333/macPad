@@ -136,6 +136,23 @@ static int MacWSIsAuthdTarget(const char *target) {
         MacWSStringContains(authdTarget, target);
 }
 
+// Narrow allow-list for system trust/keychain daemons. Exact path match only —
+// do not accept arbitrary MACWS_XPC_TARGET values.
+static int MacWSIsExactPath(const char *target, const char *expected) {
+    if (!target || !expected) return 0;
+    const char *a = target, *b = expected;
+    while (*a && *b && *a == *b) { a++; b++; }
+    return !*a && !*b;
+}
+
+static int MacWSIsTrustdTarget(const char *target) {
+    return MacWSIsExactPath(target, "/usr/libexec/trustd");
+}
+
+static int MacWSIsSecuritydTarget(const char *target) {
+    return MacWSIsExactPath(target, "/usr/sbin/securityd");
+}
+
 static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
 #if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
     for (unsigned i = 0; i < sizeof(MacWSWebKitServices) / sizeof(MacWSWebKitServices[0]); ++i)
@@ -176,6 +193,15 @@ static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
         "XPCServices/authd.xpc/Contents/MacOS/authd";
     if (xpcTarget && MacWSIsAuthdTarget(xpcTarget)) {
         return authdTarget;
+    }
+    // System-wide TLS/keychain: iPadOS owns public trustd/securityd names.
+    // Publish Ventura binaries on macosbooter.* (see macos_gui.sh) and enter
+    // chroot through this same freestanding first image.
+    if (xpcTarget && MacWSIsTrustdTarget(xpcTarget)) {
+        return "/usr/libexec/trustd";
+    }
+    if (xpcTarget && MacWSIsSecuritydTarget(xpcTarget)) {
+        return "/usr/sbin/securityd";
     }
     if (MacWSStringContains(program, "SettingsExtensionProxy")) {
         return "/System/Library/ExtensionKit/Extensions/Appearance.appex/"

@@ -253,3 +253,25 @@ Working now: Safari launches with remapped hooks; **SandboxBroker runs inside ch
 Still open: macOS **WebContent/Networking/GPU** do not stay up — page chrome/load incomplete. `GIGACAGE_ENABLED=0` is only a **temporary diagnostic** in the WebKit proxy env (and was on unloaded LaunchDaemon plists); real JSC Gigacage reservation fix still required. Safari mach-lookup entitlement expansion via ldid previously SIGKILL'd Safari before AppKit window — revisit carefully.
 
 Rollback: `/var/mobile/macws-rollback/` + NOTES.txt (libmachook pre-webkit/pre-thin, Safari.pre-webkit-*, `*.pre-webkit-resign-*`, macws-webkit copies).
+
+## 15. System-wide SecureTransport / trustd / securityd (2026-11-10)
+
+### Root cause
+iPadOS owns public `com.apple.trustd` / `com.apple.SecurityServer`. Only iOS trustd/securityd were running; Ventura Security.framework clients in the chroot talked to the wrong stack (or none). Classic Keychain APIs returned `paramErr`; SecureTransport `SSLHandshake` returned `errSSLBadCert` (-9808) even when `SecTrustEvaluate` could succeed for some chains.
+
+### System-level fix (not per-app)
+1. Publish Ventura **trustd** and **securityd** on private Mach names `com.apple.macosbooter.trustd` / `com.apple.macosbooter.SecurityServer` via `HIServicesProxy` + `MACWS_XPC_TARGET` (same shape as authd).
+2. libmachook remaps `com.apple.trustd` and `com.apple.SecurityServer` for all chroot processes.
+3. securityd hit AMFI `unsuitable CT policy 0x8` under freestanding chroot+exec → thin arm64e + ldid merge + trustcache (generic admit pattern; backup in macws-rollback).
+
+### Verification
+- `CURL_SSL_BACKEND=secure-transport curl -sI https://www.baidu.com` → HTTP 200, exit 0
+- Same for example.com / apple.com
+- Both `com.macwsguide.trustd` and `com.macwsguide.securityd` launchd jobs `state=running`
+
+### a868f70 curl LibreSSL defaults
+Kept as a **harmless fallback** when `SSL_CERT_FILE` / `CURL_SSL_BACKEND` are unset: does not disable validation, helps tools that still prefer LibreSSL PEM roots. SecureTransport no longer depends on it.
+
+### Still open (TLS)
+- Optionally wire bring-up into `macos_gui.sh` start path (plists are in LaunchDaemons).
+- Broader CT-policy admit helper for other Apple-signed rootfs/cryptex binaries.

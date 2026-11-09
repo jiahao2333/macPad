@@ -14154,6 +14154,10 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 #define HISERVICES_SERVICE_NEW  "com.apple.macosbooter.hiservices-xpcservice"
 #define AUTHD_SERVICE_ORIG "com.apple.authd"
 #define AUTHD_SERVICE_NEW  "com.apple.macosbooter.authd"
+#define TRUSTD_SERVICE_ORIG "com.apple.trustd"
+#define TRUSTD_SERVICE_NEW  "com.apple.macosbooter.trustd"
+#define SECURITYSERVER_SERVICE_ORIG "com.apple.SecurityServer"
+#define SECURITYSERVER_SERVICE_NEW  "com.apple.macosbooter.SecurityServer"
 #define CORESERVICESD_SERVICE_ORIG "com.apple.CoreServices.coreservicesd"
 #define CORESERVICESD_SERVICE_NEW \
     "com.apple.macosbooter.CoreServices.coreservicesd"
@@ -14522,6 +14526,10 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return HISERVICES_SERVICE_NEW;
     if (!strcmp(name, AUTHD_SERVICE_ORIG))
         return AUTHD_SERVICE_NEW;
+    if (!strcmp(name, TRUSTD_SERVICE_ORIG))
+        return TRUSTD_SERVICE_NEW;
+    if (!strcmp(name, SECURITYSERVER_SERVICE_ORIG))
+        return SECURITYSERVER_SERVICE_NEW;
     // RE-confirmed against Ventura 13.4 DesktopServicesPriv at
     // TDSHelperContext::LaunchDesktopServicesHelper +0x7c..+0xa8: Finder
     // resolves this exact launchd Mach service before sending its Handshake.
@@ -15423,6 +15431,14 @@ xpc_connection_t macws_xpc_connection_create_early(
         return macws_xpc_connection_create_mach_service_raw(
             AUTHD_SERVICE_NEW, targetq, 0);
     }
+    if (name && !strcmp(name, TRUSTD_SERVICE_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            TRUSTD_SERVICE_NEW, targetq, 0);
+    }
+    if (name && !strcmp(name, SECURITYSERVER_SERVICE_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            SECURITYSERVER_SERVICE_NEW, targetq, 0);
+    }
     // CarbonCore resolves its named-data helper with xpc_connection_create,
     // not the Mach-service constructor used by lsd/IconServices. Route this
     // early static-interpose entry point explicitly so Dock cannot cache a
@@ -15614,6 +15630,12 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
     } else if (program && strcmp(program, "authd") == 0 && service &&
                strcmp(service, "com.macwsguide.authd") == 0) {
         privateMachService = AUTHD_SERVICE_NEW;
+    } else if (program && strcmp(program, "trustd") == 0 && service &&
+               strcmp(service, "com.macwsguide.trustd") == 0) {
+        privateMachService = TRUSTD_SERVICE_NEW;
+    } else if (program && strcmp(program, "securityd") == 0 && service &&
+               strcmp(service, "com.macwsguide.securityd") == 0) {
+        privateMachService = SECURITYSERVER_SERVICE_NEW;
     } else if (program && strcmp(program, "QuickLookSatellite") == 0 &&
                service && strcmp(service,
                     "com.macwsguide.quicklook-satellite") == 0) {
