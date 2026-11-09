@@ -203,3 +203,23 @@
    - 诊断：`/tmp/macws_mtlcompiler_diagnostics` 时 tweak 额外把 `LLVM ERROR` 的字符串参数写进 `mtl_compiler_patch.log`；
      libmachook `MACWS_RUNTIME_DIAGNOSTICS` 时记录 `newLibraryWithDAG` 结果。生产路径不变。
    - iOS 上 `com.apple.system.logging.plist` 的 `Enable-Private-Data` 不生效（重启 logd 也不行），已删除恢复原状。
+
+12. **联网探测（2026-11-10 00:05 CST）**
+   - **chroot CLI**
+     - DNS：chroot 内 `curl` 解析 `example.com` / `www.baidu.com` / `www.apple.com` 正常（无需 SOCKS；本机未起 1082）。
+     - HTTP：`curl http://example.com` → 200。
+     - HTTPS：默认 SecureTransport 报 `SSL certificate problem: Couldn't understand the server certificate format`（Keychain/Security 在 chroot 不可用，与 AGENTS 一致）。
+       用系统 bundle 即可：`curl --cacert /etc/ssl/cert.pem https://…` → `example.com` / `baidu.com` HTTP/2 或 1.1 200。
+     - 注意：`run_bash.sh` 经 ssh/expect 传参时，远端 shell 会拆分未整体加引号的 `;`；整段命令需作为**一个** argv。
+   - **Safari GUI**
+     - 窗口与起始页正常：Favorites / Privacy Report / Siri Suggestions / iCloud「来自 Mac Pro」标签同步都在（说明部分网络与账户通路可用）。
+     - 用 `macws_control_probe open-documents /Applications/Safari.app /tmp/*.webloc` 能把 URL 交给 Safari（`open-web-url` 只走 VS Code，不适用）。
+     - VNC 键盘仍进不去地址栏（已知）。
+     - **网页仍打不开**：dmesg 实机复现
+       `System Policy: Safari(PID) deny(1) mach-lookup com.apple.WebKit.WebContent`
+       与 `…Networking`。进程表里没有 macOS WebContent；只有 iOS MobileSafari 的 WebKit XPC。
+     - 仓库里 `WebKitChrootProxy/` 是未合入的实验（README：曾拉起原生 WebContent 后撞上 JSC Gigacage）。
+       **下一步真修**：按 DockHelper/GeodProxy 同一 freestanding chroot-proxy 路径启用并接线；不要靠关沙盒糊弄。Gigacage 是后续问题。
+   - **Weather GUI**：侧边栏多个国内城市温度/晴雨已刷新（网络数据到达）；右侧详情仍是 `--`（未完全可用）。`com.apple.geod`（macOS）在跑，GeodProxy 已安装。
+   - 截图：`~/.ipadinv/work/shots/net-safari-start.png`、`net-weather-front.png`（亦在 box `/workspace/net-*.png`）。
+
