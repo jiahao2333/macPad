@@ -2851,6 +2851,48 @@ static CFDictionaryRef macws_cgsession_public_compat(void) {
             ? macws_cgsession_public_orig() : NULL);
 }
 
+static void *macws_cgsession_follow_branch_thunk(void *fn) {
+    if (!fn) return NULL;
+    void *current = fn;
+    for (int hop = 0; hop < 4; hop++) {
+        uint32_t *insn = (uint32_t *)ptrauth_strip(
+            current, ptrauth_key_function_pointer);
+        if ((insn[0] & 0xfc000000u) != 0x14000000u) break;
+        int64_t imm = (int64_t)((int32_t)(insn[0] << 6) >> 6) * 4;
+        void *target = (void *)((uintptr_t)insn + imm);
+        Dl_info a = {0}, b = {0};
+        // Only follow a thunk that stays inside its own image.
+        if (!dladdr(insn, &a) || !dladdr(target, &b) ||
+            a.dli_fbase != b.dli_fbase) break;
+        current = ptrauth_sign_unauthenticated(
+            target, ptrauth_key_function_pointer, 0);
+    }
+    return current;
+}
+
+static void macws_cgsession_hook_dump(const char *phase, void *fn,
+                                      void *orig) {
+    if (!getenv("MACWS_CGSESSION_HOOK_DIAG")) return;
+    uint32_t *insn = (uint32_t *)ptrauth_strip(fn, ptrauth_key_function_pointer);
+    Dl_info info = {0};
+    dladdr(insn, &info);
+    dprintf(2, "#### CGSESSION-HOOK %s fn=%p (%s+0x%lx) insn=%08x %08x %08x %08x orig=%p compat=%p\n",
+            phase, insn, info.dli_sname ? info.dli_sname : "?",
+            (unsigned long)((uintptr_t)insn - (uintptr_t)info.dli_saddr),
+            insn[0], insn[1], insn[2], insn[3], orig,
+            ptrauth_strip((void *)macws_cgsession_private_compat,
+                          ptrauth_key_function_pointer));
+    if ((insn[0] & 0xfc000000u) == 0x14000000u) {
+        int64_t imm = (int64_t)((int32_t)(insn[0] << 6) >> 6) * 4;
+        uint32_t *t = (uint32_t *)((uintptr_t)insn + imm);
+        Dl_info ti = {0};
+        dladdr(t, &ti);
+        dprintf(2, "#### CGSESSION-HOOK %s b-target=%p image=%s insn=%08x %08x %08x %08x\n",
+                phase, t, ti.dli_fname ? ti.dli_fname : "?",
+                t[0], t[1], t[2], t[3]);
+    }
+}
+
 static void macws_install_cgsession_login_handoff_compatibility(void) {
     // The provider is an AppKit login-state dependency.  Headless tools and
     // daemons cannot consume this result, and patching the shared-cache entry
@@ -2863,10 +2905,23 @@ static void macws_install_cgsession_login_handoff_compatibility(void) {
         RTLD_DEFAULT, "CGSSessionCopyCurrentSessionProperties");
     void *publicProvider = dlsym(
         RTLD_DEFAULT, "CGSessionCopyCurrentDictionary");
+    // Ventura's shared-cache SLSSessionCopyCurrentSessionProperties (the
+    // target of the CoreGraphics CGS re-export) is a one-instruction `b`
+    // thunk into the real body.  Runtime-confirmed on 2026-11-09 (iPad14,5,
+    // iPadOS 16.5): ElleKit retargets an existing leading `b` in place by
+    // rewriting imm26, so a replacement 2.6 GB away was truncated to a
+    // branch into the middle of MPSNeuralNetwork/libLAPACK and System
+    // Settings died with SIGILL/SIGSEGV right after main called the
+    // provider.  Hook the thunk's real body instead.
+    privateProvider = macws_cgsession_follow_branch_thunk(privateProvider);
+    publicProvider = macws_cgsession_follow_branch_thunk(publicProvider);
     if (privateProvider) {
+        macws_cgsession_hook_dump("before", privateProvider, NULL);
         MSHookFunction(privateProvider,
                        (void *)macws_cgsession_private_compat,
                        (void **)&macws_cgsession_private_orig);
+        macws_cgsession_hook_dump("after", privateProvider,
+                                  (void *)macws_cgsession_private_orig);
     }
     if (publicProvider && publicProvider != privateProvider) {
         MSHookFunction(publicProvider,
