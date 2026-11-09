@@ -1923,6 +1923,13 @@ ensure_chroot_works() {
             return 1
         fi
     fi
+    # Curl SecureTransport fails with errSSLBadCert in chroot; NSURLSession is
+    # fine. Seed LibreSSL/curl + PEM defaults for CLI TLS validation.
+    if [ -f /var/jb/usr/macOS/bin/ensure_chroot_ssl_defaults.sh ]; then
+        bash /var/jb/usr/macOS/bin/ensure_chroot_ssl_defaults.sh \
+            > "$LOGDIR/chroot-ssl-defaults.log" 2>&1 || \
+            log "WARN: chroot SSL defaults seed failed (non-fatal)."
+    fi
     # A restored/rootfs snapshot can regress only the data-only shader artifact
     # while every executable trust sentinel remains valid. Hash-check the
     # focused provisioner on every cold start; its matching path is one 1-MiB

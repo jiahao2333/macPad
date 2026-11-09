@@ -223,3 +223,16 @@
    - **Weather GUI**：侧边栏多个国内城市温度/晴雨已刷新（网络数据到达）；右侧详情仍是 `--`（未完全可用）。`com.apple.geod`（macOS）在跑，GeodProxy 已安装。
    - 截图：`~/.ipadinv/work/shots/net-safari-start.png`、`net-weather-front.png`（亦在 box `/workspace/net-*.png`）。
 
+13. **chroot HTTPS / curl 证书校验（已解决，2026-11-10 00:26 CST）**
+   - 现象：plain `curl https://…` 报 `Couldn't understand the server certificate format`；`--cacert` 或 LibreSSL backend 才通。
+   - 根因分层：
+     1. `NSURLSession` / Network.framework TLS **正常**（baidu/example/apple 均 200，校验证书未关）。
+     2. `SecCertificateCreateWithData` / `SecTrustEvaluateWithError` 对同链也正常（baidu ok=1）。
+     3. 旧 SecureTransport `SSLHandshake` 恒返回 `errSSLBadCert` (-9808)，即便随后 `SSLCopyPeerTrust`+`SecTrustEvaluate` 成功。
+     4. 经典 Keychain API（`SecKeychainSetSearchList` / `SecTrustCopyAnchorCertificates`）在 chroot 返回 `paramErr` (-50)；macOS `trustd` 未按 authd 同款私有名拉起（iOS trustd 在跑）。
+   - 修复（不关校验）：`launchdchrootexec` 默认设置 `CURL_SSL_BACKEND=openssl` + `SSL_CERT_FILE=/etc/ssl/cert.pem`（仅当未设置时）；`ensure_chroot_ssl_defaults.sh` 写入 `/etc/curlrc`（`cacert = /etc/ssl/cert.pem`）与 root `.bashrc`；由 `macos_gui.sh ensure_chroot_works` 调用。
+   - 验证：无手动 export 时 `curl -sI https://www.baidu.com|example.com|www.apple.com` 均 200；NSURLSession probe 同。
+   - 回滚：`/var/mobile/macws-rollback/launchdchrootexec.pre-ssl-*`、`macos_gui.sh.pre-ssl-*`、`bashrc.pre-ssl-*`。
+   - 未决：SecureTransport 本身仍 -9808（仅影响 ST 客户端；GUI 走 Network.framework）。完整修 ST 需 macOS securityd/keychain/trustd 私有名栈，另开。
+
+

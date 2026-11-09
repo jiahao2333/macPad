@@ -79,6 +79,17 @@ int main(int argc, char *argv[], char *envp[]) {
     if (!getenv("HOME")) setenv("HOME", "/Users/root", 1);
     if (!getenv("TMPDIR")) setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);
+    // SecureTransport SSLHandshake returns errSSLBadCert (-9808) inside the
+    // chroot even when SecTrustEvaluateWithError accepts the same peer chain
+    // and NSURLSession/Network.framework TLS succeeds. Classic SecKeychain
+    // search-list APIs also return paramErr (-50). Curl's MultiSSL build can
+    // use its LibreSSL backend instead, which validates against the system
+    // PEM bundle without disabling verification. Only set when unset so an
+    // explicit caller override still wins.
+    if (!getenv("SSL_CERT_FILE"))
+        setenv("SSL_CERT_FILE", "/etc/ssl/cert.pem", 0);
+    if (!getenv("CURL_SSL_BACKEND"))
+        setenv("CURL_SSL_BACKEND", "openssl", 0);
     // setenv("DYLD_PRINT_SEARCHING", "1", 1);
     // setenv("DYLD_PRINT_LIBRARIES", "1", 1);
     // setenv("DYLD_PRINT_LIBRARIES_POST_LAUNCH", "1", 1);
