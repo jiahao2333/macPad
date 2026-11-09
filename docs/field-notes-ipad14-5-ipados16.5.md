@@ -90,3 +90,24 @@
 - 画布 2732×2048，coexist 模式。
 
 详细的代码层分析见 [`windowserver-memory-investigation.md`](windowserver-memory-investigation.md)。
+
+6. **Safari：rootfs 里缺 App cryptex（2026-11-09）**
+   `rootfs/Applications/Safari.app` 指向 `../System/Cryptexes/App/...`，但当初只解了 OS cryptex，
+   `System/Volumes/Preboot/Cryptexes/App` 根本不存在，Dock 里的 Safari 一直是问号。
+   修复：从 `UniversalMac_13.4_22F66_Restore.ipsw` 取出 App cryptex `096-09661-085.dmg`（BuildManifest
+   `Cryptex1,AppOS`，约 13 MB / 1637 个文件），只读挂载后 tar 到
+   `/var/mnt/rootfs/System/Volumes/Preboot/Cryptexes/App`，并且 **`chown -R root:wheel`**
+   （否则 admission 报 "app executable must be a root-owned regular file"）。之后
+   `macws_control_probe launch-path /Applications/Safari.app` → admission added 3 → `window-ready`，
+   Safari 窗口（起始页 / What's New）正常显示。网页加载还没验证（OSXvnc 的键盘输入进不去）；
+   上游 WebKitChrootProxy README 记录过 WebContent 会遇到 JSC Gigacage reservation failure。
+   Dock 里的 Safari 图标仍是缓存的问号，点击无效；需要用控制中心的路径启动。
+   回滚：`rm -rf /var/mnt/rootfs/System/Volumes/Preboot/Cryptexes/App`。
+
+7. **System Settings 右侧 pane 空白（未解决）**
+   窗口和侧边栏正常，点侧边栏能改变选中项，但标题停在 Appearance，右侧不出内容。
+   30 s 内没有任何 Settings appex / `MacWSSettingsExtension-*.app/SettingsExtensionProxy` 进程出现，
+   iOS CrashReporter 里也没有对应崩溃；49 个 carrier app、48 条 extension 记录、
+   MacWSCatalystLaunch（runningboardd 里的 `RBLaunchdInterface submitExtension:overlay:domain:error:`
+   hook，iOS 16.5 这个 selector 依然存在）都在。因此请求很可能没有到达 runningboardd，或者在 spawn 前就被拒绝了。
+   设备上没有 `oslog` / `log`，没法看 runningboardd 日志，这是下一步的阻碍。
