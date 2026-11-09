@@ -257,11 +257,25 @@ static BOOL macws_process_needs_settings_symbol_raster(void) {
     if (program && strcmp(program, "iconservicesagent") == 0) return YES;
     char executable[PATH_MAX] = {0};
     if (proc_pidpath(getpid(), executable, sizeof(executable)) <= 0) return NO;
-    return strcmp(executable,
-                  "/System/Applications/System Settings.app/Contents/MacOS/"
-                  "System Settings") == 0 ||
-           strcmp(executable,
-                  "/System/Library/CoreServices/iconservicesagent") == 0;
+    if (strcmp(executable,
+               "/System/Applications/System Settings.app/Contents/MacOS/"
+               "System Settings") == 0 ||
+        strcmp(executable,
+               "/System/Library/CoreServices/iconservicesagent") == 0)
+        return YES;
+    // Settings pane extensions draw their own row icons (General: About,
+    // Software Update, Storage, ...) through the same ISGraphicSymbol /
+    // CUI vector-glyph path as the Settings sidebar. Runtime on iPad14,5
+    // 2026-11-09: with only System Settings covered, every GeneralSettings
+    // row icon stayed an empty tile while the sidebar rendered. Cover every
+    // Settings ExtensionKit pane by location, not by bundle name, so a pane
+    // added in a later rootfs is included. proc_pidpath may report either
+    // the namespace path or the /private/var/mnt/rootfs-prefixed spelling.
+    BOOL appex = strstr(executable, ".appex/Contents/MacOS/") != NULL;
+    return appex &&
+        (strstr(executable, "/System/Library/ExtensionKit/Extensions/") ||
+         strstr(executable,
+                "/System/Applications/System Settings.app/Contents/PlugIns/"));
 }
 
 // Expensive observation must never ride along with the normal interactive

@@ -39,6 +39,7 @@
 # NO shebang on purpose: this jailbreak's AMFI SIGKILLs execve() of any file with
 # a `#!` line (see CLAUDE.md).  Always invoke via `bash <path>`.
 
+# Also treat iPad14,5 / 20F66 like 20F75 for cold-start / AGX 0x78 (local port).
 set -u
 
 # ─── Paths ──────────────────────────────────────────────────────────────────
@@ -139,6 +140,7 @@ AUTHD_LABEL=com.macwsguide.authd
 DESKTOP_SERVICES_HELPER_LABEL=com.macwsguide.desktopserviceshelper
 FINDER_DESKTOP_LABEL=com.macwsguide.finder-desktop
 DOCK_LABEL=com.macwsguide.dock
+DOCK_TILES_HELPER=/var/jb/usr/macOS/bin/macws_dock_tiles.py
 SYSTEMUI_LABEL=com.macwsguide.systemuiserver
 CONTROL_CENTER_LABEL=com.macwsguide.controlcenter
 INPUT_LABEL=UIKitApplication:com.macwsguide.input
@@ -3813,6 +3815,41 @@ run_mobile_defaults_utility() {
         "$CHROOTEXEC" 501 501 "$ROOTFS" "$DEFAULTS_BIN" "$@"
 }
 
+# Ventura Dock resolves persistent-apps tiles only at startup. A tile whose
+# bundle is absent from this rootfs (stock template iWork entries, or an app
+# such as Safari that appeared after the tile was created) is drawn as "?" and
+# its click never reaches LSOpenFromURLSpec. Drop only tiles whose file URL
+# does not resolve inside the chroot, through cfprefsd, before Dock loads.
+# Failure is logged and non-fatal: it can only leave the previous tiles.
+sanitize_dock_tiles() {
+    local export_rel=/tmp/macws-dock-tiles.export.plist
+    local output_rel=/tmp/macws-dock-tiles.sanitized.plist
+    local status=0
+    [ -f "$DOCK_TILES_HELPER" ] || return 0
+    rm -f "$ROOTFS$export_rel" "$ROOTFS$output_rel"
+    if ! run_defaults_utility export com.apple.dock "$export_rel" \
+            > "$LOGDIR/dock-tiles.log" 2>&1 ||
+       [ ! -s "$ROOTFS$export_rel" ]; then
+        log "WARNING: Dock tile sanitizer could not export com.apple.dock."
+        return 0
+    fi
+    /var/jb/usr/bin/python3 "$DOCK_TILES_HELPER" "$ROOTFS" \
+        "$ROOTFS$export_rel" "$ROOTFS$output_rel" >> "$LOGDIR/dock-tiles.log" 2>&1 ||
+        status=$?
+    if [ "$status" -eq 0 ]; then
+        if run_defaults_utility import com.apple.dock "$output_rel" \
+                >> "$LOGDIR/dock-tiles.log" 2>&1; then
+            log "Dock tiles sanitized: $(tail -n 1 "$LOGDIR/dock-tiles.log")"
+        else
+            log "WARNING: Dock tile sanitizer could not import com.apple.dock."
+        fi
+    elif [ "$status" -ne 3 ]; then
+        log "WARNING: Dock tile sanitizer failed (status=$status)."
+    fi
+    rm -f "$ROOTFS$export_rel" "$ROOTFS$output_rel"
+    return 0
+}
+
 verify_preferences_persistence() {
     local value="" mission_control="" app_expose=""
     local dock_magnification="" dock_large_size="" dock_minimize_effect=""
@@ -3881,6 +3918,7 @@ verify_preferences_persistence() {
         return 1
     fi
     log "Private macOS CFPreferences database ready; native gestures, Genie minimize and maximum Dock hover magnification enabled."
+    sanitize_dock_tiles
 }
 
 verify_mobile_preferences_persistence() {

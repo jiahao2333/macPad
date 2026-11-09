@@ -12,7 +12,7 @@
 # Runtime-confirmed 2026-11-09 on iPad14,5 / iPadOS 16.5 (Dopamine rootless).
 # iPadOS 16.3 did not require this (upstream panes worked without it).
 #
-# This helper is intentionaly tiny and idempotent: every macOS GUI cold start
+# This helper is intentionally tiny and idempotent: every macOS GUI cold start
 # and every Settings extension ensure pass can re-run it safely.
 
 set -e
@@ -44,36 +44,21 @@ else
     ln -s / "$ROOTFS_SELF"
 fi
 
-# (2) Mirror host PluginKitPlugin containers that Settings panes (and similar
-# Apple settings extensions) already own. Sandbox looks the container up by
-# code-signing identifier; the host path is invisible after chroot unless a
-# same-named directory exists under $ROOTFS/private/var/mobile/Containers/...
+# (2) Mirror every host PluginKitPlugin container skeleton. Sandbox looks the
+# container up by code-signing identifier; the host path is invisible after
+# chroot unless a same-named directory exists under
+# $ROOTFS/private/var/mobile/Containers/Data/PluginKitPlugin. Mirroring all of
+# them (not a Settings allow-list) keeps extensions from newly installed or
+# updated bundles working without a per-identifier list. Existing mirrors are
+# skipped, so the steady-state cost is one directory scan.
 mirror_one_pkp() {
-    local src="$1" name dst ident
-    name=$(basename "$src")
+    local src="$1" name dst
+    name=${src##*/}
     dst="$CHROOT_PKP/$name"
-    [ -d "$src" ] || return 0
     [ -f "$src/.com.apple.mobile_container_manager.metadata.plist" ] || return 0
-    # Cheap identifier filter: only Apple settings-related plugin containers.
-    ident=$(/var/jb/usr/bin/plutil -key MCMMetadataIdentifier \
-        "$src/.com.apple.mobile_container_manager.metadata.plist" 2>/dev/null || true)
-    if [ -z "$ident" ]; then
-        # plutil -key may be unavailable; fall back to strings.
-        ident=$(strings "$src/.com.apple.mobile_container_manager.metadata.plist" 2>/dev/null |
-            grep -E '^com\.apple\.' | head -1 || true)
-    fi
-    case "$ident" in
-        com.apple.*Settings*|com.apple.*settings*|com.apple.systempreferences.*|com.apple.*Preference*)
-            ;;
-        *)
-            return 0
-            ;;
-    esac
-    mkdir -p "$dst"
-    for sub in Documents Library SystemData tmp; do
-        mkdir -p "$dst/$sub"
-    done
-    cp -a "$src/.com.apple.mobile_container_manager.metadata.plist" "$dst/" 2>/dev/null || true
+    [ -f "$dst/.com.apple.mobile_container_manager.metadata.plist" ] && return 0
+    mkdir -p "$dst/Documents" "$dst/Library" "$dst/SystemData" "$dst/tmp"
+    cp -p "$src/.com.apple.mobile_container_manager.metadata.plist" "$dst/" 2>/dev/null || true
     chown -R mobile:mobile "$dst" 2>/dev/null || true
 }
 
@@ -85,4 +70,4 @@ if [ -d "$HOST_PKP" ]; then
     done
 fi
 
-echo "[INFO] chroot sandbox paths ready (rootfs self-link + settings PluginKitPlugin mirrors)"
+echo "[INFO] chroot sandbox paths ready (rootfs self-link + PluginKitPlugin mirrors)"

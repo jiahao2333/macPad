@@ -146,8 +146,39 @@
    - 回滚：`rm -f /var/mnt/rootfs/private/var/mnt/rootfs`；
      `rm -rf /var/mnt/rootfs/private/var/mobile/Containers/Data/PluginKitPlugin`。
 
-8. **Dock 点击（铺垫，未修）**：点 Dock 里 Safari 的 "?" 图标时，iOS 侧没有任何 runningboardd / lsd /
-   macwshostd 日志。Dock 根本没有发出 open 请求：图标在 Dock 启动时就已经解析失败（当时 App cryptex 还不存在），
-   需要刷新 Dock 的 tile（`macws_control_probe refresh-dock <Dock pid>` 或重启 Dock）。
-   Safari 另外还有 `Sandbox: System Policy: Safari deny(1) mach-lookup com.apple.WebKit.WebContent`，
-   所以网页内容进程起不来（上游 WebKitChrootProxy 实验已知的问题）。
+8. **Dock 问号 / 点击无反应（已解决，2026-11-09 22:20 CST）**
+   - 现象：Dock 里 4 个 "?"（Safari、Keynote、Numbers、Pages），点了 iOS 侧没有任何日志。
+   - 点击链路本身是好的：Dock → `LSOpenFromURLSpec`（libmachook 拦截）→ macwshostd `launch-path`
+     → code admission → window-ready。Notes / Calendar / Safari 从 Dock 点击都能正常打开。
+   - 根因：Ventura Dock 只在启动时解析一次 `persistent-apps` 的 tile。"?" tile 的 bundle 当时在 chroot 里
+     不存在，Dock 不会对它调用 `LSOpenFromURLSpec`，所以没有任何启动请求：
+     - Keynote / Numbers / Pages：Dock 默认模板里自带，但这个 rootfs 没装。
+     - Safari：tile 指向 `/System/Cryptexes/App/...`，tile 建立时 App cryptex 还没装（第 6 条）。
+   - 修复（通用，不按 app 写死）：`layout/usr/macOS/bin/macws_dock_tiles.py` + `macos_gui.sh` 的
+     `sanitize_dock_tiles`（在 Dock 加载前，`verify_preferences_persistence` 末尾执行）：
+     - 用 stock `defaults export/import com.apple.dock` 走 cfprefsd 读写。
+     - 只删除 file URL 在 chroot 里解析不到的 file-tile（按 chroot 语义跟随符号链接，绝对链接从 rootfs 根重新解析）。
+     - 存在的 tile 原样保留；Dock 重新加载时会重新解析它们，所以后装的 app（比如 Safari）会自己恢复。
+     - 失败只记录日志，不影响启动。
+     - 本次现场：删掉 Keynote/Numbers/Pages，`launchctl unload/load` Dock 后 Safari 图标恢复。
+   - 新装的 app：拖进 Dock 时 bundle 已经存在，正常解析；以后被删除的 app 会在下一次会话启动时被清掉。
+   - 回滚：`defaults import` 备份 `/var/mobile/macws-rollback/com.apple.dock.plist.pre-docktiles-*`；
+     `macos_gui.sh` 备份 `macos_gui.sh.pre-docktiles-*`。
+   - Safari 另外还有 `Sandbox: System Policy: Safari deny(1) mach-lookup com.apple.WebKit.WebContent`，
+     网页内容进程起不来（上游 WebKitChrootProxy 实验已知的问题，未修）。
+
+9. **Settings > General 行图标空白（已解决）**
+   - libmachook 的 settings symbol raster 兼容层（ISGraphicSymbolResource / CUI vector glyph）原来只装在
+     `System Settings` 和 `iconservicesagent` 两个进程里。General 的行图标是 pane 进程（GeneralSettings.appex）
+     自己画的，所以侧边栏有图标、行图标是空白方块。
+   - 修复：`macws_process_needs_settings_symbol_raster()` 按路径覆盖所有 Settings pane appex
+     （`/System/Library/ExtensionKit/Extensions/*.appex` 与 `System Settings.app/Contents/PlugIns/*.appex`），
+     不按 bundle 名写死。修复后 About、Software Update、Storage 等行图标正常显示；Time Machine 行和侧边栏的
+     Siri & Spotlight 仍为空（不是同一路径，未修）。
+   - 旁注：macOS `iconservicesagent` 在 CoreImage 需要编译 Metal/MPS kernel 时会 abort
+     （`MPSKey_Create ... Unable to get MPS kernel`），launchd 会自动拉起。给它加 `MACWS_AGX_NATIVE` 没有效果，已撤回。
+   - 回滚：`/var/mobile/macws-rollback/libmachook-pre-paneicons-20261109-223118`（4 个路径，见 NOTES.txt）。
+
+10. **装新软件后 extension 还能不能用**：`ensure_chroot_sandbox_paths.sh` 改成镜像**全部** PluginKitPlugin 容器骨架，
+    不再只镜像 Settings 白名单。首次运行约 35 s（741 个），之后已存在的跳过，约 0 s。新 extension 的宿主容器由
+    iOS 在第一次启动时创建；下一次走 hostd 启动（会运行 ensure）就会被镜像进 chroot。
