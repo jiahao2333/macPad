@@ -104,7 +104,7 @@
    Dock 里的 Safari 图标仍是缓存的问号，点击无效；需要用控制中心的路径启动。
    回滚：`rm -rf /var/mnt/rootfs/System/Volumes/Preboot/Cryptexes/App`。
 
-7. **System Settings 右侧 pane 空白（未解决，根因已定位）**
+7. **System Settings 右侧 pane 空白（已解决）**
    窗口和侧边栏正常，但每个 pane extension 都在 exec 时被 iPadOS 16.5 的 Sandbox.kext 杀掉。
    **看日志的方法（iPad 上不用装任何东西）**：把 `/var/db/diagnostics`（最新的 Persist/Special tracev3、
    `timesync`、`version.plist`）和 `/var/db/uuidtext` 拷到 Mac，拼成 `x.logarchive`
@@ -128,10 +128,23 @@
      → container 这一步**通过了**，接着报
      `Sandbox: hook..execve() killing ...: (err=2) failed to set executable path`。已撤回
      （而且 `ensure_settings_extensions_runtime.sh` 下次启动 Settings 时会把 identifier 改回去）。
-   - 下一步方向：container 是按新映像的签名 identifier 查的；executable path 的检查很可能要求可执行文件
-     位于 carrier bundle 里，或者是 chroot 里的 vnode 路径对不上。候选做法：让 extension job 不带
-     container（在 MacWSCatalystLaunch 的 overlay 里改，但这需要重启 runningboardd），或者让签名 identity
-     和可执行文件路径都满足 Sandbox 的要求。iPadOS 16.3 上没有这个问题（上游当时是能用的）。
+   - **已解决（2026-11-09 21:48 CST）**：真正的根因是 chroot 之后 Sandbox 在进程命名空间里解析
+     两条**宿主机**路径，均返回 ENOENT：
+     1. 可执行文件的 realpath（`/var/mnt/rootfs/System/...`）→ `failed to set executable path`
+     2. 该 CS identifier 在 MobileContainerManager 里的 PluginKitPlugin 容器
+        （`/var/mobile/Containers/Data/PluginKitPlugin/<UUID>`）→ `failed to set container`
+     修复（`layout/usr/macOS/bin/ensure_chroot_sandbox_paths.sh`，由 `macos_gui.sh` 的
+     `ensure_chroot_works` 与 `ensure_settings_extensions_runtime.sh` 调用）：
+     - `ln -s / /var/mnt/rootfs/private/var/mnt/rootfs`（chroot 内 `/var/mnt/rootfs/...` 落到 `/...`）
+     - 把 Settings 相关的 PluginKitPlugin 容器镜像进
+       `$ROOTFS/private/var/mobile/Containers/Data/PluginKitPlugin/`
+     Appearance / General / Wallet / Headphone 等 pane 进程在修复后保持存活，Appearance UI
+     （Light/Dark/Auto、强调色等）正常渲染。截图：`~/.ipadinv/work/shots/settings-pane-rendered-20261109-2149.png`。
+   - Option A（MacWSCatalystLaunch overlay 改 ServiceType=System / 去掉 ServiceType /
+     去掉 JoinExistingSession）在 runningboardd 重启后**无效**：杀进程点是 CS identity + chroot
+     路径，不是 launchd ServiceType。策略旋钮仍留在 Tweak 里作诊断，默认 0。
+   - 回滚：`rm -f /var/mnt/rootfs/private/var/mnt/rootfs`；
+     `rm -rf /var/mnt/rootfs/private/var/mobile/Containers/Data/PluginKitPlugin`。
 
 8. **Dock 点击（铺垫，未修）**：点 Dock 里 Safari 的 "?" 图标时，iOS 侧没有任何 runningboardd / lsd /
    macwshostd 日志。Dock 根本没有发出 open 请求：图标在 Dock 启动时就已经解析失败（当时 App cryptex 还不存在），

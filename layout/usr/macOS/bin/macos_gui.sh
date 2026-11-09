@@ -1909,6 +1909,18 @@ ensure_chroot_works() {
         tail -n 10 "$LOGDIR/mountdevfs.log" 2>/dev/null || true
         return 1
     fi
+
+    # iPadOS 16.5 Sandbox execve hooks resolve /var/mnt/rootfs/... and
+    # PluginKitPlugin containers inside the chroot. Seed those paths before
+    # any macOS XPC/ExtensionKit proxy execs (Settings panes, ViewBridge, ...).
+    if [ -f /var/jb/usr/macOS/bin/ensure_chroot_sandbox_paths.sh ]; then
+        if ! bash /var/jb/usr/macOS/bin/ensure_chroot_sandbox_paths.sh \
+                > "$LOGDIR/chroot-sandbox-paths.log" 2>&1; then
+            log "ERROR: chroot sandbox path seed failed."
+            tail -n 20 "$LOGDIR/chroot-sandbox-paths.log" 2>/dev/null || true
+            return 1
+        fi
+    fi
     # A restored/rootfs snapshot can regress only the data-only shader artifact
     # while every executable trust sentinel remains valid. Hash-check the
     # focused provisioner on every cold start; its matching path is one 1-MiB
