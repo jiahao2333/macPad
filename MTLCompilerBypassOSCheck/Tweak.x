@@ -445,7 +445,20 @@ static bool InstallCatalystDAGTargetContext(void) {
     void *function = image ? dlsym(image,
         "_ZN7metalfe11GPUCompiler22getDefaultTargetTripleEN4llvm8OptionalINS1_5MachO12PlatformTypeEEE") : NULL;
     Dl_info info = {0};
-    const uint8_t uuid[16] = {0x41,0xd2,0xf0,0x61,0x8d,0xa8,0x3c,0xfa,0x8c,0x4a,0xc3,0xe9,0xd7,0x00,0x96,0x04};
+    // Admitted libGPUCompilerImpl identities. Each one was checked for the
+    // exported getDefaultTargetTriple(Optional<PlatformType>) symbol and the
+    // exact prologue below (which is re-verified at runtime):
+    //   41d2f061-8da8-3cfa-8c4a-c3e9d7009604  original RE profile
+    //   d499f499-45eb-388b-8f93-f6a1982fd35f  iPadOS 16.5 (20F66, iPad14,5);
+    //     probed 2026-11-09 via dlsym: identical 16-byte prologue and the
+    //     PLATFORM_MACCATALYST (cmp w?, #6) branch at +0x4c. Without it every
+    //     CoreImage stitched graph (DAG discriminator 0xe) returned an iOS
+    //     MTLB (01 00 / 82) that macOS Metal rejected as "library format is
+    //     not supported", and iconservicesagent then crashed in MPS.
+    static const uint8_t uuids[][16] = {
+        {0x41,0xd2,0xf0,0x61,0x8d,0xa8,0x3c,0xfa,0x8c,0x4a,0xc3,0xe9,0xd7,0x00,0x96,0x04},
+        {0xd4,0x99,0xf4,0x99,0x45,0xeb,0x38,0x8b,0x8f,0x93,0xf6,0xa1,0x98,0x2f,0xd3,0x5f},
+    };
     if (!function || !dladdr((void *)StripPAC(function), &info)) return false;
     const struct mach_header_64 *header = info.dli_fbase;
     if (!header || header->magic != MH_MAGIC_64 || header->sizeofcmds > 1048576)
@@ -456,7 +469,9 @@ static bool InstallCatalystDAGTargetContext(void) {
         const struct load_command *cmd = (const void *)cursor;
         if (cmd->cmdsize < sizeof(*cmd) || cmd->cmdsize > (size_t)(end - cursor)) return false;
         if (cmd->cmd == LC_UUID && cmd->cmdsize >= sizeof(struct uuid_command))
-            matched = !memcmp(((const struct uuid_command *)cmd)->uuid, uuid, 16);
+            for (size_t u = 0; u < sizeof(uuids) / sizeof(uuids[0]); u++)
+                if (!memcmp(((const struct uuid_command *)cmd)->uuid, uuids[u], 16))
+                    matched = true;
         cursor += cmd->cmdsize;
     }
     const uint32_t expected[] = {0xd503237f, 0xd10283ff, 0xa9065ff8, 0xa90757f6};
@@ -813,6 +828,47 @@ static void *MacWSCompilerReplyDataCreate(const void *bytes, size_t length) {
     return xpc_data_create(bytes, length);
 }
 
+// Diagnostic-only: MTLCompiler reports fatal LLVM errors through
+// os_log_fault("LLVM ERROR: %{private}s") and exits, so the actual reason is
+// redacted in unified logging. With /tmp/macws_mtlcompiler_diagnostics this
+// wraps _os_log_fault_impl (installed lazily on the first compiler request,
+// never in production) and copies only string arguments of that one format
+// into MTLPatchLog. The original fault call still runs unchanged.
+typedef void (*MacWSOSLogFaultFn)(void *, void *, uint8_t, const char *,
+                                  uint8_t *, uint32_t);
+static MacWSOSLogFaultFn gOrigOSLogFault;
+static void MacWSOSLogFault(void *dso, void *log, uint8_t type,
+                            const char *format, uint8_t *buf, uint32_t size) {
+    if (format && strstr(format, "LLVM ERROR") && buf && size >= 2) {
+        uint32_t offset = 2;
+        for (uint8_t item = 0; item < buf[1] && offset + 2 <= size; item++) {
+            uint8_t desc = buf[offset], length = buf[offset + 1];
+            offset += 2;
+            if (offset + length > size) break;
+            if ((desc >> 4) == 2 && length == sizeof(void *)) {
+                const char *text = NULL;
+                memcpy(&text, buf + offset, sizeof(text));
+                if (text) {
+                    size_t total = strnlen(text, 4096);
+                    for (size_t at = 0; at < total; at += 400)
+                        MTLPatchLog("LLVM-FATAL[%zu] %.400s", at, text + at);
+                }
+            }
+            offset += length;
+        }
+    }
+    gOrigOSLogFault(dso, log, type, format, buf, size);
+}
+static void MacWSInstallFatalErrorWitness(void) {
+    static bool attempted;
+    if (attempted || !MacWSCompilerDiagnosticsEnabled()) return;
+    attempted = true;
+    void *target = dlsym(RTLD_DEFAULT, "_os_log_fault_impl");
+    if (target) MSHookFunction(target, (void *)MacWSOSLogFault,
+                               (void **)&gOrigOSLogFault);
+    MTLPatchLog("LLVM fatal-error witness installed=%d", gOrigOSLogFault != NULL);
+}
+
 static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
     uintptr_t a0, uintptr_t a1, uintptr_t a2,
     void *request, size_t requestSize, void *a5) {
@@ -990,6 +1046,7 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
     }
 
     if (!OrigMTLCodeGenServiceBuildRequest) return (uintptr_t)-1;
+    if (diagnostics) MacWSInstallFatalErrorWitness();
 
     MacWSMetalDAGInputTarget dagInputTarget = a2 == 14
         ? MacWSMetalDAGGetInputTarget(request, requestSize) : MacWSMetalDAGInputUnknown;

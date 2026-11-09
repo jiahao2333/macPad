@@ -176,6 +176,19 @@ provision_route \
 	bfe93e8146325a912a0db9fc1ed28a2de32aa9ccb4065148398be12ac0644df1 \
 	0 || exit 1
 
+# The MPSImage output identity is tied to the installed native Apple LLVM
+# (macws-llvm-as wraps /usr/lib/libLLVM.dylib). 342738... is the iPadOS 16.2
+# native output and is byte-identical to upstream LLVM16's; iPadOS 16.5's AIR
+# reader rejects it ("Unknown attribute kind (71) (Producer: 'LLVM16.0.0')"),
+# which killed MTLCompilerService on every MPSGaussianBlur specialization
+# (CoreImage blur -> MPSKey_Create F11H assert in iconservicesagent). Because
+# any listed hash short-circuits as "already installed", a device on a known
+# build accepts only the identity its own LLVM produces, so a stale foreign
+# output is regenerated instead of kept.
+MPSIMAGE_OUTPUT_SHA256="84973060c51620471389178f7f00d6bde68f3fdf1609cda48072db46f7663916 342738608c912eab663879868288299e38147ea64d45b74f57bc0dd12761b2de 8803da673c86df94b2d3212a31e1b009b52835a246a6a0b73d449b36c89d100b"
+case "$(/var/jb/usr/sbin/sysctl -n kern.osversion 2>/dev/null)" in
+	20F66) MPSIMAGE_OUTPUT_SHA256=8803da673c86df94b2d3212a31e1b009b52835a246a6a0b73d449b36c89d100b ;;
+esac
 provision_route \
 	MPSImage \
 	"$ROOTFS/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/Resources/default.metallib" \
@@ -184,7 +197,7 @@ provision_route \
 	"$ROUTE_DIR/mpsimage-default.route.plist" \
 	"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/Resources/default.metallib" \
 	"/usr/local/share/macws/mpsimage/default-desktop-effects-macabi.metallib" \
-	"84973060c51620471389178f7f00d6bde68f3fdf1609cda48072db46f7663916 342738608c912eab663879868288299e38147ea64d45b74f57bc0dd12761b2de 8803da673c86df94b2d3212a31e1b009b52835a246a6a0b73d449b36c89d100b" \
+	"$MPSIMAGE_OUTPUT_SHA256" \
 	1 "$APPLE_LLVM_DIS" "$APPLE_LLVM_AS" || exit 1
 
 # Ventura MetalFX ships its temporal scaler network as one desktop-targeted

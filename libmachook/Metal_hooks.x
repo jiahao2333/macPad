@@ -22739,7 +22739,29 @@ static id macws_new_dag_library_compat(id self, SEL selector, NSString *dag,
     }
     if (all_companions)
         dag = [dag stringByAppendingString:macws_metal2metal_runtime_objects()->dagCacheSuffix];
-    return g_macws_new_dag_library_orig(self, selector, dag, functions, error);
+    NSError *local_error = nil;
+    id library = g_macws_new_dag_library_orig(self, selector, dag, functions,
+                                              error ? error : &local_error);
+    if (macws_runtime_diagnostics_enabled()) {
+        NSError *returned = error ? *error : local_error;
+        NSUInteger companions = 0;
+        for (id function in functions)
+            if (objc_getAssociatedObject(function,
+                    kMacWSMetal2MetalCompanionFunctionKey)) companions++;
+        dprintf(STDERR_FILENO,
+            "#### MACWS-DAG result=%p functions=%lu companions=%lu "
+            "error=%s\n", (void *)library, (unsigned long)functions.count,
+            (unsigned long)companions,
+            returned ? returned.description.UTF8String : "(nil)");
+        if (!library) for (id function in functions) {
+            dprintf(STDERR_FILENO, "#### MACWS-DAG  fn=%s class=%s companion=%d\n",
+                [[(id<MTLFunction>)function name] UTF8String] ?: "(nil)",
+                class_getName([function class]),
+                objc_getAssociatedObject(function,
+                    kMacWSMetal2MetalCompanionFunctionKey) != nil);
+        }
+    }
+    return library;
 }
 
 static void macws_install_qc_desktop_function_compatibility(void) {

@@ -182,3 +182,24 @@
 10. **装新软件后 extension 还能不能用**：`ensure_chroot_sandbox_paths.sh` 改成镜像**全部** PluginKitPlugin 容器骨架，
     不再只镜像 Settings 白名单。首次运行约 35 s（741 个），之后已存在的跳过，约 0 s。新 extension 的宿主容器由
     iOS 在第一次启动时创建；下一次走 hostd 启动（会运行 ensure）就会被镜像进 chroot。
+
+11. **iconservicesagent 反复崩溃：CoreImage 拼接 + MPS（已解决，2026-11-09 23:50 CST）**
+   - 现象：未缓存的图标（带浮雕/阴影效果）一渲染，agent 日志先出现
+     `Metal library creation failed: This library format is not supported on this platform`，
+     接着 `MPSLibrary::MPSKey_Create ... Unable to get MPS kernel F11H. Compiler encountered an internal error`，
+     SIGABRT，launchd 每 10 s 重启。
+   - 根因 1（拼接）：CoreImage 用 `newLibraryWithStitchedDescriptorSPI:`（DAG 请求，discriminator 0xe）。
+     `MTLCompilerBypassOSCheck` 里给 stitch 提供 Catalyst target context 的 hook 只认
+     libGPUCompilerImpl UUID `41d2f061…`；本机 20F66 是 `d499f499-45eb-388b-8f93-f6a1982fd35f`，
+     日志 `Catalyst DAG target context: unsupported compiler ABI; original retained`，于是返回 iOS MTLB（01 00 / 82），被 macOS Metal 拒收。
+     dlsym 探测导出符号 `getDefaultTargetTriple(Optional<PlatformType>)` 的序言与原 profile 完全一致 → 加入白名单。
+   - 根因 2（MPS）：CoreImage 把模糊节点交给 `MPSGaussianBlur`，它从 metal2metal MPSImage companion 特化（0xf）。
+     诊断版 tweak 截获被 `%{private}` 隐藏的 LLVM 错误：`Unknown attribute kind (71) (Producer: 'LLVM16.0.0' Reader: 'LLVM ')`。
+     设备上装着的 companion 是 `342738…`（16.2 的原生输出，与 upstream LLVM16 字节一致），16.5 的 AIR reader 不认；
+     用本机 Apple libLLVM（macws-llvm-as）重新生成得 `8803da…`。由于允许列表里任何一个哈希都会走"已安装"快速路径，
+     旧产物不会自动重建 → `ensure_metal2metal_compat.sh` 在 20F66 上只接受 `8803da…`。
+   - 结果：拼接和 MPS 都开着（没有禁用任何 CI 功能）；清空 icon store + agent Metal cache 后整套图标重建，
+     agent pid 稳定、0 条 MPS/format 错误；Siri & Spotlight 图标正常。Time Machine 行图标仍空白（另一条路径）。
+   - 诊断：`/tmp/macws_mtlcompiler_diagnostics` 时 tweak 额外把 `LLVM ERROR` 的字符串参数写进 `mtl_compiler_patch.log`；
+     libmachook `MACWS_RUNTIME_DIAGNOSTICS` 时记录 `newLibraryWithDAG` 结果。生产路径不变。
+   - iOS 上 `com.apple.system.logging.plist` 的 `Enable-Private-Data` 不生效（重启 logd 也不行），已删除恢复原状。
