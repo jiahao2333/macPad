@@ -15,6 +15,7 @@
 #include "../include/macws_metal_dag_request.h"
 #include "../include/macws_metal_image_filter_request.h"
 #include "../include/macws_code_pointer.h"
+#include <stdatomic.h>
 
 // The rootless iOS 16 Theos SDK used by this project omits xpc/xpc.h.  This
 // is the exact public C ABI needed by the UUID-locked reply observer.
@@ -1036,6 +1037,7 @@ static void InstallMacOSMetalTargetAdapter(void) {
     //   iOS 16.3.1 (20D67)  UUID 6D2CFE56-8D88-39AA-BC25-7FFE5058ED4E
     //   iOS 16.0   (20A8372) UUID B4745394-88D0-3739-9E17-4DE2FB12B00E
     //   iOS 16.5.1 (20F75)  UUID B5CBF457-B300-3FD0-A646-1261DA6E86B0
+    //   iOS 16.5   (20F66)  same MTLCompilerService UUID/SHA as 20F75 (iPad14,5)
     //
     // The 20A8372 executable has SHA-256
     // 2f980bfb46e3d97c5a330f54c158b41de21793ec113f3d33891e3599e75faba5;

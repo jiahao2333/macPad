@@ -133,6 +133,7 @@ patterns, GPU ABIs, and jailbreak trust behavior are version-specific.
 |---|---|---|---|
 | iPad13,6 (M1), iPadOS 16.3.1 / 20D67 | Dopamine rootless | Ventura 13.4 / 22F66 | Primary and broadest validation target: native AGX desktop, window/fullscreen Host, 120-Hz paths, input/IME, VS Code, Steam, Office workloads, system apps and interop |
 | iPad14,5 (M2), iPadOS 16.0 / 20A8372 | Dopamine rootless | Ventura 13.4 / 22F66 | Exact MTLCompilerService UUID adapter, VS Code web rendering, Steam/arm64 Unity 7DTD, direct presentation and audio paths validated; coverage is narrower than M1 |
+| iPad14,5 (M2), iPadOS 16.5 / 20F66 | Dopamine rootless | Ventura 13.4 / 22F66 | Port: MTLCompilerService UUID/SHA match 20F75 exactly (`B5CBF457-…`); reuse 20F75 adapter + 0x78 AGX negotiate; cold-start order as 20F75 |
 | iPad14,3 (M2), iPadOS 16.5.1 / 20F75 | Dopamine rootless | Ventura 13.4 / 22F66 | Porting candidate only: the exact compiler identity, native AGX ABI and cold workspace startup are runtime-confirmed, but the device remained locked before final Host pixels, sequence advance and unlocked interaction could be accepted |
 | iPad13,7, iPadOS 16.6 | NathanLR | Ventura rootfs experiment | Unsupported: runtime-confirmed CoreTrust signing cannot admit the patched macOS shared-cache closure and AMFI rejects the helper; package install fails closed without `/var/jb/usr/bin/jbctl` |
 | Any other device/build | unknown | unknown | Porting target, not supported until its identities, ABI and runtime witnesses are added |

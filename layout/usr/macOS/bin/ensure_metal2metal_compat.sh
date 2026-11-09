@@ -184,7 +184,7 @@ provision_route \
 	"$ROUTE_DIR/mpsimage-default.route.plist" \
 	"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/Resources/default.metallib" \
 	"/usr/local/share/macws/mpsimage/default-desktop-effects-macabi.metallib" \
-	"84973060c51620471389178f7f00d6bde68f3fdf1609cda48072db46f7663916 342738608c912eab663879868288299e38147ea64d45b74f57bc0dd12761b2de" \
+	"84973060c51620471389178f7f00d6bde68f3fdf1609cda48072db46f7663916 342738608c912eab663879868288299e38147ea64d45b74f57bc0dd12761b2de 8803da673c86df94b2d3212a31e1b009b52835a246a6a0b73d449b36c89d100b" \
 	1 "$APPLE_LLVM_DIS" "$APPLE_LLVM_AS" || exit 1
 
 # Ventura MetalFX ships its temporal scaler network as one desktop-targeted

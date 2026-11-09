@@ -22526,6 +22526,7 @@ __thread struct MacWSNoCopyScope *g_macws_nocopy_scope;
 // record. Runtime-confirmed native probes:
 //   * iPadOS 16.0/16.3 rejects 0x78 and accepts the legacy 0x70 shape.
 //   * iPadOS 16.5.1 / 20F75 accepts exactly 0x78 and rejects 0x70.
+//   * iPadOS 16.5 / 20F66 (iPad14,5) behaves like 20F75 (0x78 accepted).
 // Negotiate at the read-only query boundary: preserve the producer's native
 // request first and retry the known legacy size only after the kernel returns
 // kIOReturnBadArgument. This is capability-based and fail-closed; other
