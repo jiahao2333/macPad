@@ -104,10 +104,37 @@
    Dock 里的 Safari 图标仍是缓存的问号，点击无效；需要用控制中心的路径启动。
    回滚：`rm -rf /var/mnt/rootfs/System/Volumes/Preboot/Cryptexes/App`。
 
-7. **System Settings 右侧 pane 空白（未解决）**
-   窗口和侧边栏正常，点侧边栏能改变选中项，但标题停在 Appearance，右侧不出内容。
-   30 s 内没有任何 Settings appex / `MacWSSettingsExtension-*.app/SettingsExtensionProxy` 进程出现，
-   iOS CrashReporter 里也没有对应崩溃；49 个 carrier app、48 条 extension 记录、
-   MacWSCatalystLaunch（runningboardd 里的 `RBLaunchdInterface submitExtension:overlay:domain:error:`
-   hook，iOS 16.5 这个 selector 依然存在）都在。因此请求很可能没有到达 runningboardd，或者在 spawn 前就被拒绝了。
-   设备上没有 `oslog` / `log`，没法看 runningboardd 日志，这是下一步的阻碍。
+7. **System Settings 右侧 pane 空白（未解决，根因已定位）**
+   窗口和侧边栏正常，但每个 pane extension 都在 exec 时被 iPadOS 16.5 的 Sandbox.kext 杀掉。
+   **看日志的方法（iPad 上不用装任何东西）**：把 `/var/db/diagnostics`（最新的 Persist/Special tracev3、
+   `timesync`、`version.plist`）和 `/var/db/uuidtext` 拷到 Mac，拼成 `x.logarchive`
+   （补一个 `Info.plist`，`OSArchiveVersion=4`），再用 `/usr/bin/log show --archive x.logarchive`
+   （zsh 里要写全路径，`log` 是 zsh 内建命令）。logd 有缓冲，最近几十秒的日志可能还没落盘。
+   没有 USB / 无线配对时 `idevicesyslog` 连不上。
+   完整链路（runningboardd + launchd + kernel）：
+   ```
+   runningboardd  Executing launch request for xpcservice<com.apple.Appearance-Settings.extension([anon<System Settings>:PID])>
+   runningboardd  Submitting extension overlay ... ProgramArguments=/System/Library/ExtensionKit/Extensions/....appex/Contents/MacOS/...
+   launchd        [.../com.macwsguide.settings-extension-carrier.<id>] Successfully spawned SettingsExtensionProxy[N]
+   kernel         (Sandbox) Sandbox: hook..execve() killing com.apple.Appearance-Settings.extension[pid=N, uid=501]: (err=2) failed to set container
+   launchd        exited with exit reason (namespace: 9 code: 0x8) - OS_REASON_EXEC   (EXEC_EXIT_REASON_SECURITY_POLICY)
+   ```
+   也就是说，MacWSCatalystLaunch（runningboardd 里的 hook）、carrier 和 setuid proxy 都正常；被杀的是
+   proxy chroot 之后 `execve()` 真正的 macOS appex 这一步。原因是 Sandbox 的 execve hook 要给新映像设置
+   launchd/xpcproxy 下发的 container。
+   - 试验 1：在 chroot 里镜像出 carrier 的 container 路径（`rootfs/private/var/mobile/Containers/Data/Application/<UUID>`）→ 没用，已撤回。
+   - 试验 2：把 Appearance 的签名 identifier 改成 carrier 的
+     `com.macwsguide.settings-extension-carrier.com.apple.Appearance-Settings.extension`
+     → container 这一步**通过了**，接着报
+     `Sandbox: hook..execve() killing ...: (err=2) failed to set executable path`。已撤回
+     （而且 `ensure_settings_extensions_runtime.sh` 下次启动 Settings 时会把 identifier 改回去）。
+   - 下一步方向：container 是按新映像的签名 identifier 查的；executable path 的检查很可能要求可执行文件
+     位于 carrier bundle 里，或者是 chroot 里的 vnode 路径对不上。候选做法：让 extension job 不带
+     container（在 MacWSCatalystLaunch 的 overlay 里改，但这需要重启 runningboardd），或者让签名 identity
+     和可执行文件路径都满足 Sandbox 的要求。iPadOS 16.3 上没有这个问题（上游当时是能用的）。
+
+8. **Dock 点击（铺垫，未修）**：点 Dock 里 Safari 的 "?" 图标时，iOS 侧没有任何 runningboardd / lsd /
+   macwshostd 日志。Dock 根本没有发出 open 请求：图标在 Dock 启动时就已经解析失败（当时 App cryptex 还不存在），
+   需要刷新 Dock 的 tile（`macws_control_probe refresh-dock <Dock pid>` 或重启 Dock）。
+   Safari 另外还有 `Sandbox: System Policy: Safari deny(1) mach-lookup com.apple.WebKit.WebContent`，
+   所以网页内容进程起不来（上游 WebKitChrootProxy 实验已知的问题）。
