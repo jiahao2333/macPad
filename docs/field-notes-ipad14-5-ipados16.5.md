@@ -328,3 +328,30 @@ Kept as **harmless fallback** (`CURL_SSL_BACKEND=openssl` + `SSL_CERT_FILE` stil
 
 `/var/mobile/macws-rollback/` + `NOTES.txt`: `libmachook*.pre-gigacage-*`, `libmachook*.pre-xpcpath-*`, `*.pre-admit-*` for WebKit/SandboxBroker, prior TLS/securityd backups.
 
+
+
+## 17. WebKit XPC stay-up diagnosis (2026-11-10 Asia/Shanghai)
+
+Goal: Safari WebContent/Networking/GPU stay up + render example.com / baidu.com, system-level.
+
+### Confirmed causes (logs / probes)
+
+1. **Shared-cache XPC path gap (fixed in code):** `Metal_hooks` `MSHook` of `xpc_connection_create` bypassed `macws_xpc_connection_create_early`, so WebKit never hit `xpc_add_bundle`. Now both paths call `macws_xpc_create_application_service`.
+2. **Same-name activation collides with iOS:** activating `com.apple.WebKit.WebContent` without remap attaches to **iOS** MobileSafari WebContent (`mobile` pid, `/System/Library/Frameworks/WebKit/...`), not macOS. Must use private `com.apple.macosbooter.WebKit.*`.
+3. **Sandbox vs private names:** userspace `sandbox_check` was **not** observed on the hot path (empty allow log). Historical dmesg `Sandbox: Safari deny mach-lookup com.apple.WebKit.WebContent` was the **public** name when remap was missing. For private names, `sandbox_extension_issue_mach("com.apple.webkit.extension.mach", macosbooter…)` **succeeds** in Safari (logged to `/tmp/macws-sandbox-allow.log`) — system-level, no Safari re-sign.
+4. **WebContentProxy SIGKILL without admit:** unsigned/untrusted proxy binary → SIGKILL. After `macws_admit_rootfs_binary.sh`, direct exec returns **118** (proxy env bootstrap without XPC) instead of kill — AMFI OK.
+5. **LaunchDaemon MachServices are harmful if loaded:** bootstrapping `com.macwsguide.webkit.*` claims `macosbooter.WebKit.*`, launchd starts the `.xpc` proxy as a daemon → log `An XPC Service cannot be run directly.` and **blocks** bundle activation. Keep those plists **unloaded** (annotated KEEP UNLOADED).
+
+### Still open
+
+- After remap + extension + admit + LaunchDaemon bootout, Safari still retries TSV hits (**~20–300×**) and **no** `WebContentProxy` / macOS WebContent process stays up. Page chrome only; no render.
+- Next: prove `xpc_add_bundle` actually registers/activates (in-chroot probe); compare with live DockHelper registration; consider embedding proxies under a rootfs-visible Frameworks path Dock uses successfully; do **not** re-sign Safari entitlements.
+
+### System-level pieces shipped this round
+
+- `macws_xpc_create_application_service` + Metal_hooks wiring
+- `sandbox_check*` allow for `com.apple.macosbooter.*` + `sandbox_extension_issue_mach` for WebKit extension class
+- DockHelper-like proxy Info.plist (`_NSApplicationMain`, no RunningBoard Managed)
+- Proxy admit-on-install expectation + rollback NOTES
+- Screenshots: `field-artifacts/net4-*.png` / `/workspace/net4-*.png`
+

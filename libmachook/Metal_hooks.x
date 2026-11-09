@@ -1,3 +1,4 @@
+#include <stdarg.h>
 @import CydiaSubstrate;
 @import Darwin;
 @import Foundation;
@@ -25031,11 +25032,23 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
 }
 
 // Also trace xpc_connection_create (the XPC service / bundle-name style)
+
+// From mac_hooks.m — Application-type XPC (WebKit/TSV) with seatbelt-friendly names.
+extern xpc_connection_t macws_xpc_create_application_service(
+    const char *name, dispatch_queue_t targetq,
+    xpc_connection_t (*create_fn)(const char *, dispatch_queue_t));
 xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {
     const char *originalName = name;
     if (name && (!strcmp(name, "com.apple.FileCoordination") ||
                  !strcmp(name, "com.apple.ProgressReporting"))) {
         return orig_xpc_connection_create(name, queue);
+    }
+    // Shared-cache callers never hit DYLD_INTERPOSE macws_xpc_connection_create_early.
+    // Activate Application-type proxies here (stock name for sandbox checks).
+    {
+        xpc_connection_t app = macws_xpc_create_application_service(
+            name, queue, orig_xpc_connection_create);
+        if (app) return app;
     }
     name = macws_private_chroot_service_name(name);
     if (originalName && getenv("MACWS_XPC_DEBUG")) {
@@ -25058,6 +25071,41 @@ xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t
     return orig_xpc_connection_create(name, queue);
 }
 
+
+// Shared-cache sandbox_check (App Sandbox mach-lookup). Allow MacWS private
+// service names so remapped Application-type XPC works for any sandboxed app.
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+static int (*orig_sandbox_check)(pid_t pid, const char *operation, int type, ...);
+enum { MACWS_MH_SANDBOX_FILTER_GLOBAL_NAME = 2 };
+static int hooked_sandbox_check(pid_t pid, const char *operation, int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    if (operation && !strcmp(operation, "mach-lookup") &&
+        type == MACWS_MH_SANDBOX_FILTER_GLOBAL_NAME) {
+        const char *svc = va_arg(ap, const char *);
+        va_end(ap);
+        if (svc && !strncmp(svc, "com.apple.macosbooter.", 22))
+            return 0;
+        return orig_sandbox_check(pid, operation, type, svc);
+    }
+    if (type == 0) {
+        va_end(ap);
+        return orig_sandbox_check(pid, operation, type);
+    }
+    const void *arg = va_arg(ap, const void *);
+    va_end(ap);
+    return orig_sandbox_check(pid, operation, type, arg);
+}
+static void macws_install_sandbox_mach_lookup_hooks(void) {
+    MSImageRef sand = MSGetImageByName("/usr/lib/system/libsystem_sandbox.dylib");
+    if (!sand)
+        sand = MSGetImageByName("/usr/lib/system/libsystem_kernel.dylib");
+    void *sym = sand ? MSFindSymbol(sand, "_sandbox_check") : NULL;
+    if (!sym)
+        sym = dlsym(RTLD_DEFAULT, "sandbox_check");
+    if (sym)
+        MSHookFunction(sym, (void *)hooked_sandbox_check, (void *)&orig_sandbox_check);
+}
 static void macws_install_private_xpc_name_hooks(void) {
     // CoreFoundation performs the cfprefsd lookup from inside the shared
     // cache, so a client dylib's static interpose alone cannot rewrite it.
@@ -25072,6 +25120,7 @@ static void macws_install_private_xpc_name_hooks(void) {
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"),
                    hooked_xpc_connection_create,
                    (void *)&orig_xpc_connection_create);
+    macws_install_sandbox_mach_lookup_hooks();
 }
 
 extern int xpc_connection_enable_sim2host_4sim();

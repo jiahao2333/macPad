@@ -14100,6 +14100,78 @@ DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
 // pass-through when unset. This is the most general feasible substitute until a
 // larger VA window exists (kernel/platform); we will not unlock that via OS upgrade/wipe.
 static char *macws_gigacage_enabled_default = "0";
+
+// System-level App Sandbox mach-lookup allow for MacWS private service names.
+// Remapped com.apple.macosbooter.* endpoints must be reachable from sandboxed
+// macOS apps (Safari WebKit, etc.) without per-app entitlement re-signing.
+// Only applies inside MacWS chroot processes (DYLD-inserted libmachook).
+enum { MACWS_SANDBOX_FILTER_GLOBAL_NAME = 2 }; // SANDBOX_FILTER_GLOBAL_NAME
+static bool macws_sandbox_allow_macosbooter_mach_name(const char *name) {
+    return name && !strncmp(name, "com.apple.macosbooter.", 22);
+}
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+extern int sandbox_check_by_audit_token(audit_token_t token, const char *operation,
+                                        int type, ...);
+int sandbox_check_new(pid_t pid, const char *operation, int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    if (operation && strcmp(operation, "mach-lookup") == 0 &&
+        type == MACWS_SANDBOX_FILTER_GLOBAL_NAME) {
+        const char *svc = va_arg(ap, const char *);
+        va_end(ap);
+        if (macws_sandbox_allow_macosbooter_mach_name(svc)) {
+            static _Atomic unsigned allowed;
+            unsigned n = atomic_fetch_add_explicit(&allowed, 1, memory_order_relaxed);
+            if (n < 32) {
+                int fd = open("/tmp/macws-sandbox-allow.log",
+                              O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (fd >= 0) {
+                    char line[256];
+                    int len = snprintf(line, sizeof(line),
+                        "pid=%d sandbox_check allow mach-lookup %s\n",
+                        getpid(), svc);
+                    if (len > 0) (void)write(fd, line, (size_t)len);
+                    close(fd);
+                }
+            }
+            return 0;
+        }
+        return sandbox_check(pid, operation, type, svc);
+    }
+    // Non-mach-lookup or other filter types: forward without consuming args we
+    // do not understand by calling through a typed helper where possible.
+    // For unknown filter payloads, fall back to deny-safe original via
+    // sandbox_check with no extra args when type is 0 (SANDBOX_FILTER_NONE).
+    if (type == 0) {
+        va_end(ap);
+        return sandbox_check(pid, operation, type);
+    }
+    // Best-effort: one pointer arg is the common GLOBAL_NAME / LITERAL shape.
+    const void *arg = va_arg(ap, const void *);
+    va_end(ap);
+    return sandbox_check(pid, operation, type, arg);
+}
+int sandbox_check_by_audit_token_new(audit_token_t token, const char *operation,
+                                     int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    if (operation && strcmp(operation, "mach-lookup") == 0 &&
+        type == MACWS_SANDBOX_FILTER_GLOBAL_NAME) {
+        const char *svc = va_arg(ap, const char *);
+        va_end(ap);
+        if (macws_sandbox_allow_macosbooter_mach_name(svc))
+            return 0;
+        return sandbox_check_by_audit_token(token, operation, type, svc);
+    }
+    if (type == 0) {
+        va_end(ap);
+        return sandbox_check_by_audit_token(token, operation, type);
+    }
+    const void *arg = va_arg(ap, const void *);
+    va_end(ap);
+    return sandbox_check_by_audit_token(token, operation, type, arg);
+}
+
 char *getenv_new(const char *name) {
     char *value = getenv(name);
     if (!name || strcmp(name, "GIGACAGE_ENABLED") != 0)
@@ -14112,6 +14184,8 @@ char *getenv_new(const char *name) {
     return macws_gigacage_enabled_default;
 }
 
+DYLD_INTERPOSE(sandbox_check_new, sandbox_check);
+DYLD_INTERPOSE(sandbox_check_by_audit_token_new, sandbox_check_by_audit_token);
 DYLD_INTERPOSE(getenv_new, getenv);
 DYLD_INTERPOSE(mmap_new, mmap);
 DYLD_INTERPOSE(mprotect_new, mprotect);
@@ -14340,8 +14414,12 @@ static void macws_register_webkit_bundle_if_needed(const char *proxyLeaf) {
         return;
     }
 }
-#define GEOD_XPC_SERVICE "com.apple.geod"
-#define GEOD_XPC_SERVICE_NEW "com.apple.macosbooter.geod"
+
+// System-level Application-type XPC activation for sandboxed AND unsandboxed
+// clients. Prefer keeping activate_name == original so App Sandbox mach-lookup
+// checks the stock name the app is already allowed to use; the freestanding
+// chroot proxy is attached via xpc_add_bundle in this process's domain.
+// When activate_name differs (DockHelper), remap after register.
 #define WEBKIT_WEBCONTENT_SERVICE "com.apple.WebKit.WebContent"
 #define WEBKIT_WEBCONTENT_SERVICE_NEW "com.apple.macosbooter.WebKit.WebContent"
 #define WEBKIT_NETWORKING_SERVICE "com.apple.WebKit.Networking"
@@ -14350,6 +14428,119 @@ static void macws_register_webkit_bundle_if_needed(const char *proxyLeaf) {
 #define WEBKIT_GPU_SERVICE_NEW "com.apple.macosbooter.WebKit.GPU"
 #define SAFARI_SANDBOX_BROKER_SERVICE "com.apple.Safari.SandboxBroker"
 #define SAFARI_SANDBOX_BROKER_SERVICE_NEW "com.apple.macosbooter.Safari.SandboxBroker"
+
+
+// Issue+consume a mach sandbox extension for a MacWS private name when the
+// process is allowed to issue WebKit mach extensions (Safari/WebKit apps).
+// Generic for any com.apple.macosbooter.* activation — no entitlement re-sign.
+static void macws_issue_macosbooter_mach_extension(const char *serviceName) {
+    if (!macws_sandbox_allow_macosbooter_mach_name(serviceName)) return;
+    typedef char *(*issue_fn)(const char *, const char *, uint32_t);
+    typedef int (*consume_fn)(const char *);
+    static issue_fn issue = NULL;
+    static consume_fn consume = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        issue = (issue_fn)dlsym(RTLD_DEFAULT, "sandbox_extension_issue_mach");
+        consume = (consume_fn)dlsym(RTLD_DEFAULT, "sandbox_extension_consume");
+    });
+    if (!issue || !consume) return;
+    // Prefer WebKit's extension class (Safari sbpl already allows issuing it).
+    const char *classes[] = {
+        "com.apple.webkit.extension.mach",
+        "com.apple.app-sandbox.mach",
+        "com.apple.security.exception.mach-lookup.global-name",
+    };
+    for (size_t i = 0; i < sizeof(classes)/sizeof(classes[0]); i++) {
+        char *token = issue(classes[i], serviceName, 0);
+        if (token) {
+            (void)consume(token);
+            free(token);
+            int fd = open("/tmp/macws-sandbox-allow.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                char line[320];
+                int len = snprintf(line, sizeof(line),
+                    "pid=%d extension class=%s service=%s\n",
+                    getpid(), classes[i], serviceName);
+                if (len > 0) (void)write(fd, line, (size_t)len);
+                close(fd);
+            }
+            return;
+        }
+    }
+}
+
+xpc_connection_t macws_xpc_create_application_service(
+        const char *name, dispatch_queue_t targetq,
+        xpc_connection_t (*create_fn)(const char *, dispatch_queue_t)) {
+    if (!name || !create_fn) return NULL;
+    {
+        static _Atomic unsigned macws_app_xpc_trace = 0;
+        unsigned n = atomic_fetch_add_explicit(&macws_app_xpc_trace, 1,
+                                               memory_order_relaxed);
+        if (n < 64) {
+            int fd = open("/tmp/macws-xpc-app.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                char line[320];
+                int len = snprintf(line, sizeof(line),
+                    "pid=%d app-xpc name=%s\n", getpid(), name);
+                if (len > 0) (void)write(fd, line, (size_t)len);
+                close(fd);
+            }
+        }
+    }
+    const MacWSXpcAppServiceRow *row = macws_xpc_app_services_lookup(name);
+    if (row) {
+        macws_register_xpc_app_proxy_bundle(row->relativeProxy);
+        {
+            int fd = open("/tmp/macws-xpc-app.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                char line[400];
+                int len = snprintf(line, sizeof(line),
+                    "pid=%d TSV-hit orig=%s activate=%s proxy=%s\n",
+                    getpid(), row->original, row->privateName,
+                    row->relativeProxy);
+                if (len > 0) (void)write(fd, line, (size_t)len);
+                close(fd);
+            }
+        }
+        macws_issue_macosbooter_mach_extension(row->privateName);
+        return create_fn(row->privateName, targetq);
+    }
+    // Hardcoded WebKit / Safari SandboxBroker bootstrap (same-name activate).
+    const char *leaf = NULL;
+    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
+        leaf = "WebContentProxy.xpc";
+    else if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
+        leaf = "WebNetworkingProxy.xpc";
+    else if (!strcmp(name, WEBKIT_GPU_SERVICE))
+        leaf = "WebGPUProxy.xpc";
+    else if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
+        leaf = "SafariSandboxProxy.xpc";
+    if (!leaf) return NULL;
+    macws_register_webkit_bundle_if_needed(leaf);
+    // Activate under private macosbooter.* name (proxies' CFBundleIdentifier).
+    // Avoids colliding with iOS WebKit peers that own the public names.
+    // Seatbelt: macws_sandbox_check_* allows com.apple.macosbooter.* lookups
+    // for all libmachook chroot processes (system-level, not per-app re-sign).
+    const char *activate = name;
+    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
+        activate = WEBKIT_WEBCONTENT_SERVICE_NEW;
+    else if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
+        activate = WEBKIT_NETWORKING_SERVICE_NEW;
+    else if (!strcmp(name, WEBKIT_GPU_SERVICE))
+        activate = WEBKIT_GPU_SERVICE_NEW;
+    else if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
+        activate = SAFARI_SANDBOX_BROKER_SERVICE_NEW;
+    macws_issue_macosbooter_mach_extension(activate);
+    return create_fn(activate, targetq);
+}
+
+#define GEOD_XPC_SERVICE "com.apple.geod"
+#define GEOD_XPC_SERVICE_NEW "com.apple.macosbooter.geod"
 #define DISKARBITRATIOND_SERVICE_ORIG \
     "com.apple.DiskArbitration.diskarbitrationd"
 #define DISKARBITRATIOND_SERVICE_NEW \
@@ -14592,14 +14783,10 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
     // com.apple.geod executable.
     if (!strcmp(name, GEOD_XPC_SERVICE))
         return GEOD_XPC_SERVICE_NEW;
-    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
-        return WEBKIT_WEBCONTENT_SERVICE_NEW;
-    if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
-        return WEBKIT_NETWORKING_SERVICE_NEW;
-    if (!strcmp(name, WEBKIT_GPU_SERVICE))
-        return WEBKIT_GPU_SERVICE_NEW;
-    if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
-        return SAFARI_SANDBOX_BROKER_SERVICE_NEW;
+    // WebKit/Safari SandboxBroker: do not bootstrap-remap to macosbooter.*;
+    // Application-type activation keeps the stock name for seatbelt checks
+    // (see macws_xpc_create_application_service).
+
     // CoreFoundation's Ventura _CFVolumeObserver asks DiskArbitration for the
     // initial mounted-volume set and a terminal "existing events received"
     // event.  Runtime sampling of the stock Ventura sharedfilelistd on
@@ -15574,34 +15761,13 @@ xpc_connection_t macws_xpc_connection_create_early(
         return macws_xpc_connection_create_mach_service_raw(
             GEOD_XPC_SERVICE_NEW, targetq, 0);
     }
-    // Generic TSV-backed Application-type XPC (system-level). Prefer this for
-    // newly registered software; hardcoded WebKit branches remain as fallback.
-    if (name) {
-        const MacWSXpcAppServiceRow *row = macws_xpc_app_services_lookup(name);
-        if (row) {
-            macws_register_xpc_app_proxy_bundle(row->relativeProxy);
-            return xpc_connection_create(row->privateName, targetq);
-        }
-    }
-    // Safari WebKit XPC services: iPadOS owns the public WebKit names for
-    // MobileSafari. Application-type proxies (WebKitChrootProxy) are activated
-    // via xpc_add_bundle like DockHelper so xpcproxy preserves the one-shot
-    // per-instance NSRunLoop/NSApplication context across chroot+exec.
-    if (name && !strcmp(name, WEBKIT_WEBCONTENT_SERVICE)) {
-        macws_register_webkit_bundle_if_needed("WebContentProxy.xpc");
-        return xpc_connection_create(WEBKIT_WEBCONTENT_SERVICE_NEW, targetq);
-    }
-    if (name && !strcmp(name, WEBKIT_NETWORKING_SERVICE)) {
-        macws_register_webkit_bundle_if_needed("WebNetworkingProxy.xpc");
-        return xpc_connection_create(WEBKIT_NETWORKING_SERVICE_NEW, targetq);
-    }
-    if (name && !strcmp(name, WEBKIT_GPU_SERVICE)) {
-        macws_register_webkit_bundle_if_needed("WebGPUProxy.xpc");
-        return xpc_connection_create(WEBKIT_GPU_SERVICE_NEW, targetq);
-    }
-    if (name && !strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE)) {
-        macws_register_webkit_bundle_if_needed("SafariSandboxProxy.xpc");
-        return xpc_connection_create(SAFARI_SANDBOX_BROKER_SERVICE_NEW, targetq);
+    // Application-type XPC (WebKit/Safari + TSV): activate via xpc_add_bundle
+    // under the stock name when possible so App Sandbox mach-lookup sees the
+    // original id. Shared-cache callers also take this path via Metal_hooks.
+    {
+        xpc_connection_t app = macws_xpc_create_application_service(
+            name, targetq, xpc_connection_create);
+        if (app) return app;
     }
     return xpc_connection_create(name, targetq);
 }

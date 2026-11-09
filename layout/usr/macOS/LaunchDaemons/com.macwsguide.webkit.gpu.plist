@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- NOT the default activation path: WebKit/Safari SandboxBroker are Application-type XPC; libmachook uses xpc_add_bundle like DockHelper. These Geod-style MachServices plists are retained for experiments only; GIGACAGE_ENABLED=0 here is a temporary diagnostic guard, not the Gigacage fix. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- KEEP UNLOADED: claiming com.apple.macosbooter.WebKit.* via MachServices makes launchd start the XPC-bundle proxy as a daemon, which dies with "An XPC Service cannot be run directly" and blocks xpc_add_bundle activation. Application-type path only. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
