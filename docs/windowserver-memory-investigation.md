@@ -91,6 +91,66 @@ tick=8 nonlease_live=224 nonlease=312.3MB lease_live=107 lease=199.0MB plain_nat
 
 原因是 pending 候选仍然只在 `macws_vnc_complete_composite` 里选，drain 只丢掉从来没被 End 配对的栈项。但如果 SkyLight 在 EndUpdate 之后才补 End，那一帧的候选就会丢。出现回归时先用 `MACWS_VNC_STAGE_DRAIN=0` 做 A/B 对照。
 
+## 实测结论 2：IOSurface 释放 ABI 不匹配（根因，2026-11-09 晚）
+
+> 来源：iPad14,5（iPadOS 16.5 20F66）上三次 `MACWS_MEMDIAG=1` 会话，打开 macOS 天气（Weather）作为触发。5 秒一组采样。数字逐字摘自 `WindowServer.err` 和 `trend.tsv`。
+
+### 现象
+
+装上 composite stage drain/cap（5933628）以后，stage 栈已经平了（`composite_stage_depth` 0–2，`stages_drained_at_endupdate` 持续增长），但打开天气后 WindowServer 仍然在 15–20 秒内从约 400 MB 涨到 3–4.5 GB。涨的全是 `ledger_purgeable_nonvolatile`（含 compressed），hook 到的 Metal、graphics、malloc 都很小。
+
+### 诊断：`MACWS-PURGEDIAG`（`libmachook/Diagnostics/MacWSPurgeableDiag.m`）
+
+跟 `MACWS_MEMDIAG=1` 一起开，只在 WindowServer 里生效，纯观察。MEMDIAG 的定时器同时从 10 秒改成 5 秒。每个 tick 输出：
+
+```
+#### MACWS-PURGEDIAG census tick= conn= id_off= live= nonvolatile=N/MB volatile=N/MB empty=N/MB query_failed=N/MB(last kr) size_unknown= own_nv= import_nv= ledger_nv=MB+MBc ledger_vol= untracked_nv= state_mismatch= overflow= unknown_release=
+#### MACWS-PURGEDIAG origins kcreate=N/MBnv api=N/MBnv lookup=N/MBnv
+#### MACWS-PURGEDIAG setpurgeable surf_kernel nv=ok/fail vol= empty= keep= old[...] api[...] gpu ... gpu_res create= fail= final=
+#### MACWS-PURGEDIAG surf-sel <selector>=calls/fail ...        (IOSurface user client 的每个 selector)
+#### MACWS-PURGEDIAG site live= bytes= nv= created= released= set[...] <5 帧 image+offset>   (前 10)
+#### MACWS-PURGEDIAG setter ...                                 (IOSurfaceSetPurgeable 的调用点)
+#### MACWS-PURGEDIAG fmt pf= w>= h>= live= bytes= nv=            (前 10)
+#### MACWS-PURGEDIAG vmwalk nonvolatile=regions/MB(res MB) volatile=... empty=...
+#### MACWS-PURGEDIAG vmwalk-tags (tag:state resMB) ...
+```
+
+数据来源：
+- `IOSurfaceCreate_safe` 返回值（API 创建，带大小/格式/调用栈）；`IOConnectCallMethod_new` 里 IOSurface 连接的每个 selector 和 kr（连接按调用方镜像是 `IOSurface` 来识别，`IOObjectGetClass` 对 connect port 在这个内核上返回空串）；sel 0 回复里的 surfaceID 偏移在运行时用第一次 API 创建对出来（实测 `id_off=24`）；释放 adapter 的结果。
+- 状态用 `IOSurfaceLookup` + `IOSurfaceSetPurgeable(kIOSurfacePurgeableKeepCurrent)` 查询，不会改变状态。
+- `vmwalk` 用 `mach_vm_region_recurse` + `mach_vm_purgable_control(GET_STATE)` 遍历本进程映射的 purgeable 对象，按 VM tag 汇总（88 = IOSurface，100 = IOAccelerator）。
+
+### 三次运行
+
+| 运行 | libmachook | 打开天气前 phys | 天气后最高 phys | ledger_nv（+compressed） | vmwalk 映射 nonvolatile | 结果 |
+|---|---|---|---|---|---|---|
+| A 20:06 | 5933628 + 诊断 v1 | 427.6 MB | 3870.8 MB（6 秒内 577→2582→3870） | 1511.1 + 2227.6 MB | 861 区 / 4328 MB | 触发 3 GB 中止，回滚 memdiag |
+| B 20:12 | + 诊断 v2（识别连接、5 帧调用栈） | 355.0 MB | 4571.0 MB | 1977.1 + 2480.5 MB | 866 区 / 4527.6 MB | 触发 3 GB 中止，回滚 memdiag |
+| C 20:18 | + 释放 ABI 修复 | 326–330 MB | 524.7 MB（60 次点城市+滚动的压力操作期间），之后稳定在 418–423 MB（至 20:27:46） | 303.9 MB（+0） | 159 区 / 275 MB | 跑满监控窗口，无中止 |
+
+关键证据：
+- A：`SkyLight+0x2d44f8 < SkyLight+0x2d42a0`（`iosurface_create_common` ← `WSIOSurfaceCreateWithFormat`）在约 15 秒里创建了 461 个 surface，共 4064 MB，几乎全是 BGRA、宽高 1024–2047（每个约 9.7 MB，窗口大小的 backing store）。`setpurgeable` 一共只有 10 次调用，所以不是“该变 volatile 没变”，而是 surface 根本没被释放。
+- B：`surf-sel ... 0=542/0 0x1=476/476`。WindowServer 发起的 476 次释放**全部失败**；诊断表随“释放”删了条目，所以 `live=74`，但 vmwalk 看到 866 个 IOSurface 区、4.5 GB 仍然映射着。
+- C：`#### IOSURFACE-RELEASE-ABI probe surfaceID=40 sel=1 -> 0xe00002c2; native trap4 -> 0 trap5 -> 0; mode=native-traps`，之后 `0x1=…/0`（释放不再失败）。
+
+### 根因
+
+`mac_hooks.m` 的 `IOConnectTrap1_new` 把 macOS 13.4 `IOSurfaceClientRelease` 的 trap 对（`IOConnectTrap1(conn, 4, id)` / `IOConnectTrap1(conn, 5, id)`）改写成 iOS 16.3 的 `IOConnectCallMethod(conn, 1, &id, 1)`：吞掉 trap 4，把 trap 5 换成 selector 1。这是按 iPad13 / iOS 16.3（IOSurface DF041B53）做的。
+
+iOS 16.5 不一样。从 iPad14,5 自己的 dyld cache 静态反汇编 `_IOSurfaceClientRelease`（`0x1a5782910 mov w1,#0x4 → IOConnectTrap1`，`0x1a5782974 mov w1,#0x5 → IOConnectTrap1`）：iOS 16.5 用的就是和 macOS 一样的 trap 对。iOS 16.5 内核对 selector 1 返回 `kIOReturnBadArgument`（0xe00002c2）。结果 WindowServer 创建的每一个 IOSurface 在内核里都不会被释放，内存一直挂在 WindowServer 的 owner ledger 上，默认状态 nonvolatile，所以表现为 `ledger_purgeable_nonvolatile` 暴涨。天气这种窗口内容频繁重建 backing store 的 app 会在几秒内放大这个泄漏。
+
+同一次反汇编也确认 `IOSurfaceClientSetPurgeable` 两边 ABI 完全一样（selector 0x14，in = {surfaceID, state}，1 个 scalar out），H2 里“SetPurgeable selector 不匹配”的猜测不成立。
+
+### 修复（默认开启，不需要环境变量）
+
+`IOConnectTrap1_new` 改成按内核行为决定一次：
+- 第一对释放仍然先走 selector 1。内核接受 → 记为 `mode=selector1`（iOS 16.3 行为不变）。
+- 内核拒绝 → 对同一个 surface 补发原生 trap 4、trap 5。trap 5 成功 → 记为 `mode=native-traps`，之后所有 trap 对原样透传。
+- 切换瞬间已经被吞掉 trap 4 的那一对，会在 trap 5 前补发 trap 4。
+- 原生模式下 trap 失败会打 `#### IOSURFACE-RELEASE-ABI native trap%u failure`（前 16 次，之后每 500 次一行）；selector 1 模式的失败也改成 `dprintf`，前 16 次和每 500 次一行（以前用 `fprintf(stderr)`，在 WindowServer 里实测没有落到日志里）。
+
+**要盯的回归**：`mode=` 那一行每次 WindowServer 启动应该只出现一次；不应该出现 `native trap… failure`；`surf-sel` 里 `0x1` 的 fail 应该是 0。iOS 16.3 设备上应该打 `mode=selector1`。
+
 ## 结论速览（按可能性排序）
 
 > 下面是实测之前只读代码时的排序，保留作记录。实测结果见上一节：H1 里的 `g_wscd_tex` 被排除，真正的泄漏是 H1 第 3 项 `g_vnc_composite_stages`，当时只读代码判断它可能性低，判断错了。
@@ -217,4 +277,6 @@ libmachook hook 了 SkyLight 的 `StartComposite*`、`EndCurrentComposite` 和 `
 1. ~~打开诊断跑一次会话~~（2026-11-09 已完成，定位到 composite stage 栈）。
 2. 装上带 stage drain/cap 的 libmachook，开 MEMDIAG 复跑同样的会话，确认 `composite_stage_depth ≤ 8`、footprint 平稳、final-composite 仍然 `published=YES`。
 3. 定位 SkyLight 不经过 `EndCurrentComposite` 就结束 composite 的那条路径，看能不能在源头配对。
-4. 如果修复后 footprint 仍然在涨，再看新增的 purgeable/media/neural ledger，以及 H2（CA 的 purgeable 和 `SetPurgeable` 路径）。
+4. ~~如果修复后 footprint 仍然在涨，再看新增的 purgeable/media/neural ledger，以及 H2（CA 的 purgeable 和 `SetPurgeable` 路径）。~~（2026-11-09 已完成：根因是 IOSurface 释放 ABI，见“实测结论 2”。SetPurgeable ABI 两边一致。）
+5. 在 iOS 16.3 设备上确认打出 `mode=selector1`，且释放不失败。
+6. 长时间会话（>1 小时、多个 app）复跑，看剩下的 `untracked_nv`（约 70–80 MB，主要是没走 API 创建的 surface 和 IOAccelerator）是否平稳。
