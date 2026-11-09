@@ -17408,11 +17408,13 @@ static struct macws_agx_t82_request
     g_macwsAgxT82Requests[MACWS_AGX_T82_REQUEST_CAP];
 static uint64_t g_macwsAgxT82RequestSequence;
 
+extern BOOL macws_memdiag_enabled(void);
 static bool macws_agx_life_diagnostics_enabled(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
         value = macws_runtime_diagnostics_enabled() ||
+            macws_memdiag_enabled() ||
             getenv("MACWS_AGX_LIFE_VERBOSE") != NULL ||
             macws_iogpu_error_diag_enabled() ||
             macws_submit_ring_enabled() ||
@@ -17613,6 +17615,38 @@ static void macws_agx_life_destroy(uint64_t gid, IOReturn kr) {
                                           surface_id, bytes, kr);
     }
     pthread_mutex_unlock(&g_agxLifeLock);
+}
+
+// MACWS_MEMDIAG periodic summary of the kernel-accepted IOGPU resource
+// lifecycle table above.  Returns the formatted length, or 0 when the
+// lifecycle table is not being maintained in this process.
+int macws_agx_life_memdiag_format(char *buffer, size_t length) {
+    if (!buffer || length == 0 || !macws_agx_life_diagnostics_enabled())
+        return 0;
+    pthread_mutex_lock(&g_agxLifeLock);
+    uint64_t live_total = 0, bytes_total = 0;
+    for (unsigned i = 0; i < 256; i++) {
+        live_total += g_agxLifeLive[i];
+        bytes_total += g_agxLifeBytes[i];
+    }
+    int written = snprintf(buffer, length,
+        "live=%llu/%lluMB t0=%llu/%lluMB t80=%llu/%lluMB t82=%llu/%lluMB "
+        "okC=%llu okD=%llu failC=%llu unmatchedD=%llu full=%llu",
+        (unsigned long long)live_total,
+        (unsigned long long)(bytes_total >> 20),
+        (unsigned long long)g_agxLifeLive[0],
+        (unsigned long long)(g_agxLifeBytes[0] >> 20),
+        (unsigned long long)g_agxLifeLive[0x80],
+        (unsigned long long)(g_agxLifeBytes[0x80] >> 20),
+        (unsigned long long)g_agxLifeLive[0x82],
+        (unsigned long long)(g_agxLifeBytes[0x82] >> 20),
+        (unsigned long long)g_agxLifeCreateOK,
+        (unsigned long long)g_agxLifeDestroyOK,
+        (unsigned long long)g_agxLifeCreateFail,
+        (unsigned long long)g_agxLifeUnmatchedDestroy,
+        (unsigned long long)g_agxLifeTableFull);
+    pthread_mutex_unlock(&g_agxLifeLock);
+    return written > 0 ? written : 0;
 }
 
 static const struct macws_agx_life_entry *
