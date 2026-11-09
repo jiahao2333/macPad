@@ -14087,6 +14087,32 @@ DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
 DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
+
+// System-level Gigacage policy for macPad chroot on iPadOS.
+// Field-measured on iPad14,5 (iPadOS 16.5 / macOS 13.4 chroot):
+//   best mach_vm_map reservation ≈ 31 GiB at 32 GiB alignment, ≈ 53 GiB at 1 GiB
+//   alignment. Ventura JavaScriptCore requests totalSize=80 GiB with
+//   maxAlignment=32 GiB → KERN_NO_SPACE, then FATAL abort in Gigacage::ensureGigacage.
+// Full-size Gigacage reservation is therefore platform-infeasible here (not a
+// per-app bug). Default GIGACAGE_ENABLED to "0" for every libmachook process so
+// newly installed JSC/WebKit clients keep running without per-app env. Explicit
+// GIGACAGE_ENABLED=1 still wins (diagnostic). MACWS_ALLOW_GIGACAGE=1 also forces
+// pass-through when unset. This is the most general feasible substitute until a
+// larger VA window exists (kernel/platform); we will not unlock that via OS upgrade/wipe.
+static char *macws_gigacage_enabled_default = "0";
+char *getenv_new(const char *name) {
+    char *value = getenv(name);
+    if (!name || strcmp(name, "GIGACAGE_ENABLED") != 0)
+        return value;
+    if (value)
+        return value;
+    char *allow = getenv("MACWS_ALLOW_GIGACAGE");
+    if (allow && allow[0] && allow[0] != '0')
+        return value;
+    return macws_gigacage_enabled_default;
+}
+
+DYLD_INTERPOSE(getenv_new, getenv);
 DYLD_INTERPOSE(mmap_new, mmap);
 DYLD_INTERPOSE(mprotect_new, mprotect);
 DYLD_INTERPOSE(munmap_new, munmap);
@@ -14215,6 +14241,71 @@ static void macws_register_dock_helper_bundle_if_needed(void) {
     xpc_add_bundle(path, 2);
 }
 
+
+// Generic Application-type XPC table (system-level). Rows live in
+// /var/jb/usr/macOS/etc/macws-xpc-app-services.tsv so newly installed software
+// can be remapped without rebuilding libmachook. Hardcoded WebKit branches
+// below remain as a fast path / bootstrap when the TSV is missing.
+typedef struct {
+    char original[128];
+    char privateName[128];
+    char relativeProxy[512];
+} MacWSXpcAppServiceRow;
+enum { MACWS_XPC_APP_SERVICE_MAX = 64 };
+static MacWSXpcAppServiceRow g_macws_xpc_app_services[MACWS_XPC_APP_SERVICE_MAX];
+static int g_macws_xpc_app_service_count = -1;
+static void macws_xpc_app_services_load(void) {
+    if (g_macws_xpc_app_service_count >= 0) return;
+    g_macws_xpc_app_service_count = 0;
+    FILE *fp = fopen("/usr/local/etc/macws-xpc-app-services.tsv", "r");
+    if (!fp)
+        fp = fopen("/var/jb/usr/macOS/etc/macws-xpc-app-services.tsv", "r");
+    if (!fp) return;
+    char line[768];
+    while (fgets(line, sizeof(line), fp) &&
+           g_macws_xpc_app_service_count < MACWS_XPC_APP_SERVICE_MAX) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+        char *tab1 = strchr(line, '\t'); if (!tab1) continue; *tab1 = 0;
+        char *tab2 = strchr(tab1 + 1, '\t'); if (!tab2) continue; *tab2 = 0;
+        MacWSXpcAppServiceRow *row =
+            &g_macws_xpc_app_services[g_macws_xpc_app_service_count];
+        snprintf(row->original, sizeof(row->original), "%s", line);
+        snprintf(row->privateName, sizeof(row->privateName), "%s", tab1 + 1);
+        snprintf(row->relativeProxy, sizeof(row->relativeProxy), "%s", tab2 + 1);
+        g_macws_xpc_app_service_count++;
+    }
+    fclose(fp);
+}
+static const MacWSXpcAppServiceRow *macws_xpc_app_services_lookup(
+        const char *name) {
+    if (!name) return NULL;
+    macws_xpc_app_services_load();
+    for (int i = 0; i < g_macws_xpc_app_service_count; i++) {
+        if (!strcmp(g_macws_xpc_app_services[i].original, name))
+            return &g_macws_xpc_app_services[i];
+    }
+    return NULL;
+}
+static void macws_register_xpc_app_proxy_bundle(const char *relativeProxy) {
+    if (!relativeProxy || !relativeProxy[0]) return;
+    static char registered[MACWS_XPC_APP_SERVICE_MAX][512];
+    static int registeredCount = 0;
+    for (int i = 0; i < registeredCount; i++) {
+        if (!strcmp(registered[i], relativeProxy)) return;
+    }
+    if (registeredCount < MACWS_XPC_APP_SERVICE_MAX)
+        snprintf(registered[registeredCount++], sizeof(registered[0]),
+                 "%s", relativeProxy);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/usr/local/libexec/macws-xpc/%s",
+             relativeProxy);
+    if (access(path, F_OK) != 0)
+        snprintf(path, sizeof(path), "/var/jb/usr/macOS/Frameworks/%s",
+                 relativeProxy);
+    xpc_add_bundle(path, 2);
+}
+
 // Safari WebKit XPC services are Application-type (_MultipleInstances +
 // NSRunLoop), same activation class as DockHelper. A permanent launchd Mach
 // listener cannot preserve xpcproxy's per-instance NSApplication context and
@@ -14239,8 +14330,12 @@ static void macws_register_webkit_bundle_if_needed(const char *proxyLeaf) {
             return;
         char path[PATH_MAX];
         snprintf(path, sizeof(path),
-                 "%s/WebKit.framework/Versions/A/XPCServices/%s",
-                 "/var/jb/usr/macOS/Frameworks", proxyLeaf);
+                 "/usr/local/libexec/macws-xpc/WebKit.framework/Versions/A/XPCServices/%s",
+                 proxyLeaf);
+        if (access(path, F_OK) != 0)
+            snprintf(path, sizeof(path),
+                     "%s/WebKit.framework/Versions/A/XPCServices/%s",
+                     "/var/jb/usr/macOS/Frameworks", proxyLeaf);
         xpc_add_bundle(path, 2);
         return;
     }
@@ -14352,6 +14447,11 @@ static const char *macws_private_bootstrap_lsd_service_name(const char *name) {
 
 static const char *macws_private_bootstrap_service_name(const char *name) {
     if (!name) return name;
+    // Generic TSV Application-type remaps (same table as xpc_connection_create).
+    {
+        const MacWSXpcAppServiceRow *row = macws_xpc_app_services_lookup(name);
+        if (row) return row->privateName;
+    }
     // The settings-extension launch proxy is the first iOS image submitted to
     // RunningBoard, so launchd allocates its managed endpoints under the proxy
     // unique bundle identifier. Ventura derives each peer name from the real
@@ -15473,6 +15573,15 @@ xpc_connection_t macws_xpc_connection_create_early(
     if (name && !strcmp(name, GEOD_XPC_SERVICE)) {
         return macws_xpc_connection_create_mach_service_raw(
             GEOD_XPC_SERVICE_NEW, targetq, 0);
+    }
+    // Generic TSV-backed Application-type XPC (system-level). Prefer this for
+    // newly registered software; hardcoded WebKit branches remain as fallback.
+    if (name) {
+        const MacWSXpcAppServiceRow *row = macws_xpc_app_services_lookup(name);
+        if (row) {
+            macws_register_xpc_app_proxy_bundle(row->relativeProxy);
+            return xpc_connection_create(row->privateName, targetq);
+        }
     }
     // Safari WebKit XPC services: iPadOS owns the public WebKit names for
     // MobileSafari. Application-type proxies (WebKitChrootProxy) are activated

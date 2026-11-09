@@ -1,0 +1,8 @@
+# MacWS Application-type XPC remaps (system-level).
+# original_name	private_name	proxy_relative
+# Resolved under /usr/local/libexec/macws-xpc/ (rootfs-visible) first, then
+# /var/jb/usr/macOS/Frameworks/ (host jb tree).
+com.apple.WebKit.WebContent	com.apple.macosbooter.WebKit.WebContent	WebKit.framework/Versions/A/XPCServices/WebContentProxy.xpc
+com.apple.WebKit.Networking	com.apple.macosbooter.WebKit.Networking	WebKit.framework/Versions/A/XPCServices/WebNetworkingProxy.xpc
+com.apple.WebKit.GPU	com.apple.macosbooter.WebKit.GPU	WebKit.framework/Versions/A/XPCServices/WebGPUProxy.xpc
+com.apple.Safari.SandboxBroker	com.apple.macosbooter.Safari.SandboxBroker	WebKit.framework/Versions/A/XPCServices/SafariSandboxProxy.xpc

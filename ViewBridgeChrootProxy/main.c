@@ -345,9 +345,10 @@ int main(int argc, char *argv[], char *envp[]) {
     } else {
         targetEnvironment[environmentCount++] = insertLibrary;
     }
-    // TEMPORARY diagnostic for WebKit JSC Gigacage reservation failure on
-    // iPadOS (see WebKitChrootProxy/README). Real cage/allocator fix still
-    // required; remove once Gigacage maps succeed without this guard.
+    // Belt-and-suspenders with libmachook getenv_new (system default
+    // GIGACAGE_ENABLED=0). Full 80GiB/32GiB-align Gigacage is VA-infeasible on
+    // iPad14,5 chroot (see field notes); keep explicit env for WebKit proxies
+    // until getenv interpose is verified in every XPC spawn path.
 #if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
     {
         static char gigacageOff[] = "GIGACAGE_ENABLED=0";

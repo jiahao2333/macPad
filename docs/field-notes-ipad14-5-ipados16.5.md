@@ -275,3 +275,56 @@ Kept as a **harmless fallback** when `SSL_CERT_FILE` / `CURL_SSL_BACKEND` are un
 ### Still open (TLS)
 - Optionally wire bring-up into `macos_gui.sh` start path (plists are in LaunchDaemons).
 - Broader CT-policy admit helper for other Apple-signed rootfs/cryptex binaries.
+
+
+## 16. System-level Gigacage + generic XPC (2026-11-10 Asia/Shanghai)
+
+User ask (t120u): system-layer fixes so new software works without per-app patches.
+
+### Gigacage (system policy; full reservation infeasible)
+
+Evidence on iPad14,5 chroot (probe `va_ceiling` / `mmap_align_probe`):
+
+| alignment | max successful anonymous map |
+|-----------|------------------------------|
+| 32 GiB    | **31 GiB**                   |
+| 16 GiB    | 47 GiB                       |
+| 1 GiB     | 53 GiB                       |
+
+Ventura JSC requests `totalSize=85899345920` (80 GiB) with `maxAlignment=34359738368` (32 GiB) → `KERN_NO_SPACE` → FATAL in `Gigacage::ensureGigacage`. **Full-size Gigacage cannot be reserved on this VA ceiling** (not a per-app bug; OS upgrade/wipe out of scope).
+
+**Most general feasible fix shipped:** `libmachook` `getenv_new` defaults `GIGACAGE_ENABLED` to `"0"` when unset for every injected process. Explicit `GIGACAGE_ENABLED=1` or `MACWS_ALLOW_GIGACAGE=1` still opt into the FATAL path for diagnostics. Verified: stock WebContent prints `Warning: disabling gigacage because GIGACAGE_ENABLED=0!` with **no** process env set.
+
+WebKitChrootProxy still also injects `GIGACAGE_ENABLED=0` as belt-and-suspenders until every XPC spawn path is confirmed to load `getenv_new`.
+
+### Generic AMFI CT-policy admit
+
+`layout/usr/macOS/bin/macws_admit_rootfs_binary.sh` — thin arm64e, ldid merge, `jbctl trustcache add`, rollback copy. Used in-place on stock WebContent/Networking/GPU/SandboxBroker (CT policy 0x8 cleared; process starts, then hits Gigacage without the system getenv default).
+
+### Generic Application-type XPC table
+
+- `/usr/local/etc/macws-xpc-app-services.tsv` (rootfs-visible) + `/var/jb/usr/macOS/etc/...` host copy
+- `macws_xpc_register_app_service.sh` appends rows
+- `libmachook` loads TSV on first lookup; `xpc_add_bundle` prefers `/usr/local/libexec/macws-xpc/<relative>` (chroot-visible) then jb Frameworks tree
+- Seeded with WebKit WebContent/Networking/GPU + Safari SandboxBroker
+- Hardcoded WebKit branches retained as bootstrap fallback
+
+Proxies retargeted to **stock** admitted Mach-Os (no per-app `macws-webkit` copies as the preferred path).
+
+### Still open (WebContent stay-up / page render)
+
+After Safari relaunch with new libmachook + rootfs proxies + system Gigacage default:
+
+- Safari launches; `open-documents` delivers `.webloc`
+- **No** macOS `WebContent` / `Networking` / `GPU` stay up (only iOS MobileSafari WebKit XPCs + historically SandboxBroker under old `macws-webkit` path)
+- Likely remaining blocker: Safari App Sandbox `mach-lookup` allowlist vs remapped `com.apple.macosbooter.WebKit.*` names (public names collide with iOS). Entitlement expansion previously SIGKILL'd Safari — needs a careful system-level sandbox allow for the private names, not per-app disables
+- Screenshots: `field-artifacts/net3-*.png` / `/workspace/net3-*.png` (chrome/favorites; pages not rendering)
+
+### a868f70 curl defaults
+
+Kept as **harmless fallback** (`CURL_SSL_BACKEND=openssl` + `SSL_CERT_FILE` still appear in Safari env from hostd). System SecureTransport path is primary after trustd/securityd (commit `66f3d88`).
+
+### Rollback
+
+`/var/mobile/macws-rollback/` + `NOTES.txt`: `libmachook*.pre-gigacage-*`, `libmachook*.pre-xpcpath-*`, `*.pre-admit-*` for WebKit/SandboxBroker, prior TLS/securityd backups.
+
