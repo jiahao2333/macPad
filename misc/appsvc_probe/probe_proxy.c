@@ -26,7 +26,7 @@ extern kern_return_t bootstrap_register(mach_port_t bp, const char *service_name
                                        mach_port_t sp);
 
 #define MACWS_ROOTFS "/var/mnt/rootfs"
-#define SERVICE_PATH "/tmp/macws-appsvc-probe.xpc/macws-appsvc-probe"
+#define SERVICE_PATH "/tmp/macws-appsvc-probe.xpc/macws-appsvc-prexpc"
 
 static void logf_proxy(const char *fmt, ...) {
     char buf[768];

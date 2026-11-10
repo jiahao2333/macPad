@@ -42,7 +42,8 @@ fi
 echo "==== install throwaway probe only ===="
 mkdir -p "$MOBILE"
 if [ ! -x "$MOBILE/probe_proxy" ] || [ ! -x "$MOBILE/probe_client" ] || \
-   [ ! -x "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-probe" ]; then
+   [ ! -x "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-probe" ] || \
+   [ ! -x "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-prexpc" ]; then
     echo "missing staged binaries under $MOBILE"
     ls -la "$MOBILE" || true
     exit 22
@@ -53,8 +54,10 @@ fi
 ldid -S"$ENT" -M "$MOBILE/probe_proxy"
 ldid -S"$ENT" -M "$MOBILE/probe_client"
 ldid -S"$ENT" -M "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-probe"
+ldid -S"$ENT" -M "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-prexpc"
 chmod 755 "$MOBILE/probe_proxy" "$MOBILE/probe_client" \
-    "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-probe"
+    "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-probe" \
+    "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-prexpc"
 
 trust_one() {
     f="$1"
@@ -69,14 +72,16 @@ trust_one "$MOBILE/probe_proxy" arm64e
 trust_one "$MOBILE/probe_client" arm64e
 # service is a macOS arm64 in-chroot executable
 trust_one "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-probe" arm64
-# also try arm64e in case the staged binary is still arm64e
+trust_one "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-prexpc" arm64
 trust_one "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-probe" arm64e
+trust_one "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-prexpc" arm64e
 
 rm -rf "$ROOTFS_XPC"
 mkdir -p "$ROOTFS_XPC"
 cp -f "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-probe" "$ROOTFS_XPC/macws-appsvc-probe"
+cp -f "$MOBILE/macws-appsvc-probe.xpc/macws-appsvc-prexpc" "$ROOTFS_XPC/macws-appsvc-prexpc"
 cp -f "$MOBILE/macws-appsvc-probe.xpc/Info.plist" "$ROOTFS_XPC/Info.plist"
-chmod 755 "$ROOTFS_XPC/macws-appsvc-probe"
+chmod 755 "$ROOTFS_XPC/macws-appsvc-probe" "$ROOTFS_XPC/macws-appsvc-prexpc"
 rm -f "$LOG" "$NAMEF" "$MOBILE/proxy.out" "$MOBILE/client.out" "$MOBILE/proxy.pid"
 
 echo "==== start proxy (background) then client ===="

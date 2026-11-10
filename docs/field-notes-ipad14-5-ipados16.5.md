@@ -1888,3 +1888,49 @@ A raw `mach_port_allocate` + `mach_ports_register(SERVICE_SLOT)` + `XPC_FLAGS=80
 A later Safari hookup should not assume this placement is sufficient. Next work needs a real packed Application-type launch context (or another way to have stock `xpc_main` consume a live receive on the process main thread with a running main CFRunLoop) that still does not check in `macosbooter.WebKit.*`. This turn did not start a guarded Safari run, did not deploy a libmachook or proxy variant, and left net34 untouched.
 
 Final throwaway CDHashes (not part of the WebKit install): probe_proxy arm64e `9b07655d587ca15bf2dd7f30e5d90f252389da45`; macws-appsvc-probe arm64 `ec6b676f569930306540f786d82238e9180f5520` (sha1 candidate `75001742915089225d070a45be51a963f6985e6f`).
+
+## 57. Packed Application-type context: the RECEIVE is already a dead name before libxpc is linked; launchd's blob+ports is the missing piece (2026-11-11 01:34:01 CST / 2026-11-10 09:34:01 PT)
+
+Follow-up to §56. Standalone throwaway probe only. No Safari launch, no new libmachook, no change to the live net34 WebKit install, no reboot, no 停止 macOS. IconServices 1724 / 53067 / 53071 stayed loaded. `com.macwsguide.webkit.*` LaunchDaemons stayed unloaded. No public `macosbooter.WebKit.*` check-in. Device remained on net34: libmachook arm64e `d774151c50fb3e893c1d93f3d7df0063e200bc7b` / arm64 `6724bb1f417ae8fd618689b9ff0c4fc9184465ce`, pre- and post-flight identical. Rollback tag `pre-net37-20261111-001219` was not used.
+
+Sources (no binaries on the PR): `misc/appsvc_probe/` now also has `probe_prexpc.c` (macOS 13 arm64, libSystem only). Throwaway paths unchanged under `/var/mobile/appsvc-probe/` and `/var/mnt/rootfs/tmp/macws-appsvc-probe.xpc/` (byte-copied after signing on the mobile vnode).
+
+### What Apple xpcproxy actually packs
+
+Read-only copies of the live binaries (`/usr/libexec/xpcproxy` iOS 96 352 B, libxpc_executables-2462.120.4; `/var/mnt/rootfs/usr/libexec/xpcproxy` fat x86_64+arm64e, 2462.121.1) plus HookCase's xpcproxy notes and the x86_64 slice disassembly:
+
+1. launchd `posix_spawn`s xpcproxy with two registered ports (bootstrap + a pipe back to launchd; HookCase, `OS_ALLOC_ONCE_KEY_LIBXPC`).
+2. xpcproxy `xpc_pipe_routine`s launchd and gets a reply whose interesting keys include **`blob`**, **`ports`**, program / argv / environment, cwd, stdin/stdout/stderr, username / group, sandbox profile, container_id, `setup-event`, `uuid`, `XPC_FLAGS`, `Executable` / `Path`.
+3. If `blob` is missing, xpcproxy logs **`No spawn attr blob`** (the string already cited in net17–net19). If it is present but shorter than **`0x104` (260) bytes**, it logs **`Insufficient spawnattr length: %zu < %lu`** (the `%lu` immediate is `0x104`). The first 0x104 bytes are a packed `posix_spawnattr`; the tail is applied together with the `ports` object (special / registered ports).
+4. xpcproxy then `posix_spawn`s the service over itself with **`POSIX_SPAWN_SETEXEC`**, using that unpacked attr + env. The child's `__libxpc_initializer` is supposed to see a live `SERVICE_SLOT` receive and `XPC_FLAGS=8019` *because the kernel already applied that attr*, not because the service re-reads the launchd blob.
+
+`__xpc_spawnattr_binprefs_pack/unpack` (libxpc TBD) is the CPU-architecture pref helper (`_xpc_binprefs_cpu_type` / `_xpc_binprefs_set_psattr`), not the launch-context blob itself. The packed Application-type context is the launchd reply (`blob` + `ports` + packed environment), applied by xpcproxy via SETEXEC.
+
+### Probe design
+
+The iOS first image still allocated a RECEIVE, `mach_ports_register`ed it in slot 2 (`typ=0x30000`, `recv_rights=1`, `register` kr=0), set `XPC_FLAGS=8019`, `bootstrap_register`ed `com.macwsguide.probe.appsvc.<pid>`, chrooted, and `execve`d a **new libSystem-only stub** (`macws-appsvc-prexpc`) so `__libxpc_initializer` would not run *in that image's link set*. The stub logged `mach_ports_lookup` / `getenv("XPC_FLAGS")` / inherited fds, re-set `XPC_FLAGS=8019`, then `posix_spawnattr_setflags(POSIX_SPAWN_SETEXEC)` + `posix_spawnattr_set_registered_ports_np` of the current slots and SETEXEC'd `macws-appsvc-probe` (stock `xpc_main`). Live net34 libmachook was still inserted; a macOS image still SIGTRAPs without it (§56). A real launchd `blob` was not transplanted: that requires launchd to emit one (xpcproxy's "No spawn attr blob" path is exactly the missing handshake).
+
+### Result (01:34:01.139–01:34:02.276 CST / 09:34:01.139–09:34:02.276 PT, pid 86643)
+
+Before `chroot`+`execve`, the first image again had a live slot-2 RECEIVE (`0x1c07 typ=0x30000`).
+
+**In the libSystem-only stub, already at `main` (no libxpc in the stub's link set):**
+
+```
+environ flags=0x0 service=com.macwsguide.probe.appsvc dyld_insert=/usr/local/lib/libmachook.dylib
+after-exec ports_lookup kr=0 count=3 [0]=0x807 typ=0x10000 [1]=0x0 typ=0x0 [2]=0xffffffff typ=0x100000 DEAD recv_rights=0
+PREXPC_SERVICE_SLOT_SURVIVED=dead_name
+inherited_fds 0 1 2
+```
+
+The receive right is already a dead name, and `XPC_FLAGS` is already the string `0x0`, *before* the test service that links libxpc is admitted. Inherited fds are only 0/1/2 (no packed fileports). So the §56 “libxpc unpacks after exec and overwrites environ” picture has to be narrowed: the destroy is not unique to the service binary linking libxpc. The live libmachook insert (still required for the macOS image to start) loads libmachook, which depends on libxpc, so `__libxpc_initializer` can still run as a constructor of that dependency *before* the stub's `main`. execve itself, that early libxpc/libmachook init, or both, leave slot 2 dead and flags `0x0`. This probe cannot separate those two without a pre-libxpc logger that also does not need libmachook, which this environment does not have (stock `/bin/echo` SIGTRAPs without the insert).
+
+SETEXEC still ran (`set_registered_ports` rc=0; `errno=9` is a leftover from the fd scan, not a setter failure) and did admit the `xpc_main` image (same pid 86643). It could only hand over a dead name in slot 2. After that second image's constructors: `SERVICE_SLOT_SURVIVED=no`, `flags=0x0` again (the stub's `setenv("XPC_FLAGS","8019")` did not survive into the service `main`), stock `xpc_main` entered and SIGTRAP'd (`wait_rc=133` / signal 5) with no accept, no park, no `dispatch_sync_f(main)`, no reply. Client `bootstrap_look_up kr=1102`.
+
+Re-applying 8019 and SETEXEC of a proper posix_spawnattr therefore cannot resurrect a right that is already a dead name at the first after-exec `main`. A homemade `mach_port_allocate` RECEIVE is still not a substitute for launchd's `blob`+`ports`.
+
+### Implication for a later generic proxy fix
+
+The missing system-level object is the launchd-issued spawnattr blob (≥ 0x104 bytes) plus the `ports` array that xpcproxy applies with SETEXEC — the same handshake iOS xpcproxy logs as **`No spawn attr blob`** on the WebKit first image (net17–net19). Until that blob is actually present (or the early destroy of a same-task RECEIVE is prevented *before* `__libxpc_initializer`), placing a RECEIVE in `SERVICE_SLOT` and setting `XPC_FLAGS=8019` in the exec environment will keep showing a dead name and `flags=0x0` at `main`. This turn did not invent a fake 0x104-byte blob (unsafe, version-specific, and too late once the right is already dead) and did not register a throwaway LaunchDaemon to ask launchd for a real one. No Safari hookup, no libmachook or proxy deploy. Device remains on net34.
+
+Throwaway CDHashes (not part of the WebKit install): probe_proxy arm64e `ef4ac526de45efec711db200481420605efbe1fd`; macws-appsvc-prexpc arm64 `12f93b980395fd23d5da46b9a7a1ed6815c15837` (sha1 `e9b6f6a1b53688a434312ede6ea96b8a9204fc56`); macws-appsvc-probe arm64 `269746af25865ca98cff6d8c56189ceee97d39ac` (sha1 `ce0e0391054a526b18b3d64aee80d01dfc4fb096`).

@@ -11,6 +11,7 @@ Throwaway, generic (not Safari-only) probe of the chroot-proxy
   the test service. A macOS image exec'd this way SIGTRAPs unless the
   live chroot `libmachook` is inserted (`MallocNanoZone=0` is not
   sufficient; reproduced with stock `/bin/echo`).
+- `probe_prexpc.c` — macOS 13 arm64, libSystem only. Logs ports/flags after exec before libxpc runs, then `posix_spawn(POSIX_SPAWN_SETEXEC)` of the test service with `set_registered_ports_np` (xpcproxy apply path).
 - `probe_appsvc.c` — macOS 13 arm64 test service (same arch as
   `launchservicesd` / other in-chroot custom executables). Logs
   `mach_ports_lookup` / `XPC_FLAGS`, then calls stock `xpc_main`. On a
