@@ -1778,3 +1778,65 @@ No second variant. net37 was rolled back; the device is back on net34 libmachook
 ### Paint / IPC conclusion
 
 The Safari window did **not** stay visible, so net37 was rolled back to net34 and no net37 screenshots were taken. `run()` **did** start on the incoming-serial queue with real dictionary events (`type=dictionary`, logged `main=1` only because of the TLS hook), and the stock path's `dispatch_*_f(main)` bounce was inlined (30 `main-queue-inline-fn`), but the stock handler did not return and InitializeWebProcess / CreateWebPage did **not** arrive as completed IPC: 0 `xpc event end`, 0 `InitializeWebKit2 call`, 0 replies, no WebContent CAContext, no page paint. Inlining the GCD-main bounce fixed the “callback waits on an undrained main queue” hypothesis as the sole cause, then still hung inside `user(event)` and lost the launch window. The remaining gap, starting again from restored net34, is why that already-delivered dictionary blocks inside the stock callback before InitializeWebKit2 / a reply — and how to get a reply without a delivery that stalls Safari's AppKit window — without checking in the public macosbooter name, adding a competing Mach listener on that name, retrying CAContext ports, stalling Safari's launch thread, or retrying `CFRunLoopRun` / `NSApp` `-run` / the cond-wait drain / this incoming-serial + inline-GCD-main run as the next first step.
+
+## 55. user(event) hang is WorkQueue::main().dispatchSync / initializer needing a live main CFRunLoop; no deploy (2026-11-11 00:16–00:21 CST / 2026-11-10 08:16–08:21 PT)
+
+### Status
+
+Diagnosis only. No libmachook change and no device deploy this turn. The device was left on restored net34 (arm64e `d774151c50fb3e893c1d93f3d7df0063e200bc7b`, arm64 `6724bb1f417ae8fd618689b9ff0c4fc9184465ce`, WebContentProxy `124857f954b1d5174741de2e71bb1b078cda15ec`, net19 layout, IconServices 1724 / 53067 / 53071). No reboot, no 停止 macOS, no second variant, no screenshots. Rollback copies were not used.
+
+### What was already known from the field
+
+net34 delivers unique incoming dictionaries onto a live background serial queue and parks helper main in `dispatch_main`; the wrap logs `xpc event off main; dispatch_async` but `run()` never executes, and the Safari window stays visible.
+
+net36 ran `run()` on the helper main thread via a cond-wait drain: 58 `xpc event begin type=dictionary main=1`, then 0 `xpc event end`, 0 `InitializeWebKit2 call`, and the launch window was lost.
+
+net37 restored `dispatch_main`, ran `run()` on incoming-serial, inlined `dispatch_*_f(main)` (30 `main-queue-inline-fn`, 0 bare block `dispatch_sync` / `dispatch_async`), and lied about `pthread_main_np` / `+[NSThread isMainThread]` for that run. `run()` started (58 begin / xpc-event), the GCD-main bounce was inlined, then `user(event)` still never returned (0 end, 0 hook `InitializeWebKit2 call`) and the window was lost again. Inlining therefore ruled out “the callback only waits on an undrained GCD main queue” as the *sole* cause.
+
+### Why “0 InitializeWebKit2 call” is not evidence IW2 never ran
+
+Every net37 hook install logged `hooked InitializeWebKit2 via offset-unsigned … orig=0x0` and `hooked runInitializationCode … orig=0x0` (57 of each). That is the same shared-cache `MSHookFunction` failure documented in §22: no trampoline is created, the stock functions stay unhooked, and `hooked_InitializeWebKit2` never logs a call even if the stock `InitializeWebKit2` runs. The 57 `InitializeWebKit2 raw=` lines only mean the installer found the UUID offset. This observation also applies to net36’s “0 InitializeWebKit2 call”.
+
+### Stock callback path (WebKit-7615.1.26.11.5 / Ventura 13.4, `safari-7615-branch`)
+
+The accepted-peer `user(event)` is `WebKit::XPCServiceEventHandler`’s message block (`Source/WebKit/Shared/EntryPointUtilities/Cocoa/XPCService/XPCServiceMain.mm`). It requires a dictionary with `message-name`. For `"bootstrap"` it looks up `WebContentServiceInitializer` (or Networking/GPU) in the WebKit bundle, **sends** a `"process-finished-launching"` reply, then:
+
+```
+WorkQueue::main().dispatchSync({
+    WebContentServiceInitializer(connection, event);
+});
+```
+
+`WorkQueue::constructMainWorkQueue` is `dispatch_get_main_queue()`. `WorkQueueBase::dispatchSync` is `dispatch_sync_f` of a `DispatchWorkItem` — which is exactly the 30 `main-queue-inline-fn` hits (no block `dispatch_sync`). The net7 crash stack already named this path: `WebContentServiceInitializer` ← `XPCServiceEventHandler` block ← `_dispatch_sync_f_slow` ← `_xpc_connection_call_event_handler`.
+
+`WebContentServiceInitializer` (`WebContentServiceEntryPoint.mm`) calls `WTF::initializeMainThread()` *before* `XPCServiceInitializer`, which then calls `InitializeWebKit2()`. `initializeMainThread()` is `initialize()` + `initializeMainThreadPlatform()` + `RunLoop::initializeMain()`. On Cocoa, `RunLoop::initializeMain()` sets WTF’s main `RunLoop` to `RunLoop::current()`, and the CF `RunLoop` constructor binds `CFRunLoopGetCurrent()` — the *calling thread’s* loop, not necessarily `CFRunLoopGetMain()`.
+
+Apple’s xpcproxy delivers Application-type (`RunLoopType=_NSApplicationMain`) first events on the process main thread with a running main CFRunLoop, so `dispatch_sync_f(main)` can be completed by `_dispatch_sync_f_slow` pumping that loop, and `RunLoop::initializeMain()` binds the real main CFRunLoop.
+
+### How that path hung in net36 vs net37
+
+**net36 (real main thread, cond-wait drain):** `user()` is already on the process main thread, but that thread is not in a GCD main or CFRunLoop drain. `WorkQueue::main().dispatchSync` therefore takes `_dispatch_sync_f_slow` and waits for the main queue to be pumped. The cond-wait drain does not pump it, so the initializer (and IW2) never run. This is the “undrained GCD main” deadlock. It also explains why Safari’s launch window fails: the helper never finishes the bootstrap work Safari is waiting on (0 `wk-peer reply` in these runs; Safari’s `send_message_with_reply` callback never fired).
+
+**net37 (incoming-serial + inlined `dispatch_sync_f` + isMainThread lie):** The `dispatch_sync_f` wait is bypassed, so the initializer *does* start on incoming-serial (30 `main-queue-inline-fn`). That is a different hang, inside the inlined work, still in `user()` so `run()` never returns. Two mutually reinforcing defects follow from not being on a *running process-main CFRunLoop`:
+
+1. `WTF::initializeMainThread()` / `RunLoop::initializeMain()` ran off the real main thread (the TLS `pthread_main_np` lie only hides `isMainThread()` checks). WTF’s “main” `RunLoop` is then bound to the incoming-serial thread’s CFRunLoop, which is not running (the thread is inside `user()`). Later `RunLoop::main().dispatch` / `callOnMainRunLoopAndWait` work is signaled on a loop that will never drain, or on the real process main, which is parked in `dispatch_main()` and also does not drain CF.
+2. Even the isMainThread assert in `runInitializationCode` cannot be trusted as a gate: if stock `InitializeWebKit2` did run (unhooked), the lie would let it proceed into `JSC::initialize()` / the rest of `XPCServiceInitializer` still without a live main CFRunLoop.
+
+So inlining GCD-main `dispatch_*_f` fixed net36’s *first* deadlock and still left `user()` blocked, which is sufficient to keep Safari from publishing an AppKit window in 30 s (same launch-path class as net35/net36). The TLS lie is not a window-safe substitute for actually being on the process main thread with that thread’s CFRunLoop running.
+
+Other leads that do not fit as well as the sole cause: a missing `message-name` would return from the stock handler and log `xpc event end`; a sandbox denial or `exit(EXIT_FAILURE)` after entitlements would kill the helper, but after-launch still showed many unique WebContent processes `Ss` at ~28 MB; the double wrap only explains the 2× begin/xpc-event counts; `orig=0x0` explains the missing hook logs, not the hang itself.
+
+### Why a fix was not deployed
+
+A correct delivery needs the stock initializer to run on the *real* process main thread *while a main CFRunLoop is actually running*, which is what xpcproxy provides for Application-type services and what this chroot-proxy `execve` does not. Every attempt so far to provide that park has been either incomplete or window-unsafe:
+
+- `dispatch_main` (net34): window stays; it does not drain GCD main or CF, so `dispatch_sync_f(main)` / `run()` never complete.
+- `CFRunLoopRun` (net35): did not drain the bounce and lost the window; not retried.
+- helper-main-drain (net36): ran `run()` on main, then deadlocked in `dispatch_sync_f(main)`; lost the window; not retried.
+- incoming-serial + inline GCD main + isMainThread lie (net37): bypassed the first deadlock, hung inside the initializer; lost the window; not retried.
+
+No clearly window-safe alternative is identified on this turn (including “run a real CFRunLoop / NSApp on helper main”, already excluded, and any further isMainThread lie). A logging-only probe of `message-name` / `service-name` without calling `user()` would be window-safe and is unnecessary for the path identification above; it can wait. Next work should start from restored net34 and should not retry those four delivery/park variants as the first step. The remaining product problem is how to get a running process-main CFRunLoop (or an equivalent pump of `dispatch_sync_f(main)` *and* WTF’s main `RunLoop`) in the unique helper *without* blocking Safari’s AppKit window publish, still without a public macosbooter check-in, a competing Mach listener on that name, CAContext port retries, or a long serial wait on Safari’s launch thread.
+
+### Paint / IPC conclusion
+
+No new Safari run. The diagnosed reason `user(event)` does not return is the stock bootstrap path’s `WorkQueue::main().dispatchSync` → `WebContentServiceInitializer` / `WTF::initializeMainThread` / `InitializeWebKit2` requiring a live process-main CFRunLoop. net36 deadlocked on the `dispatch_sync_f(main)` wait; net37 inlined that wait and then hung inside the initializer after binding or waiting on the wrong (or unpumped) main `RunLoop`. `0 InitializeWebKit2 call` cannot be read as “IW2 never entered” because the offset hook still has `orig=0x0`. No window-safe fix was deployed. Device remains on net34; content-area paint and WebContent CAContext remain unreached from this unique-peer path.
