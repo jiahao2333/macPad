@@ -72,24 +72,31 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("macws_xpc_connection_create_raw", chunk)
         # Treat create(NULL) as an anonymous LISTENER: accept
         # XPC_TYPE_CONNECTION, hand that incoming conn to WebKit, and
-        # park main in helper-main-drain so incoming wrap run() blocks
-        # actually execute (dispatch_main does not drain GCD main;
-        # CFRunLoopRun lost the window). Do not call NSApp or
-        # CFRunLoopRun, and do not hand the listener itself to the
-        # stock xpc_main handler. dispatch_main remains as a fallback.
+        # park main with dispatch_main (window-safe). Run unique
+        # incoming dictionaries on the live serial queue and inline
+        # GCD-main work. Do not call NSApp, CFRunLoopRun, or the
+        # helper-main-drain, and do not hand the listener itself to
+        # the stock xpc_main handler.
         self.assertIn("XPC_TYPE_CONNECTION", chunk)
         self.assertIn("macws_webkit_xpc_main_connection(incoming)", chunk)
         self.assertNotIn("macws_webkit_xpc_main_connection(listener)", chunk)
         self.assertIn("listening for incoming", chunk)
-        self.assertIn("entering helper-main-drain", chunk)
-        self.assertIn("macws_wk_helper_main_drain()", chunk)
-        self.assertIn("macws_wk_schedule_on_helper_main", HOOKS)
-        self.assertIn("schedule helper-main-drain", HOOKS)
         self.assertIn("entering dispatch_main", chunk)
         self.assertIn("dispatch_main()", chunk)
         self.assertNotIn("CFRunLoopRun()", chunk)
+        self.assertNotIn("macws_wk_helper_main_drain", HOOKS)
+        self.assertNotIn("macws_wk_schedule_on_helper_main", HOOKS)
         self.assertNotIn('sel_registerName("sharedApplication")', chunk)
         self.assertNotIn('sel_registerName("run")', chunk)
+        self.assertIn("run on incoming-serial", HOOKS)
+        self.assertIn("macws_wk_unique_incoming_run_begin", HOOKS)
+        self.assertIn("macws_wk_try_run_main_block_inline", HOOKS)
+        self.assertIn("main-queue-inline", HOOKS)
+        METAL = (ROOT / "libmachook/Metal_hooks.x").read_text()
+        self.assertIn("hooked_dispatch_sync", METAL)
+        self.assertIn("hooked_pthread_main_np", METAL)
+        self.assertIn("macws_is_webkit_helper_process_ex", METAL)
+        self.assertIn("macws_install_unique_incoming_main_hooks", METAL)
         self.assertLess(
             chunk.index("XPC_TYPE_CONNECTION"),
             chunk.index("xpc_endpoint_create"))
@@ -98,9 +105,9 @@ class WebKitPeerSpawnContract(unittest.TestCase):
             chunk.index("xpc_endpoint_create"))
         self.assertLess(
             chunk.index("xpc_endpoint_create"),
-            chunk.index("entering helper-main-drain"))
+            chunk.index("entering dispatch_main"))
         self.assertLess(
-            chunk.index("macws_wk_helper_main_drain();"),
+            chunk.index("entering dispatch_main"),
             chunk.rindex("dispatch_main();"))
         self.assertIn("macws_xpc_remember_unique_listener(listener, peer)", chunk)
         self.assertNotIn("macws_xpc_remember_app_conn(listener, peer)", chunk)
