@@ -14361,6 +14361,29 @@ static const MacWSXpcAppServiceRow *macws_xpc_app_services_lookup(
     }
     return NULL;
 }
+
+// Resolve an Application-type chroot-proxy bundle path that iOS launchd can
+// spawn. xpc_add_bundle records the path string; launchd/xpcproxy resolves
+// it in the *host* namespace, then the setuid proxy chroots into rootfs.
+//
+// /usr/local/libexec/macws-xpc exists only inside the chroot, so add_bundle
+// of that path yields "Connection invalid" and never starts the proxy
+// (runtime, 2026-11-10). Prefer:
+//   1. /var/mnt/rootfs/usr/local/libexec/macws-xpc/... — host-visible, and
+//      also visible inside the chroot via the rootfs self-symlink
+//      (/var/mnt/rootfs -> /).
+//   2. /var/jb/usr/macOS/Frameworks/... — the DockHelper pattern. access()
+//      may fail inside the chroot because rootfs /var/jb/usr is an absolute
+//      symlink loop; launchd still resolves the path on the host.
+static void macws_xpc_host_visible_proxy_path(char *path, size_t pathsz,
+        const char *relativeProxy) {
+    if (!path || pathsz == 0 || !relativeProxy) return;
+    snprintf(path, pathsz, "/var/mnt/rootfs/usr/local/libexec/macws-xpc/%s",
+             relativeProxy);
+    if (access(path, F_OK) == 0) return;
+    snprintf(path, pathsz, "/var/jb/usr/macOS/Frameworks/%s", relativeProxy);
+}
+
 static void macws_register_xpc_app_proxy_bundle(const char *relativeProxy) {
     if (!relativeProxy || !relativeProxy[0]) return;
     static char registered[MACWS_XPC_APP_SERVICE_MAX][512];
@@ -14372,11 +14395,7 @@ static void macws_register_xpc_app_proxy_bundle(const char *relativeProxy) {
         snprintf(registered[registeredCount++], sizeof(registered[0]),
                  "%s", relativeProxy);
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/usr/local/libexec/macws-xpc/%s",
-             relativeProxy);
-    if (access(path, F_OK) != 0)
-        snprintf(path, sizeof(path), "/var/jb/usr/macOS/Frameworks/%s",
-                 relativeProxy);
+    macws_xpc_host_visible_proxy_path(path, sizeof(path), relativeProxy);
     xpc_add_bundle(path, 2);
 }
 
@@ -14403,13 +14422,10 @@ static void macws_register_webkit_bundle_if_needed(const char *proxyLeaf) {
                                      memory_order_acq_rel))
             return;
         char path[PATH_MAX];
-        snprintf(path, sizeof(path),
-                 "/usr/local/libexec/macws-xpc/WebKit.framework/Versions/A/XPCServices/%s",
-                 proxyLeaf);
-        if (access(path, F_OK) != 0)
-            snprintf(path, sizeof(path),
-                     "%s/WebKit.framework/Versions/A/XPCServices/%s",
-                     "/var/jb/usr/macOS/Frameworks", proxyLeaf);
+        char rel[PATH_MAX];
+        snprintf(rel, sizeof(rel),
+                 "WebKit.framework/Versions/A/XPCServices/%s", proxyLeaf);
+        macws_xpc_host_visible_proxy_path(path, sizeof(path), rel);
         xpc_add_bundle(path, 2);
         return;
     }

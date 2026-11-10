@@ -355,3 +355,63 @@ Goal: Safari WebContent/Networking/GPU stay up + render example.com / baidu.com,
 - Proxy admit-on-install expectation + rollback NOTES
 - Screenshots: `field-artifacts/net4-*.png` / `/workspace/net4-*.png`
 
+## 18. WebContent stay-up: host-visible xpc_add_bundle + reboot trust (2026-11-10 Asia/Shanghai)
+
+### Reboots (diagnosis)
+
+**2026-11-10 01:45:10–01:45:25 CST (full kernel reboot, unexplained).**  
+`lockdownd`: `Boot session changed (reboot detected)` at 01:45:25. `shutdown.log` SIGTERM flush at 01:45:10 with macOS still up (Safari pid 46628, Settings, securityd). **No** `panic-full-*.ips` and **no** new `ResetCounter` for this event, so the cause is not written as the same mutex panic. Earlier the same day: `panic-full-2026-11-09-153246.000.ips` (`Invalid/destroyed mutex @lock_mtx.c:161`, `kernel_task`, **Compressor Info: 98% of compressed pages limit (BAD)**) plus JetsamEvent storms at 17:14 and 18:17–18:18 CST. 10:34 CST was a later **userspace** jailbreak (`Starting Up` without boot-session change). Kernel `uptime` therefore counted from 01:45, not from the morning jailbreak. Load ~41 at 10:36 was macOS coming up (~379 processes) and later fell to ~2.5.
+
+**2026-11-10 10:57:15 CST (user-initiated full reboot).**  
+`ResetCounter-2026-11-10-105715.ips`: `Boot faults: rst btn_rst,btn_seq_reset timeout,dblclick_timeout`. `lockdownd` boot session changed at 10:57:15, then jailbreak `Starting Up` at 10:58:41. No new panic-full. macOS was started the same way as the in-app button: `macos_gui.sh watchdog coexist --no-vnc --no-terminal --experimental`. WebKit LaunchDaemons stayed unloaded.
+
+### Guardrails used for later probes
+
+- Before each probe, require ≳ 300 MB free pages and a low compressor (`occupied` not high). Otherwise abort and back off.
+- One Safari/WebKit attempt at a time; a timeout watchdog kills ballooning WebKit/Safari/probe processes.
+- Never leave probe processes behind.
+- Stop if a second *unexplained* reboot occurs (the 10:57 button reset does not count).
+
+### Why WebContent/Networking/GPU did not stay up
+
+Live comparison of DockHelper vs `xpc_add_bundle` (guarded in-chroot probe `xpc_bundle_probe2`, 2026-11-10 11:21–11:30 CST):
+
+1. **`xpc_add_bundle` preferred a chroot-only path.**  
+   `macws_register_xpc_app_proxy_bundle` tried `/usr/local/libexec/macws-xpc/...` first. That path exists *inside* the chroot (so `access()` succeeds in Safari) but **does not exist on the iOS host**. launchd/xpcproxy resolves the recorded path in the host namespace → `Connection invalid`, no process. DockHelper is registered at `/var/jb/usr/macOS/Frameworks/Dock.framework/...`, which *is* host-visible. Inside the chroot, `/var/jb/usr` is an absolute symlink loop (`Too many levels of symbolic links`), so a naive `access()` fallback never selected the working DockHelper-style path.
+
+2. **Reboot-volatile trustcache did not include WebKit.**  
+   `macos_gui.sh` `restore_cold_boot_trust` already re-registers WindowServer, Dock, libmachook, etc. after every jailbreak, but not the WebKit proxies or the admitted stock WebContent/Networking/GPU/SandboxBroker binaries. After the 10:57 reboot, host exec of the setuid `WebContentProxy` was **SIGKILL (137)**. After `jbctl trustcache add` of the existing CDHashes (no rewrite), the same exec reached the stock target and exited with the expected no-XPC `An XPC Service cannot be run directly` / abort (134).  
+   `macws_admit_rootfs_binary.sh` also ends with `chmod 755`, which strips the setuid bit the proxy needs to `chroot(/var/mnt/rootfs)`.
+
+### System-level fix
+
+- libmachook: `macws_xpc_host_visible_proxy_path` prefers `/var/mnt/rootfs/usr/local/libexec/macws-xpc/<relative>` (visible on the host *and* in the chroot via the `/var/mnt/rootfs -> /` self-symlink), then `/var/jb/usr/macOS/Frameworks/<relative>` (DockHelper pattern). It no longer registers the chroot-only `/usr/local/libexec/...` path. Shared by the TSV registrar and the WebKit fast path.
+- `macos_gui.sh` `restore_cold_boot_trust`: also restores trust for the macws-xpc WebKit tree, the jb Frameworks WebKit tree, stock WebKit XPCServices, and Safari SandboxBroker. After trust, `chmod 4755` the four proxies (both trees).
+- LaunchDaemons `com.macwsguide.webkit.*` stay **unloaded**.
+
+### Verification (probe)
+
+After re-trust + setuid, in-chroot `xpc_add_bundle` of the jb/host-visible path spawned stock macOS WebContent and it stayed up for the 5 s window:
+
+`/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent` (root, `Ss`, ~28–29 MB RSS, ppid 1). The previous chroot-only path still produced `Connection invalid` and no process. Probe and WebContent were cleaned up; compressor stayed idle.
+
+### Verification (guarded Safari, 2026-11-10 11:36–11:44 CST)
+
+Deployed the new thin libmachook (CDHash `9720795b…` / arm64 `b921d279…`) and `macos_gui.sh` to jb + rootfs (fresh inodes, `ldid` + `jbctl`, rollback `*.pre-net5-*`). Did **not** restart macOS; a new Safari is enough to load the new dylib.
+
+One guarded attempt (`net5_safari.sh`: mem_guard, watchdog, only macOS Safari/WebKit, no MobileSafari):
+
+- Safari launched (pid 4984, root, ppid `macwshostd`, ~50 MB RSS). `vmmap` showed the **new** `/usr/local/lib/libmachook.dylib`. `DYLD_INSERT_LIBRARIES` was set. Proxies exist at the host-visible path `/var/mnt/rootfs/usr/local/libexec/macws-xpc/WebKit.framework/Versions/A/XPCServices/*.xpc`.
+- **No** macOS WebContent / Networking / GPU / proxy process appeared. `/tmp/macws-xpc-app.log` and `/tmp/macws-sandbox-allow.log` stayed **empty**, so Safari never entered `macws_xpc_create_application_service` (no TSV-hit). `open-documents` of `/tmp/example.webloc` probably did not start a load (Favorites-only is also what net4 captures showed).
+- `screencapture -x /tmp/net5-example.png` hung ~2.5 min with no file. At that point free pages were already ~235 MB. The watchdog (40 s) had already exited, so the script was aborted: hung screencapture + the script tree were killed, then Safari, **before** opening baidu.
+- Concurrently, Finder, Dock, ControlCenter, SystemUIServer, and OSXvnc-server were all in **`Ts` (SIGSTOP)** while WindowServer stayed `Ss`. That likely explains the hung capture and a Safari UI that never actually presented. They were **not** continued: free pages were already under the ~300 MB guard (compressor still idle, `occupied=36`). No second Safari attempt.
+- No new panic-full; kernel uptime still counts from the 10:57 button reset (not a second unexplained reboot).
+- Screenshots were **not** produced (`field-artifacts/net5-*.png` / `/workspace/net5-*.png` are not present).
+
+### Still open
+
+Safari has not yet been shown to request WebKit XPC or render a page under this fix. The in-chroot probe still shows the host-visible `xpc_add_bundle` path can keep stock WebContent up. Next guarded run needs the macOS GUI apps un-stopped **and** free pages ≳ 300 MB, plus a hard timeout on `screencapture`.
+
+### Rollback
+
+`/var/mobile/macws-rollback/` + `NOTES.txt`: `libmachook*.pre-net5-*`, `macos_gui.sh.pre-net5-*`, prior `*.pre-admit-*` / `xpc_bundle_probe2.pre-admit-*`. Re-trust of existing CDHashes does not rewrite the proxies.

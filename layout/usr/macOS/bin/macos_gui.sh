@@ -1610,6 +1610,10 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/PrivateFrameworks/TimelineUI.framework/Versions/A/TimelineUI" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" \
+        "$ROOTFS/usr/local/libexec/macws-xpc/WebKit.framework" \
+        /var/jb/usr/macOS/Frameworks/WebKit.framework \
+        "$ROOTFS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices" \
+        "$ROOTFS/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app/Contents/XPCServices" \
         "$ROOTFS$CSNAMEDDATAD_BIN" \
         "$ROOTFS$CORESERVICESD_BIN" \
         "$ROOTFS$AUTHD_BIN" \
@@ -1695,6 +1699,18 @@ restore_cold_boot_trust() {
         "$@" || return 1
     BASE_TRUST_READY=1
     log "Cold-boot trust closure ready (complete dependency closure; live membership verified)."
+    # Application-type WebKit/Safari proxies are setuid-root so host
+    # xpcproxy can chroot into the rootfs (DockHelper pattern).
+    # macws_admit_rootfs_binary.sh ends with chmod 755; put setuid back
+    # after every cold-boot trust restore.
+    for _macws_proxy in WebContentProxy WebNetworkingProxy WebGPUProxy SafariSandboxProxy; do
+        for _macws_bin in             "$ROOTFS/usr/local/libexec/macws-xpc/WebKit.framework/Versions/A/XPCServices/${_macws_proxy}.xpc/${_macws_proxy}"             "/var/jb/usr/macOS/Frameworks/WebKit.framework/Versions/A/XPCServices/${_macws_proxy}.xpc/${_macws_proxy}"; do
+            if [ -f "$_macws_bin" ]; then
+                chown root:wheel "$_macws_bin" 2>/dev/null || true
+                chmod 4755 "$_macws_bin" || true
+            fi
+        done
+    done
 }
 
 # True if a macOS binary can actually run in the chroot right now.
