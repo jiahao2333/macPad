@@ -3,6 +3,9 @@
 // xpcproxy gives the service process a one-shot launchd receive right in
 // XPC_FLAGS/XPC_*. Preserve that context through a raw chroot/exec transition;
 // do not introduce an intermediate posix_spawn or XPC client initialization.
+// For Application-type WebKit helpers, iOS xpcproxy may leave XPC_FLAGS=0x0
+// on this setuid first image; reconstitute the stock macOS value 8019 so
+// Ventura xpc_main can consume the inherited receive right after execve.
 // The transition below calls no libSystem APIs, although the current build
 // still links libSystem (-lSystem in the Makefile and the deployed Mach-O).
 // Calling this executable dependency-free would therefore be inaccurate.
@@ -123,6 +126,59 @@ static const char *MacWSEnvironmentValue(char *envp[], const char *key) {
     }
     return (const char *)0;
 }
+
+#if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
+static int MacWSFlagsAreZero(const char *value) {
+    // Treat unset, empty, and 0 / 0x0 / 0x00 as "no managed receive right".
+    if (!value || !*value) return 1;
+    if (value[0] == '0' && (value[1] == 'x' || value[1] == 'X'))
+        value += 2;
+    if (!*value) return 1;
+    while (*value) {
+        if (*value != '0') return 0;
+        value++;
+    }
+    return 1;
+}
+
+#define MACWS_SYS_open  5
+#define MACWS_SYS_write 4
+#define MACWS_SYS_close 6
+#define MACWS_O_WRONLY  0x0001
+#define MACWS_O_APPEND  0x0008
+#define MACWS_O_CREAT   0x0200
+#define MACWS_LOG_MODE  0644
+
+static void MacWSAppendString(char *buf, size_t cap, size_t *len, const char *s) {
+    if (!s) s = "(null)";
+    while (*s && *len + 1 < cap) buf[(*len)++] = *s++;
+}
+
+// Host-visible path so the line lands in the chroot /tmp log tree.
+static void MacWSLogWebKitProxyFlags(const char *incoming, const char *outgoing,
+                                     const char *program, const char *target) {
+    static const char path[] = "/var/mnt/rootfs/tmp/macws-webkit-proxy.log";
+    char line[512];
+    size_t len = 0;
+    MacWSAppendString(line, sizeof(line), &len, "proxy XPC_FLAGS incoming=");
+    MacWSAppendString(line, sizeof(line), &len,
+                      incoming && *incoming ? incoming : "(unset)");
+    MacWSAppendString(line, sizeof(line), &len, " outgoing=");
+    MacWSAppendString(line, sizeof(line), &len, outgoing);
+    MacWSAppendString(line, sizeof(line), &len, " program=");
+    MacWSAppendString(line, sizeof(line), &len, program);
+    MacWSAppendString(line, sizeof(line), &len, " target=");
+    MacWSAppendString(line, sizeof(line), &len, target);
+    if (len + 1 < sizeof(line)) line[len++] = '\n';
+    long fd = MacWSCheckedSyscall3(
+        MACWS_SYS_open, (long)path,
+        MACWS_O_WRONLY | MACWS_O_CREAT | MACWS_O_APPEND, MACWS_LOG_MODE);
+    if (fd < 0) return;
+    (void)MacWSSyscall3(MACWS_SYS_write, (const void *)fd, line,
+                        (const void *)len);
+    (void)MacWSSyscall1(MACWS_SYS_close, (const void *)fd);
+}
+#endif
 
 static int MacWSIsSettingsExtensionTarget(const char *target) {
     return MacWSIsStockSettingsExecutable(target);
@@ -320,16 +376,44 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     targetArguments[argumentCount] = (char *)0;
 
+#if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
+    // Stock macOS Application-type WebKit helpers (WebContent, Networking,
+    // GPU, Safari.SandboxBroker) are launched with XPC_FLAGS=8019. iOS
+    // xpcproxy leaves 0x0 on this setuid iPhoneOS-platform first image, so
+    // stock Ventura xpc_main sees no managed receive right after exec.
+    // Mach ports survive raw chroot+execve; reconstituting the Application-
+    // type flags lets stock xpc_main consume the inherited one-shot right.
+    // Do not bootstrap_check_in the public macosbooter name.
+    int isWebKit = 0;
+    for (unsigned i = 0; i < sizeof(MacWSWebKitServices) / sizeof(MacWSWebKitServices[0]); ++i) {
+        if (target && MacWSStringContains(target, MacWSWebKitServices[i].target))
+            isWebKit = 1;
+    }
+    const char *incomingFlags = MacWSEnvironmentValue(envp, "XPC_FLAGS");
+    static char webkitFlags[] = "XPC_FLAGS=8019";
+    const int replaceZeroFlags = isWebKit && MacWSFlagsAreZero(incomingFlags);
+    const char *outgoingFlags = replaceZeroFlags ? "8019"
+        : (incomingFlags && *incomingFlags ? incomingFlags : "(unset)");
+    if (isWebKit)
+        MacWSLogWebKitProxyFlags(incomingFlags, outgoingFlags,
+            argc > 0 && argv ? argv[0] : (const char *)0, target);
+#endif
+
     size_t environmentCount = 0;
     for (char **entry = envp; entry && *entry; entry++) {
         // Replace only values that must describe the macOS process.  Preserve
-        // XPC_FLAGS and every launchd-provided entry byte-for-byte.
+        // XPC_FLAGS and every launchd-provided entry byte-for-byte, except a
+        // zero Application-type WebKit XPC_FLAGS which is reconstituted below.
         if (MacWSHasEnvironmentKey(*entry, "DYLD_INSERT_LIBRARIES") ||
             MacWSHasEnvironmentKey(*entry, "HOME") ||
             MacWSHasEnvironmentKey(*entry, "TMPDIR") ||
             MacWSHasEnvironmentKey(*entry, "MallocNanoZone") ||
             MacWSHasEnvironmentKey(*entry, MACWS_CHROOT_ROOT_KEY))
             continue;
+#if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
+        if (replaceZeroFlags && MacWSHasEnvironmentKey(*entry, "XPC_FLAGS"))
+            continue;
+#endif
         // Five canonical values plus NULL remain. Reject an oversized launch
         // context instead of silently discarding trailing one-shot XPC data.
         if (environmentCount + 6 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
@@ -352,14 +436,13 @@ int main(int argc, char *argv[], char *envp[]) {
 #if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
     {
         static char gigacageOff[] = "GIGACAGE_ENABLED=0";
-        int isWebKit = 0;
-        for (unsigned i = 0; i < sizeof(MacWSWebKitServices) / sizeof(MacWSWebKitServices[0]); ++i) {
-            if (target && MacWSStringContains(target, MacWSWebKitServices[i].target))
-                isWebKit = 1;
-        }
         if (isWebKit) {
             if (environmentCount + 1 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
             targetEnvironment[environmentCount++] = gigacageOff;
+        }
+        if (replaceZeroFlags) {
+            if (environmentCount + 1 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
+            targetEnvironment[environmentCount++] = webkitFlags;
         }
     }
 #endif

@@ -1000,3 +1000,47 @@ No second dylib variant. net15 stays deployed (window publish still works; the c
 ### Paint / IPC conclusion
 
 Safari still publishes a capturable window and accepts example.com / baidu.com, but the content area stays white because WebContent never gets a peer XPC connection, so it never runs a drawing-area constructor or creates a CAContext. The earlier Mach-listener fallback could not attach to Safari's existing send right. net15 confirmed that after the proxy `execve`s stock WebContent, `XPC_SERVICE_NAME` is the expected `com.apple.macosbooter.WebKit.WebContent` but `XPC_FLAGS=0x0`, and stock `xpc_main` never accepts a connection. Next work should restore a real xpcproxy (or equivalent) receive right across the chroot+exec transition, not retry CAContext ports and not reintroduce a competing Mach listener on the same name.
+
+## 33. WebKit proxy reconstitutes XPC_FLAGS=8019, but the child still sees 0x0 and has no peer (2026-11-10 20:07–20:12 CST / 04:07–04:12 PST)
+
+### What was tried
+
+net15 left stock `xpc_main` on the inherited path and showed that after the setuid chroot proxy `execve`s the stock image, `XPC_FLAGS` is the string `0x0`. On a real Mac, Application-type WebKit helpers (WebContent, Networking, GPU, Safari.SandboxBroker) run with `XPC_FLAGS=8019` for their entire lifetime; stock `xpc_main` does not clear that value. The proxy already copied `XPC_*` byte-for-byte, so the zero flags were already present on the first image (iOS xpcproxy → setuid iPhoneOS-platform proxy).
+
+net16 is a generic, proxy-side reconstitution: for Application-type WebKit targets only, if incoming `XPC_FLAGS` is unset or zero (`0`, `0x0`, `0x00`), replace it with `8019` in the `execve` environment so Ventura `xpc_main` can consume an inherited one-shot receive right. Mach ports and fds still survive the raw chroot+exec; the change does not `bootstrap_check_in` the public `macosbooter.WebKit.*` name, does not add a CAContext port-retry, and does not touch libmachook (still net15). The proxy logs incoming vs outgoing flags to `/tmp/macws-webkit-proxy.log` (host path `/var/mnt/rootfs/tmp/...`) with raw syscalls. Unit tests cover zero-flag replacement, preservation of a real `8019`, and leaving non-WebKit `0x0` alone.
+
+### Deploy
+
+Backup tag `pre-net16-20261110-201123` (20:11:23 CST / 04:11:23 PST) saved the live net15-era proxies in both trees (`/var/jb/usr/macOS/Frameworks/WebKit.framework/...` and `/var/mnt/rootfs/usr/local/libexec/macws-xpc/WebKit.framework/...`) plus `/var/mobile/macws-rollback/proxies.pre-net16-20261110-201123/`. Those backups restore:
+
+- WebContentProxy CDHash `181c64a699f325458491544c309f5d397bdd5007`
+- WebNetworkingProxy `d1e70795621022ea4a141c89e522339ee24f5250`
+- WebGPUProxy `0f8b2ea9772122eb5e6777dd6d9ff504503bb21b`
+- SafariSandboxProxy `e8b38f8989b73ef63119a70b3ecefcde64004885`
+
+libmachook was not replaced (rootfs inode 23377884, arm64e CDHash `86f08ac4b4fa875ec61799ce7e991a0576b8b57b`, sha1 candidate `2b0e9195c0f12b00f4d0b76c0c42a32e0692c8d0`). New thin arm64e proxies are setuid 4755, 85760 B, fresh inodes (jb WebContent 44288 / rootfs 23409031), trusted with 40-char sha1 and sha256 CDHashes (64-char CandidateCDHashFull skipped). Deployed CDHashes:
+
+- WebContentProxy `5d3a9cec32167ad654d0796efaf141cbab6345a9` (sha1 `f5d11cd39fd652532a43d42378f9d4f3e5850598`)
+- WebNetworkingProxy `e9c0baa3d66e16d4ded68e2937f0449aaaf6798b` (sha1 `035e94ddcf41460e368a06d54c3bfc91e8c1a17f`)
+- WebGPUProxy `b9d40e10881077c7ba82a5a7a3b8f1f5d5427220` (sha1 `088d1378cadae3c944add5abba18e1bbb6bbc5ef`)
+- SafariSandboxProxy `6503dc2e9a3cebea1195a4dc9596e37c03d0ec6c` (sha1 `50bbda54244f871bcc3bbcabeb7f9604927fad83`)
+
+Smoke at 20:11:29 CST / 04:11:29 PST: `run_bash.sh` printed `SMOKE_OK` (rc=0). IconServices jobs 53067 (uid 240) and 53071 (`runAsRoot`) stayed loaded; iOS agent 1724 was left alone. No reboot, no 停止 macOS.
+
+### Safari run (one guarded attempt)
+
+20:11:45–20:12 CST / 04:11:45–04:12 PST, Safari pid 56937. `launch-path` returned `ok=yes` (probe message `不支持的操作`, same as earlier runs); the script treated that as `LAUNCH_WINDOW_OK` and opened documents. example.com and baidu.com were both accepted (`已由目标应用接收 1 个文稿`). Safari RSS grew to ~471 MB (481760–482032 KB), the healthy visible-window class. 24 WebContent helpers plus Networking and SandboxBroker stayed `Ss` at ~27 MB each; GPU was not requested. `comp_occ` 20554 → 20793 (no watchdog trip). Cleanup left CORE_OK (WindowServer 51054, macwshostd 416, SpringBoard 391), WebKit LaunchDaemons unloaded, no leftover macOS Safari/WebContent. Screenshots: `/workspace/net16-example.png` and `/workspace/net16-baidu.png` (2732×2048, clock 04:12 PST), Safari in front, URLs example.com / baidu.com, Start Page + E Untitled (+ B Untitled on baidu), content area still white. Because the window stayed capturable, net16 was **not** rolled back.
+
+### Field result
+
+The proxy rewrite fired as intended: 24 WebContent + 1 Networking + 1 SandboxBroker lines of `proxy XPC_FLAGS incoming=0x0 outgoing=8019` (confirms iOS xpcproxy already hands the first image `0x0`, and that we replaced it on the `execve` env). Inside the stock helpers, libmachook's inherited-path log still showed `flags=0x0` on all 25 `xpc_main` entries (24 WebContent + 1 Networking). **Zero** `xpc_main accepted connection=` lines. No `xpc event begin/end`, no `InitializeWebKit2 call` / `runInitializationCode call` (install still `orig=0x0`), no drawing-area `setGeometryFlipped`, no WebContent `remoteContextWithOptions` or dropped-port log. Safari created 24 `com.apple.macosbooter.WebKit.WebContent` connections with no `xpc_error`, `add_bundle` still `access=-1 errno=62` then `add_bundle_done` on the jb Frameworks path. Chrome still created CGS CAContexts (`contextWithCGSConnection`, WindowServer `setContextId` for those ids). The five `remoteContextWithOptions` lines were Safari, openAndSavePanel, QuickLookUIService, and the two screencapture processes — not WebContent.
+
+`getenv_new` only defaults `GIGACAGE_ENABLED`; it does not rewrite `XPC_FLAGS`. On a real Mac, live WebContent keeps `XPC_FLAGS=8019` in its environment, so stock `xpc_main` is not what clears the value. The leading hypothesis is that iOS xpcproxy's authoritative launch context is a packed blob (inherited fd / port) that still carries `XPC_FLAGS=0x0` and no Application-type receive right; Ventura libxpc unpacks that blob after exec and overwrites the classic environ we set. Setting `8019` on the `execve` vector alone is therefore not enough to reconstitute the receive right.
+
+### What was not done
+
+No second variant. net16 proxies stay deployed (window publish still works). Rollback copies remain at `pre-net16-20261110-201123` (net15-era proxies, WebContent `181c64a6…`); libmachook rollback `pre-net15-20261110-195216` / net14 `c1b7b439…` and net10b `cffee750…` are still on the device. No SkyLight hooks, no extra Safari CAContext IMPs, no constructor `dispatch_after`, no remapper export, no competing Mach listener, no CAContext port-retry, no reboot, no 停止 macOS. IconServices jobs were left loaded.
+
+### Paint / IPC conclusion
+
+Safari still publishes a capturable window and accepts example.com / baidu.com, but the content area stays white because WebContent never accepts a peer XPC connection, so it never runs InitializeWebProcess / CreateWebPage, never constructs a drawing area, and never creates a CAContext. net16 confirmed that iOS xpcproxy already starts the setuid proxy with `XPC_FLAGS=0x0`, that rewriting the classic `execve` environment to the stock Application-type value `8019` does not make that value (or a receive right) appear in the child at `xpc_main`, and that stock `xpc_main` therefore still never accepts a connection. Next work should find and fix the packed launch context (or otherwise put a real xpcproxy receive right into the task) across chroot+exec, not retry CAContext ports and not reintroduce a competing Mach listener on the same name.

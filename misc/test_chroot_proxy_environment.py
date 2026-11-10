@@ -84,5 +84,9 @@ int main(void) {
         self.assertIn("MacWSCheckedSyscall3)) MacWSExit(118)", source)
 
 
+    def test_webkit_zero_xpc_flags_reconstituted(self):
+        self.compile_and_run(ROOT / "misc/test_webkit_proxy_xpc_flags.c")
+
+
 if __name__ == "__main__":
     unittest.main()
