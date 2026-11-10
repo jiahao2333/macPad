@@ -15389,9 +15389,16 @@ static void macws_wk_peer_envp_free(char **envp) {
 // thread cannot stall for 2 s per helper. Do not check in or listen on
 // the public macosbooter.WebKit.* name.
 #define MACWS_WK_RV_SLOT 1
-#define MACWS_WK_RV_WAIT_MS 150
+#define MACWS_WK_RV_WAIT_MS 800
 extern int posix_spawnattr_set_registered_ports_np(
     posix_spawnattr_t *attr, mach_port_t *portarray, unsigned int count);
+extern kern_return_t macws_bootstrap_register_raw(
+    mach_port_t bp, const char *name, mach_port_t sp)
+    __asm__("_bootstrap_register");
+extern kern_return_t macws_bootstrap_look_up_raw(
+    mach_port_t bp, const char *name, mach_port_t *sp)
+    __asm__("_bootstrap_look_up");
+extern mach_port_t bootstrap_port;
 extern void *xpc_pipe_create_from_port(mach_port_t port, uint64_t flags);
 extern int xpc_pipe_simpleroutine(void *pipe, xpc_object_t msg);
 extern int xpc_pipe_receive(mach_port_t port, xpc_object_t *msg);
@@ -15419,6 +15426,23 @@ static mach_port_t macws_wk_rendezvous_send_from_slots(void) {
         (void)vm_deallocate(mach_task_self(), (vm_address_t)ports,
                             count * sizeof(*ports));
     return p;
+}
+
+// Prefer an inherited slot-1 COPY_SEND. If the 0755 proxy did not
+// observe that slot (field, net22: all handshakes had [1]=0x0 even
+// though a macOS-minos chroot child does receive it), look up the
+// unique name Safari bootstrap_register'd. That register keeps the
+// receive right in Safari (typ=0x30000); look_up returns a send.
+static mach_port_t macws_wk_rendezvous_send(const char *peerName) {
+    mach_port_t p = macws_wk_rendezvous_send_from_slots();
+    if (MACH_PORT_VALID(p)) return p;
+    if (!peerName || !peerName[0]) return MACH_PORT_NULL;
+    mach_port_t bp = bootstrap_port;
+    mach_port_t looked = MACH_PORT_NULL;
+    kern_return_t kr = macws_bootstrap_look_up_raw(bp, peerName, &looked);
+    if (kr == KERN_SUCCESS && MACH_PORT_VALID(looked))
+        return looked;
+    return MACH_PORT_NULL;
 }
 
 static int macws_wk_send_peer_endpoint(xpc_object_t endpoint,
@@ -15529,6 +15553,18 @@ static xpc_connection_t macws_xpc_spawn_webkit_peer(
         macws_xpc_app_logf("pid=%d wk-peer rv-insert kr=%d\n",
                            getpid(), (int)kr);
         return NULL;
+    }
+    // Publish a send right under the unique name without giving the
+    // receive to launchd (chroot probe: typ stays 0x30000). The 0755
+    // proxy may not inherit slot 1; the helper can look this up after
+    // exec. Not a public macosbooter check-in.
+    kr = macws_bootstrap_register_raw(bootstrap_port, peer, rvrecv);
+    macws_xpc_app_logf("pid=%d wk-peer register kr=%d peer=%s recv=0x%x\n",
+                       getpid(), (int)kr, peer, (unsigned)rvrecv);
+    if (kr != KERN_SUCCESS) {
+        // Still try inherited slot 1; helper look_up will also fail.
+        macws_xpc_app_logf("pid=%d wk-peer register-fail; trying slots only\n",
+                           getpid());
     }
 
     mach_port_array_t pports = NULL;
@@ -17258,7 +17294,7 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
             // send right. Not a bootstrap name and not the public
             // macosbooter check-in. create_mach_service LISTENER on the
             // unique name is not look-up-able in this chroot (net21).
-            mach_port_t rv = macws_wk_rendezvous_send_from_slots();
+            mach_port_t rv = macws_wk_rendezvous_send(peer);
             xpc_connection_t listener = macws_xpc_connection_create_raw(
                 NULL, dispatch_get_main_queue());
             snprintf(msg, sizeof(msg),

@@ -23,7 +23,7 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("posix_spawnattr_set_registered_ports_np", HOOKS)
         self.assertIn("xpc_connection_create_from_endpoint", HOOKS)
         self.assertIn("xpc_pipe_simpleroutine", HOOKS)
-        self.assertIn("MACWS_WK_RV_WAIT_MS 150", HOOKS)
+        self.assertIn("MACWS_WK_RV_WAIT_MS 800", HOOKS)
         self.assertNotIn("macws_wk_wait_for_peer", HOOKS)
         self.assertNotIn("lookup-timeout", HOOKS)
         self.assertIn("macws_wk_leaf_for_public_name", HOOKS)
@@ -67,17 +67,24 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("macws_xpc_connection_create_raw", chunk)
 
     def test_rendezvous_is_fail_fast_and_not_bootstrap_lookup(self):
-        start = HOOKS.index("#define MACWS_WK_RV_WAIT_MS 150")
+        start = HOOKS.index("#define MACWS_WK_RV_WAIT_MS 800")
         end = HOOKS.index("macws_xpc_create_application_service")
         chunk = HOOKS[start:end]
         self.assertIn("macws_wk_recv_peer_endpoint", chunk)
         self.assertIn("xpc_pipe_receive", chunk)
         self.assertIn("endpoint-timeout", chunk)
         self.assertIn("MACWS_WK_RV_SLOT", chunk)
-        self.assertNotIn("bootstrap_look_up(", chunk)
         self.assertNotIn("usleep(20 * 1000)", chunk)
         # Cap must stay well under the old 2 s-per-helper stall.
-        self.assertIn("MACWS_WK_RV_WAIT_MS 150", chunk)
+        self.assertIn("MACWS_WK_RV_WAIT_MS 800", chunk)
+        self.assertLess(800, 2000)
+        # Parent publishes the unique name; helper may look it up after
+        # exec if slot 1 did not survive the 0755 proxy. Not a 2 s loop
+        # on Safari's application-service thread, and not macosbooter.
+        self.assertIn("macws_bootstrap_register_raw", chunk)
+        self.assertIn("macws_wk_rendezvous_send", chunk)
+        self.assertIn("macws_bootstrap_look_up_raw", chunk)
+        self.assertNotIn("WEBKIT_WEBCONTENT_SERVICE_NEW);", chunk)
 
     def test_sandbox_allows_unique_peer_prefix(self):
         self.assertIn('!strncmp(name, "com.macwsguide.wk.i.", 20)', HOOKS)

@@ -1255,3 +1255,42 @@ No second variant. Because the Safari window stayed visible, net22 libmachook wa
 ### Paint / IPC conclusion
 
 Fail-fast unique-name spawn still runs (`wk-peer spawn rc=0`) and no longer blocks Safari's launch thread long enough to miss the window: the window is visible, example.com and baidu.com open, chrome paints, screenshots are at `/workspace/net22-example.png` and `/workspace/net22-baidu.png`. The unique-name peer does **not** actually connect. `bootstrap_look_up` is no longer used; the remaining gap is that the inherited rendezvous send right is not look-up-able in the proxy (`slot 1 = 0`) and the unique child never reaches the anonymous-listener / `xpc_pipe` send before the 150 ms timeout. Fallback add_bundle still starts helpers with no receive right, and there is no InitializeWebProcess / CreateWebPage / WebContent CAContext / page paint (content still white). Next work should keep the net19 layout, the TSV-hit reordering, and the fail-fast cap, and should get a usable rendezvous send right into the helper across the proxy exec — without checking in the public macosbooter name, adding a competing Mach listener on that name, retrying CAContext ports, or stalling 2 s per helper.
+
+## 40. Parent bootstrap_register plus helper look_up can connect a unique peer, but 800 ms × N missed the Safari window (2026-11-10 21:57–22:00 CST / 05:57–06:00 PT)
+
+### Change
+
+net22's slot-1 `posix_spawnattr_set_registered_ports_np` COPY_SEND never appeared in the 0755 WebContentProxy handshake (`[1]=0x0`), and unique children were SIGKILL'd at 150 ms before stock `xpc_main`. A same-chroot probe this turn (`net23_rvprobe`, `CHROOT_RC=0`) split those findings:
+
+- `posix_spawnattr_set_registered_ports_np` *does* work for a macOS-minos 13 child in this chroot: the child sees slot 1 as a SEND right and `xpc_pipe_simpleroutine` of an anonymous-listener endpoint succeeds.
+- `bootstrap_register` of `com.macwsguide.wk.i.<32 hex>` keeps the receive right in the caller (`typ=0x30000` after register). A child `bootstrap_look_up` gets a SEND, and the parent `xpc_pipe_receive` + `xpc_connection_create_from_endpoint` succeeds (`timed_out=0`, `pipe_rc=0`).
+
+net23 therefore keeps the TSV-hit reordering and the fail-fast pipe/endpoint handshake, and adds a bootstrap-independent *name* publish that does not depend on the 0755 proxy inheriting slot 1: Safari `bootstrap_register`s the rendezvous receive under the unique peer name (not a public macosbooter check-in), and the helper, after exec into the stock image, uses slot 1 if present or else `bootstrap_look_up` of that unique name. The wait cap was raised from 150 ms to 800 ms (still well under the old 2 s-per-helper stall) so chroot + execve + dyld + `xpc_main` has a better chance to send the endpoint. Proxies and the net19 path layout were left on net20 / net19. No new exported symbols (168 T per slice). 12 contract tests OK on the Intel Mac (7 peer-spawn + 5 environment).
+
+### Deploy
+
+Backup tag `pre-net23-20261110-215737` (21:57:37 CST / 05:57:37 PT) saved the live net22 libmachook (`98f4443646ba1e480075044de20deba064248675`) and net20 proxies (WebContent `2097451dd27a6c353c69c88c6ccb5c62acb14e5b`). The net19 path layout was not touched. Only libmachook was replaced (same cross-build / two-pass `ldid` / trustcache / rootfs byte-copy path as net22). Live net23 CDHashes (while deployed): arm64e `67d741e3c6b6ff33a7464d51f955a6e4226cf3a8`, arm64 `8c7e873ed711f0fc0fd761225bd008323a9fcd81`. Smoke at 21:57:43 CST / 05:57:43 PT: `SMOKE_OK` / `RUN_BASH_CANARY_OK` rc=0, IconServices 1724 / 53067 / 53071 loaded, WindowServer 51054 `Ss`, macwshostd 416, SpringBoard 391. `SMOKE_PASS`. No reboot, no 停止 macOS.
+
+### Safari run (one guarded attempt)
+
+21:57:47 CST / 05:57:47 PT onward, Safari pid 66268. The launcher reported `ok=no … 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`. After that 30 s Safari was still running (RSS 190400 KB, below the healthy visible-window class of ~593 MB) with fallback WebContent + one unique-connected Networking helper, but no capturable AppKit window. The script did not open example.com or baidu.com (`LAUNCH_WINDOW_FAIL; not opening URLs`) and wrote `DONE_NO_WINDOW`. Cleanup `CORE_OK`, WebKit LaunchDaemons unloaded, IconServices left loaded. No `/workspace/net23-example.png` or `/workspace/net23-baidu.png`.
+
+Because Safari lost a visible/capturable window, net23 was **rolled back immediately** to `pre-net23-20261110-215737` (the net22 libmachook that was live before this deploy). No second variant. Post-rollback smoke at 22:00:13 CST / 06:00:13 PT: `SMOKE_PASS`, libmachook arm64e again `98f4443646ba1e480075044de20deba064248675`, WebContentProxy still `2097451dd27a6c353c69c88c6ccb5c62acb14e5b`, IconServices 1724 / 53067 / 53071, WindowServer 51054 `Ss`.
+
+### Field result
+
+Spawn and register both ran. 25 `wk-peer register kr=0` and 25 `wk-peer spawn rc=0` lines, unique `com.macwsguide.wk.i.<32 hex>` names, no `register-fail`, no public macosbooter check-in. One helper actually connected: Networking child 66294 logged `xpc_main WebKit unique peer anonymous listener=… rv=0x1403` and `endpoint-send rc=0` *after* exec into the stock `com.apple.WebKit.Networking` image, and Safari logged `wk-peer connected … conn=0x…`. That is the first unique-name peer connection in this stream, and it used the post-exec look_up path rather than inherited slot 1.
+
+The 0755 proxy still never carries slot 1: all 23 handshake inventories have `[1]=0x0`, `[2]=0x0`, `recv_rights=0` (same as net22). The right that reached Networking arrived by `bootstrap_look_up` of the parent-registered unique name after stock exec.
+
+23 of 25 spawns then hit `wk-peer endpoint-timeout wait_ms=800 timed_out=1` and fell back to add_bundle (`tsv=hit`). Almost all `xpc_main WebKit inherited path` lines are those fallback helpers (`peer=(null)`, `flags=8019`, `service=com.apple.macosbooter.WebKit.*`). One later unique WebContent (pid 66639) did reach stock `xpc_main` with `MACWS_WK_PEER` set and created an anonymous listener, but `rv=0x0` and `endpoint-send rc=-1` — Safari had already destroyed the rendezvous receive after the 800 ms timeout. 23 × 800 ms on Safari's application-service thread is the likely reason the AppKit window was not published within 30 s (same class of failure as net21's 2 s × N, even though the per-helper cap stayed under 2 s).
+
+Zero accepted connections, no `InitializeWebProcess` / `CreateWebPage`, no WebContent `remoteContextWithOptions` (only a Safari chrome CAContext from pid 66268).
+
+### What was not done
+
+No second variant. net23 libmachook was rolled back; the device is again on net22 libmachook + net20 proxies + the net19 path layout. Rollback copies remain at `pre-net23-20261110-215737` (this turn's `67d741e3…` dylib, restoring net22 `98f44436…`), `pre-net22-20261110-214530` (net20 libmachook `1cd2631f…` and proxies `2097451d…`), `pre-net21-20261110-212258`, `pre-net20-20261110-211200`, `pre-net19-20261110-205054` (path layout), `pre-net18-20261110-203748`, and `pre-net17-20261110-202135`. No SkyLight hooks, no extra Safari CAContext IMPs, no constructor `dispatch_after`, no new remapper export, no public macosbooter check-in, no competing Mach listener on that name, no CAContext port-retry, no macwshostd restart, no reboot, no 停止 macOS. IconServices jobs were left loaded.
+
+### Paint / IPC conclusion
+
+The rendezvous send right *can* be made visible after proxy exec: Safari's `bootstrap_register` of the unique name succeeds (`kr=0`, receive stays with Safari), and at least the Networking helper reached stock `xpc_main`, obtained a send right (`rv=0x1403`), sent the anonymous-listener endpoint (`endpoint-send rc=0`), and Safari logged `wk-peer connected`. Slot 1 is still not inherited by the 0755 proxy. WebContent generally does not reach that send within 800 ms, and 23 synchronous 800 ms waits prevented Safari from publishing a capturable window. There is no InitializeWebProcess / CreateWebPage / WebContent CAContext / page paint, and there are no net23 screenshots. net23 was rolled back to net22. Next work should keep the register + post-exec look_up path (it is the first proven unique-peer connect) but must not block Safari's launch thread for 800 ms × N helpers — without checking in the public macosbooter name, adding a competing Mach listener on that name, or retrying CAContext ports.
