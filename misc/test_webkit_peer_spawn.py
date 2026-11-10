@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contracts for the net20 unique-peer WebKit spawn handshake."""
+"""Contracts for the unique-peer WebKit spawn handshake."""
 import unittest
 from pathlib import Path
 
@@ -20,12 +20,30 @@ class WebKitPeerSpawnContract(unittest.TestCase):
     def test_client_posix_spawns_proxy_and_skips_add_bundle_on_success(self):
         self.assertIn("macws_xpc_spawn_webkit_peer", HOOKS)
         self.assertIn("posix_spawn(&child, path, NULL, NULL, argv, envp)", HOOKS)
-        # Success path returns before register/add_bundle.
+        self.assertIn("macws_wk_leaf_for_public_name", HOOKS)
+        # Success path is attempted for public WebKit / SandboxBroker
+        # names before any TSV-hit add_bundle / create_fn return.
         spawn = HOOKS.index("macws_xpc_spawn_webkit_peer(activate, leaf, targetq)")
         fallback = HOOKS.index("wk-peer fallback activate=", spawn)
+        tsv = HOOKS.index("macws_register_xpc_app_proxy_bundle(row->relativeProxy);")
         add = HOOKS.index("macws_register_webkit_bundle_if_needed(leaf);", fallback)
         self.assertLess(spawn, fallback)
+        self.assertLess(spawn, tsv)
+        self.assertLess(fallback, tsv)
         self.assertLess(fallback, add)
+        # Do not spawn again when the hook re-enters on a macosbooter remap.
+        self.assertIn("macws_wk_leaf_for_public_name", HOOKS)
+        self.assertIn("Not macosbooter.*", HOOKS)
+
+    def test_spawn_covers_public_webkit_names_only(self):
+        start = HOOKS.index("macws_wk_leaf_for_public_name")
+        end = HOOKS.index("macws_wk_activate_for_public_name")
+        chunk = HOOKS[start:end]
+        self.assertIn("WEBKIT_WEBCONTENT_SERVICE)", chunk)
+        self.assertIn("WEBKIT_NETWORKING_SERVICE)", chunk)
+        self.assertIn("WEBKIT_GPU_SERVICE)", chunk)
+        self.assertIn("SAFARI_SANDBOX_BROKER_SERVICE)", chunk)
+        self.assertNotIn("WEBKIT_WEBCONTENT_SERVICE_NEW", chunk)
 
     def test_helper_listens_only_on_validated_unique_name(self):
         self.assertIn("macws_wk_peer_name_valid(peer)", HOOKS)

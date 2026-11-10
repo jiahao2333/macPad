@@ -15452,6 +15452,35 @@ static xpc_connection_t macws_xpc_spawn_webkit_peer(
     return conn;
 }
 
+/* Public WebKit / Safari SandboxBroker names only. Not macosbooter.*
+ * remaps — those can re-enter this hook from create_fn fallback and
+ * must not start a second unique-name helper. */
+static const char *macws_wk_leaf_for_public_name(const char *name) {
+    if (!name) return NULL;
+    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
+        return "WebContentProxy.xpc";
+    if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
+        return "WebNetworkingProxy.xpc";
+    if (!strcmp(name, WEBKIT_GPU_SERVICE))
+        return "WebGPUProxy.xpc";
+    if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
+        return "SafariSandboxProxy.xpc";
+    return NULL;
+}
+
+static const char *macws_wk_activate_for_public_name(const char *name) {
+    if (!name) return NULL;
+    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
+        return WEBKIT_WEBCONTENT_SERVICE_NEW;
+    if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
+        return WEBKIT_NETWORKING_SERVICE_NEW;
+    if (!strcmp(name, WEBKIT_GPU_SERVICE))
+        return WEBKIT_GPU_SERVICE_NEW;
+    if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
+        return SAFARI_SANDBOX_BROKER_SERVICE_NEW;
+    return NULL;
+}
+
 xpc_connection_t macws_xpc_create_application_service(
         const char *name, dispatch_queue_t targetq,
         xpc_connection_t (*create_fn)(const char *, dispatch_queue_t)) {
@@ -15473,6 +15502,20 @@ xpc_connection_t macws_xpc_create_application_service(
         }
     }
     const MacWSXpcAppServiceRow *row = macws_xpc_app_services_lookup(name);
+    const char *leaf = macws_wk_leaf_for_public_name(name);
+    const char *activate = macws_wk_activate_for_public_name(name);
+    // Unique-name spawn for WebKit / SandboxBroker only, and *before*
+    // the TSV-hit add_bundle / create_fn return so iOS launchd is not
+    // also asked to start a helper with no receive right. Other TSV
+    // rows are unchanged. Skip xpc_add_bundle on the success path.
+    if (leaf && activate) {
+        xpc_connection_t spawned =
+            macws_xpc_spawn_webkit_peer(activate, leaf, targetq);
+        if (spawned) return spawned;
+        macws_xpc_app_logf(
+            "pid=%d wk-peer fallback activate=%s leaf=%s tsv=%s\n",
+            getpid(), activate, leaf, row ? "hit" : "miss");
+    }
     if (row) {
         macws_register_xpc_app_proxy_bundle(row->relativeProxy);
         {
@@ -15495,37 +15538,11 @@ xpc_connection_t macws_xpc_create_application_service(
         macws_xpc_remember_app_conn(conn, row->privateName);
         return conn;
     }
-    // Hardcoded WebKit / Safari SandboxBroker bootstrap (same-name activate).
-    const char *leaf = NULL;
-    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
-        leaf = "WebContentProxy.xpc";
-    else if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
-        leaf = "WebNetworkingProxy.xpc";
-    else if (!strcmp(name, WEBKIT_GPU_SERVICE))
-        leaf = "WebGPUProxy.xpc";
-    else if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
-        leaf = "SafariSandboxProxy.xpc";
+    // Hardcoded WebKit / Safari SandboxBroker bootstrap when the TSV is
+    // missing. Spawn already tried above for public names.
     if (!leaf) return NULL;
-    const char *activate = name;
-    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
-        activate = WEBKIT_WEBCONTENT_SERVICE_NEW;
-    else if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
-        activate = WEBKIT_NETWORKING_SERVICE_NEW;
-    else if (!strcmp(name, WEBKIT_GPU_SERVICE))
-        activate = WEBKIT_GPU_SERVICE_NEW;
-    else if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
-        activate = SAFARI_SANDBOX_BROKER_SERVICE_NEW;
-    // Prefer a host-handshake equivalent: posix_spawn the proxy with a
-    // unique peer name. Skip xpc_add_bundle so iOS launchd does not
-    // also start a helper with no receive right.
-    {
-        xpc_connection_t spawned =
-            macws_xpc_spawn_webkit_peer(activate, leaf, targetq);
-        if (spawned) return spawned;
-        macws_xpc_app_logf(
-            "pid=%d wk-peer fallback activate=%s leaf=%s\n",
-            getpid(), activate, leaf);
-    }
+    if (!activate)
+        activate = name;
     macws_register_webkit_bundle_if_needed(leaf);
     // Fallback: previous add_bundle + macosbooter name activation.
     // Avoids colliding with iOS WebKit peers that own the public names.
