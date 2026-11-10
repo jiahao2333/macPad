@@ -92,6 +92,12 @@ class WebKitPeerSpawnContract(unittest.TestCase):
             chunk.index("entering dispatch_main"))
         self.assertIn("macws_xpc_remember_app_conn(listener, peer)", chunk)
         self.assertIn("macws_xpc_remember_app_conn(incoming, peer_for_accept)", chunk)
+        self.assertIn("com.macwsguide.wk.peer-listener", chunk)
+        self.assertIn("macws_xpc_connection_set_event_handler_raw(listener", chunk)
+        self.assertIn("xpc_dictionary_set_mach_send", HOOKS)
+        self.assertIn("xpc_endpoint_copy_listener_port_4sim", HOOKS)
+        self.assertIn("xpc_endpoint_create_mach_port_4sim", HOOKS)
+        self.assertIn("wk-peer recv-endpoint", HOOKS)
         self.assertLess(
             chunk.index("macws_xpc_remember_app_conn(incoming, peer_for_accept)"),
             chunk.index("macws_webkit_xpc_main_connection(incoming)"))
@@ -131,6 +137,7 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("_xpc_connection_set_instance", metal)
         self.assertIn("wk-peer resume", metal)
         self.assertIn("wk-peer send-message", metal)
+        self.assertIn("wk-peer reply", metal)
         self.assertIn("wk-peer set-event-handler", HOOKS)
 
     def test_sandbox_allows_unique_peer_prefix(self):

@@ -25127,13 +25127,31 @@ static void hooked_xpc_connection_send_message_with_reply(
         xpc_connection_t connection, xpc_object_t message,
         dispatch_queue_t replyq, xpc_handler_t handler) {
     const char *svc = macws_xpc_lookup_app_conn_name(connection);
-    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20))
+    xpc_handler_t reply = handler;
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20)) {
         macws_xpc_app_logf(
             "pid=%d wk-peer send-message-with-reply peer=%s conn=%p\n",
             getpid(), svc, connection);
+        if (handler) {
+            const char *peer = svc;
+            reply = ^(xpc_object_t event) {
+                const char *typ = "other";
+                if (!event)
+                    typ = "null";
+                else if (xpc_get_type(event) == XPC_TYPE_ERROR)
+                    typ = "error";
+                else if (xpc_get_type(event) == XPC_TYPE_DICTIONARY)
+                    typ = "dictionary";
+                macws_xpc_app_logf(
+                    "pid=%d wk-peer reply peer=%s type=%s\n",
+                    getpid(), peer, typ);
+                handler(event);
+            };
+        }
+    }
     if (orig_xpc_connection_send_message_with_reply)
         orig_xpc_connection_send_message_with_reply(
-            connection, message, replyq, handler);
+            connection, message, replyq, reply);
 }
 
 xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {

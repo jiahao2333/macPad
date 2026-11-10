@@ -15170,8 +15170,11 @@ void macws_xpc_wrap_app_event_handler(
                 run();
                 return;
             }
-            macws_webkit_init_log("xpc event off main; dispatch_sync");
-            dispatch_sync(dispatch_get_main_queue(), run);
+            /* Unique incoming conns can be accepted on a background
+             * queue before dispatch_main is draining; dispatch_sync
+             * would deadlock. Async parks the work on the main queue. */
+            macws_webkit_init_log("xpc event off main; dispatch_async");
+            dispatch_async(dispatch_get_main_queue(), run);
         });
         return;
     }
@@ -15432,6 +15435,9 @@ extern int xpc_pipe_simpleroutine(void *pipe, xpc_object_t msg);
 extern int xpc_pipe_receive(mach_port_t port, xpc_object_t *msg);
 extern xpc_connection_t macws_xpc_connection_create_raw(
     const char *, dispatch_queue_t) __asm("_xpc_connection_create");
+extern void macws_xpc_connection_set_event_handler_raw(
+    xpc_connection_t connection, xpc_handler_t handler)
+    __asm("_xpc_connection_set_event_handler");
 
 static void macws_wk_destroy_rendezvous_recv(mach_port_t *recv) {
     if (!recv || !MACH_PORT_VALID(*recv)) return;
@@ -15473,6 +15479,29 @@ static mach_port_t macws_wk_rendezvous_send(const char *peerName) {
     return MACH_PORT_NULL;
 }
 
+typedef mach_port_t (*macws_wk_ep_copy_port_fn)(xpc_object_t);
+typedef xpc_object_t (*macws_wk_ep_from_port_fn)(mach_port_t);
+
+static macws_wk_ep_copy_port_fn macws_wk_ep_copy_port(void) {
+    static macws_wk_ep_copy_port_fn fn;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (macws_wk_ep_copy_port_fn)dlsym(
+            RTLD_DEFAULT, "xpc_endpoint_copy_listener_port_4sim");
+    });
+    return fn;
+}
+
+static macws_wk_ep_from_port_fn macws_wk_ep_from_port(void) {
+    static macws_wk_ep_from_port_fn fn;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (macws_wk_ep_from_port_fn)dlsym(
+            RTLD_DEFAULT, "xpc_endpoint_create_mach_port_4sim");
+    });
+    return fn;
+}
+
 static int macws_wk_send_peer_endpoint(xpc_object_t endpoint,
                                        mach_port_t rendezvousSend) {
     if (!endpoint || !MACH_PORT_VALID(rendezvousSend)) return -1;
@@ -15481,8 +15510,25 @@ static int macws_wk_send_peer_endpoint(xpc_object_t endpoint,
     xpc_object_t payload = xpc_dictionary_create(NULL, NULL, 0);
     if (!payload) return -1;
     xpc_dictionary_set_value(payload, "endpoint", endpoint);
+    /* Cross-process probe: embedding the endpoint object does work,
+     * but also COPY a raw send right. xpc_pipe may drop complex
+     * endpoint objects in some sandboxes; set_mach_send is explicit. */
+    macws_wk_ep_copy_port_fn copy_port = macws_wk_ep_copy_port();
+    mach_port_t lport = MACH_PORT_NULL;
+    if (copy_port)
+        lport = copy_port(endpoint);
+    unsigned typ = 0;
+    if (MACH_PORT_VALID(lport)) {
+        (void)mach_port_type(mach_task_self(), lport, &typ);
+        xpc_dictionary_set_mach_send(payload, "port", lport);
+    }
+    macws_xpc_app_logf(
+        "pid=%d wk-peer endpoint-port port=0x%x typ=0x%x copy_fn=%p\n",
+        getpid(), (unsigned)lport, typ, copy_port);
     int rc = xpc_pipe_simpleroutine(pipe, payload);
     xpc_release(payload);
+    if (MACH_PORT_VALID(lport))
+        (void)mach_port_deallocate(mach_task_self(), lport);
     return rc;
 }
 
@@ -15566,10 +15612,36 @@ static void macws_wk_arm_pending_receive(macws_wk_pending_t *p) {
                 return;
             }
             xpc_object_t ep = NULL;
+            const char *eptyp = "null";
             if (prc == 0 && msg)
                 ep = xpc_dictionary_get_value(msg, "endpoint");
             if (ep) {
+                if (xpc_get_type(ep) == XPC_TYPE_ENDPOINT)
+                    eptyp = "endpoint";
+                else
+                    eptyp = "other";
+            }
+            mach_port_t pport = MACH_PORT_NULL;
+            if (prc == 0 && msg)
+                pport = xpc_dictionary_copy_mach_send(msg, "port");
+            unsigned ptyp = 0;
+            if (MACH_PORT_VALID(pport))
+                (void)mach_port_type(mach_task_self(), pport, &ptyp);
+            xpc_object_t rebuilt = NULL;
+            macws_wk_ep_from_port_fn from_port = macws_wk_ep_from_port();
+            if (from_port && MACH_PORT_VALID(pport))
+                rebuilt = from_port(pport);
+            macws_xpc_app_logf(
+                "pid=%d wk-peer recv-endpoint typ=%s port=0x%x port_typ=0x%x "
+                "rebuilt=%p\n",
+                getpid(), eptyp, (unsigned)pport, ptyp, rebuilt);
+            if (rebuilt)
+                ep = rebuilt;
+            else if (ep)
                 xpc_retain(ep);
+            if (MACH_PORT_VALID(pport))
+                (void)mach_port_deallocate(mach_task_self(), pport);
+            if (ep) {
                 p->endpoint = ep;
                 p->done = 1;
                 macws_wk_destroy_rendezvous_recv(&p->recv);
@@ -17552,8 +17624,18 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
             // connections to the stock handler. Do not call NSApp on
             // this stack.
             mach_port_t rv = macws_wk_rendezvous_send(peer);
+            /* Receive accepts on a live serial queue, not the main
+             * queue. The helper wrap of set_event_handler forces unique
+             * peers onto main; if the listener itself is on main,
+             * Safari can connect and send before dispatch_main() is
+             * draining. A same-chroot cross-process probe with
+             * libmachook delivered CONNECTION + dictionaries on a
+             * non-main serial queue (got_peer=2 got_msg=2). Incoming
+             * conns are still handed to WebKit and targeted at main. */
+            dispatch_queue_t lq = dispatch_queue_create(
+                "com.macwsguide.wk.peer-listener", DISPATCH_QUEUE_SERIAL);
             xpc_connection_t listener = macws_xpc_connection_create_raw(
-                NULL, dispatch_get_main_queue());
+                NULL, lq);
             snprintf(msg, sizeof(msg),
                      "xpc_main WebKit unique peer anonymous listener=%p "
                      "rv=0x%x name=%s",
@@ -17562,7 +17644,7 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
             if (listener) {
                 macws_xpc_remember_app_conn(listener, peer);
                 const char *peer_for_accept = peer;
-                xpc_connection_set_event_handler(listener, ^(xpc_object_t event) {
+                macws_xpc_connection_set_event_handler_raw(listener, ^(xpc_object_t event) {
                     if (event && xpc_get_type(event) == XPC_TYPE_CONNECTION) {
                         xpc_connection_t incoming = (xpc_connection_t)event;
                         char amsg[256];
