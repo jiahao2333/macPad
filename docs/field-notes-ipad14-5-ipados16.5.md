@@ -637,3 +637,36 @@ Logs: `field-artifacts/net11-safari.out` (net11c run), `field-artifacts/net11-we
 ### Still open
 
 WebContent still never creates a CAContext (the net10b diagnosis stands; net11 / net11b / net11c never reached a paint-capable Safari+WebContent session). The next deploy should be the no-ctor-`dispatch_after` tree, with one guarded Safari only after smoke. Remaining leads are unchanged: `InitializeWebProcess` / `CreateWebPage` or the drawing-area constructor never completing, or a dropped compositing send-right (the port-retry is in the tree and untested).
+
+## 25. 296254e logging build still blocks Safari window publish (2026-11-10 18:06–18:10 CST)
+
+### Context
+
+Health at 18:06:14 CST: up 7:09 from the 10:57 CST button reset (no second reboot). `CORE_OK`. WebKit LaunchDaemons unloaded. `comp_occ=16421` (under the emergency gate). GUI already `Ss` (SIGCONT from the earlier net11b/net11c runs; nothing was SIGSTOP'd). Deployed dylib was net10b. Stale hung expect sessions were left alone.
+
+This turn deployed the already-committed 296254e logging tree: no SkyLight / CGS / SLS `MSHookFunction`, no constructor `dispatch_after` on the main queue, Safari `serverPort` logged from the first `remoteContextWithOptions`, WebContent heartbeats from the first two XPC events, CARender port-retry if `portNumber` is 0, no new exported symbols.
+
+### net11d deploy and smoke
+
+Rebuilt from `296254e0f6ad0bfca7e7fc4883343232cc3bdc29`, no macOS restart. Deploy 18:06:55 CST. Device arm64e CDHash `c79a42d13a091e676482da3bb8fb79cb6bece0c9` (sha1 `a013d749ebbd6bef362c63338a7246667b14e0d2`), arm64 `4c91502c1d54f683e53092152ff9caf21f4766a9` (sha1 `51e56d3e98ccfb914a5027f4c1704a67e6d2fce0`). Size 1479344. Fresh inodes 44262 / 23302177. Rollback `*.pre-net11d-20261110-180655` (a copy of working net10b). Smoke via `run_bash.sh` / `launchdchrootexec` was `SMOKE_OK` at 18:07:02 CST.
+
+### Guarded Safari (one attempt, 18:07:07–18:10 CST)
+
+Safari pid 46558 stayed up (~51 MB, `S`) for the whole window, but `macws_control_probe launch-path` reported `custom-path 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`. Both webloc opens failed with `目标应用没有确认 AppKit 文稿事件`. Zero WebContent / Networking / GPU helpers. XPC and init logs were empty. The paint log had only the constructor line `wc=0 safari=1` plus the bash/screencapture installer lines: no `remoteContextWithOptions`, so the unhooked Safari `serverPort` log never ran; no drawing-area breadcrumb; no XPC event begin/end; no `setContextId`. Both captures timed out. No `/workspace/net11-example.png` or `/workspace/net11-baidu.png`. Mid-run `free_mb` 42–45, `comp_occ` 16421 → 16409. After cleanup `CORE_OK`, LaunchDaemons unloaded, no leftover macOS Safari/helpers, uptime still from the 10:57 CST button reset.
+
+This is the same hang as net11c, so removing constructor `dispatch_after` was not sufficient. The ctor itself finished (the installer line was written). Relative to net10b, which did publish a Safari window and start helpers, the remaining 296254e delta that still runs in Safari is the enhanced global `CAContext` hook body (portNumber / key logging and a WebContent-only retry) plus `setAllowsCGSConnections:`. Those hook *bodies* were never entered (no `remoteContextWithOptions` line), so the hang is earlier than the first CAContext call — either installing the extra IMPs, other 296254e ctor work, or leftover session state after the net11b SIGBUS / net11c hang. net10b Safari was not re-run this turn (stop after one failed attempt).
+
+### Rollback
+
+Rolled back immediately to `*.pre-net11d-20261110-180655` (net10b arm64e CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e`, sha1 `b027e89499f34b6bd3c74b55b66a9439f1b8e1d7`, arm64 `b9638f5dad1ee8cf7db3ff9e2d12b492abc12d06`). Size 1477120. Smoke `SMOKE_OK` at 18:10:33 CST. net11d must not be left deployed. No second variant was tried.
+
+Logs: `field-artifacts/net11d-safari.out`, `field-artifacts/net11d-webkit-paint.log`. Currently deployed is net10b.
+
+### Paint-path conclusion
+
+Not reached. InitializeWebProcess / CreateWebPage were not observed, the drawing-area constructor did not run, Safari never logged `CARemoteLayerServer.serverPort`, WebContent never created a CAContext, and the compositing port could not be checked. The net10b diagnosis (WebContent never hosts a remote layer) still stands, untested by this run.
+
+### Still open
+
+Next logging build has to stay out of Safari's window-publish path until a net10b-style window + helper launch is reproduced. Options: keep new hooks strictly out of the Safari process (install-time and method IMPs), or first confirm that net10b Safari still publishes a window after the net11b/net11c incidents. Do not reintroduce SkyLight MSHooks or constructor main-queue `dispatch_after`.
+
