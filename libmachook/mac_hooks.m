@@ -15376,19 +15376,20 @@ static char **macws_wk_peer_envp(const char *peerName) {
     // set XPC_FLAGS=8019. The unsandboxed in-chroot probe delivered
     // without Application-type managed flags.
     char *flags = strdup("XPC_FLAGS=0");
-    char *svc = calloc(1, 17 + 64);
-    if (!peer || !flags || !svc) {
+    // Do not set XPC_SERVICE_NAME to the unique peer. The probe had
+    // no service name, and xpc_connection_create(NULL) in a process
+    // whose XPC_SERVICE_NAME is set can bind as a named client
+    // instead of an anonymous listener, so Safari's
+    // create_from_endpoint traffic never shows up as accepts.
+    if (!peer || !flags) {
         free(peer);
         free(flags);
-        free(svc);
         free(envp);
         return NULL;
     }
     snprintf(peer, 13 + 64, "%s=%s", MACWS_WK_PEER_ENV, peerName);
-    snprintf(svc, 17 + 64, "XPC_SERVICE_NAME=%s", peerName);
     envp[o++] = peer;
     envp[o++] = flags;
-    envp[o++] = svc;
     envp[o] = NULL;
     return envp;
 }
@@ -17644,11 +17645,22 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                 "xpc_main WebKit unique peer cleared XPC_FLAGS "
                 "(no inherited receive, skip 8019 reconstitution)");
         }
+        if (uniquePeer) {
+            // Drop a leftover service name before create(NULL) so the
+            // anonymous listener is not created as a named client of
+            // the unique peer (the unsandboxed probe had no
+            // XPC_SERVICE_NAME and got CONNECTION + dictionaries).
+            unsetenv("XPC_SERVICE_NAME");
+            macws_webkit_init_log(
+                "xpc_main WebKit unique peer omitted XPC_SERVICE_NAME "
+                "(anonymous listener, not a named service)");
+        }
+        const char *serviceNow = getenv("XPC_SERVICE_NAME");
         char msg[320];
         snprintf(msg, sizeof(msg),
                  "xpc_main WebKit inherited path service=%s flags=%s "
                  "uid=%d euid=%d peer=%s (no public macosbooter check-in)",
-                 service ? service : "(null)",
+                 serviceNow ? serviceNow : "(null)",
                  flags ? flags : "(null)",
                  (int)getuid(), (int)geteuid(),
                  peer ? peer : "(null)");

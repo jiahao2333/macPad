@@ -177,6 +177,13 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         envp = HOOKS[start:end]
         self.assertIn('strdup("XPC_FLAGS=0")', envp)
         self.assertNotIn('strdup("XPC_FLAGS=8019")', envp)
+        # Do not advertise XPC_SERVICE_NAME=unique-peer; create(NULL)
+        # must stay an anonymous listener, as in the unsandboxed probe.
+        self.assertNotIn('snprintf(svc, 17 + 64, "XPC_SERVICE_NAME=%s", peerName)', envp)
+        self.assertNotIn('envp[o++] = svc', envp)
+        self.assertIn('unsetenv("XPC_SERVICE_NAME")', HOOKS)
+        self.assertIn("omitted XPC_SERVICE_NAME", HOOKS)
+        self.assertIn("anonymous listener, not a named service", HOOKS)
         # Fallback still reapplies 8019; the unique path must not.
         self.assertIn("macws_webkit_reapply_packed_xpc_flags", HOOKS)
         self.assertIn("if (!uniquePeer)", HOOKS)
@@ -187,6 +194,12 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         end = HOOKS.index("macws_xpc_main_raw(macws_webkit_xpc_main_connection);", start)
         chunk = HOOKS[start:end]
         self.assertNotIn("macws_webkit_reapply_packed_xpc_flags", chunk)
+        self.assertIn('unsetenv("XPC_SERVICE_NAME")', HOOKS)
+        start_un = HOOKS.index('unsetenv("XPC_SERVICE_NAME")')
+        start_cr = HOOKS.index(
+            "xpc_connection_t listener = macws_xpc_connection_create_raw(",
+            start_un)
+        self.assertLess(start_un, start_cr)
         # Proxy must not reconstitute 8019 when MACWS_WK_PEER is set.
         self.assertIn("Do not reconstitute XPC_FLAGS=8019", PROXY)
         self.assertIn('uniqueFlags[] = "XPC_FLAGS=0"', PROXY)
