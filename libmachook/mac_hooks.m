@@ -15128,6 +15128,31 @@ const char *macws_xpc_lookup_app_conn_name(xpc_connection_t conn) {
     return found;
 }
 
+/* Live background serial queue for unique accepted peers. The
+ * unsandboxed probe delivered dictionaries on a non-main serial
+ * queue; net33 forced those peers onto main (helper wrap +
+ * macws_webkit_xpc_main_connection) and saw 30 accepts + resume
+ * but 0 dictionary events. dispatch_main may not drain libxpc
+ * sources the way a live GCD serial queue does. Bounce the
+ * user handler to main separately so InitializeWebKit2 still
+ * sees isMainThread. */
+static dispatch_queue_t macws_wk_unique_incoming_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.macwsguide.wk.peer-incoming",
+                                  DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+static int macws_xpc_app_conn_is_unique_incoming(xpc_connection_t conn) {
+    if (!conn || macws_xpc_app_conn_is_unique_listener(conn))
+        return 0;
+    const char *name = macws_xpc_lookup_app_conn_name(conn);
+    return name && !strncmp(name, "com.macwsguide.wk.i.", 20);
+}
+
 static void macws_xpc_log_and_add_bundle(const char *path, const char *tag) {
     int acc = (path && path[0]) ? access(path, F_OK) : -1;
     int err = (acc == 0) ? 0 : errno;
@@ -15168,11 +15193,25 @@ void macws_xpc_wrap_app_event_handler(
             orig(connection, handler);
             return;
         }
-        if (hsvc && !strncmp(hsvc, "com.macwsguide.wk.i.", 20))
+        /* Unique accepted peer: keep delivery on a live background
+         * serial queue (probe path). Still wrap and bounce off-main
+         * events onto main for isMainThread. Do not force mainq. */
+        if (macws_xpc_app_conn_is_unique_incoming(connection)) {
             macws_xpc_app_logf(
-                "pid=%d wk-peer set-event-handler peer=%s conn=%p helper=1\n",
-                getpid(), hsvc, connection);
-        xpc_connection_set_target_queue(connection, dispatch_get_main_queue());
+                "pid=%d wk-peer set-event-handler-incoming peer=%s "
+                "conn=%p helper=1 wrap=1 mainq=0\n",
+                getpid(), hsvc ? hsvc : "?", connection);
+            xpc_connection_set_target_queue(
+                connection, macws_wk_unique_incoming_queue());
+        } else {
+            if (hsvc && !strncmp(hsvc, "com.macwsguide.wk.i.", 20))
+                macws_xpc_app_logf(
+                    "pid=%d wk-peer set-event-handler peer=%s conn=%p "
+                    "helper=1\n",
+                    getpid(), hsvc, connection);
+            xpc_connection_set_target_queue(
+                connection, dispatch_get_main_queue());
+        }
         xpc_handler_t user = handler;
         orig(connection, ^(xpc_object_t event) {
             void (^run)(void) = ^{
@@ -17585,13 +17624,20 @@ static xpc_connection_handler_t g_macws_webkit_xpc_main_user;
 
 static void macws_webkit_xpc_main_connection(xpc_connection_t conn) {
     char m[192];
+    int unique_in = macws_xpc_app_conn_is_unique_incoming(conn);
     snprintf(m, sizeof(m),
-             "xpc_main accepted connection=%p main=%d "
+             "xpc_main accepted connection=%p main=%d target=%s "
              "(InitializeWebProcess/CreateWebPage ride this conn)",
-             conn, pthread_main_np());
+             conn, pthread_main_np(),
+             unique_in ? "incoming-serial" : "main");
     macws_webkit_init_log(m);
-    if (conn)
-        xpc_connection_set_target_queue(conn, dispatch_get_main_queue());
+    if (conn) {
+        /* Unique accepted peers stay on a live background serial
+         * queue; the wrap bounces the stock handler onto main. */
+        xpc_connection_set_target_queue(
+            conn, unique_in ? macws_wk_unique_incoming_queue()
+                            : dispatch_get_main_queue());
+    }
     if (g_macws_webkit_xpc_main_user)
         g_macws_webkit_xpc_main_user(conn);
 }

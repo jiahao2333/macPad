@@ -103,11 +103,27 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("macws_xpc_app_conn_is_unique_listener", HOOKS)
         self.assertIn("wk-peer set-event-handler-raw", HOOKS)
         self.assertIn("helper=0 wrap=0", HOOKS)
-        wrap = HOOKS[HOOKS.index("if (macws_is_webkit_helper_process() && handler)"):HOOKS.index("xpc_connection_set_target_queue(connection, dispatch_get_main_queue());")]
+        wrap = HOOKS[HOOKS.index("if (macws_is_webkit_helper_process() && handler)"):HOOKS.index("xpc_connection_set_target_queue(\n                connection, dispatch_get_main_queue());")]
         self.assertIn("macws_xpc_app_conn_is_unique_listener(connection)", wrap)
         self.assertIn("orig(connection, handler)", wrap)
         self.assertIn("helper=0 wrap=0", wrap)
         self.assertNotIn("dispatch_get_main_queue()", wrap)
+        # Unique accepted peers keep a live background serial queue
+        # (probe path) and bounce the user handler to main; they must
+        # not take the force-main target queue that net33 used.
+        self.assertIn("macws_xpc_app_conn_is_unique_incoming", HOOKS)
+        self.assertIn("wk-peer set-event-handler-incoming", HOOKS)
+        self.assertIn("helper=1 wrap=1 mainq=0", HOOKS)
+        self.assertIn("com.macwsguide.wk.peer-incoming", HOOKS)
+        self.assertIn("macws_wk_unique_incoming_queue", HOOKS)
+        self.assertIn("incoming-serial", HOOKS)
+        hs = HOOKS.index("static void macws_webkit_xpc_main_connection(xpc_connection_t conn)")
+        he = HOOKS.index("void macws_xpc_main(xpc_connection_handler_t handler)", hs)
+        handoff = HOOKS[hs:he]
+        self.assertIn("macws_xpc_app_conn_is_unique_incoming(conn)", handoff)
+        self.assertIn("macws_wk_unique_incoming_queue()", handoff)
+        self.assertIn("incoming-serial", handoff)
+        self.assertIn("dispatch_async(dispatch_get_main_queue(), run)", HOOKS)
         self.assertIn("xpc_dictionary_set_mach_send", HOOKS)
         self.assertIn("xpc_endpoint_copy_listener_port_4sim", HOOKS)
         self.assertIn("xpc_endpoint_create_mach_port_4sim", HOOKS)
