@@ -23,7 +23,12 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("posix_spawnattr_set_registered_ports_np", HOOKS)
         self.assertIn("xpc_connection_create_from_endpoint", HOOKS)
         self.assertIn("xpc_pipe_simpleroutine", HOOKS)
-        self.assertIn("MACWS_WK_RV_WAIT_MS 800", HOOKS)
+        self.assertIn("MACWS_WK_RV_POP_MS 3000", HOOKS)
+        self.assertIn("MACWS_WK_RV_GRACE_MS 5000", HOOKS)
+        self.assertIn("macws_wk_prewarm_if_needed", HOOKS)
+        self.assertIn("wk-peer pop-timeout", HOOKS)
+        self.assertIn("wk-peer grace-timeout", HOOKS)
+        self.assertIn("recv kept until grace", HOOKS)
         self.assertNotIn("macws_wk_wait_for_peer", HOOKS)
         self.assertNotIn("lookup-timeout", HOOKS)
         self.assertIn("macws_wk_leaf_for_public_name", HOOKS)
@@ -67,17 +72,23 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("macws_xpc_connection_create_raw", chunk)
 
     def test_rendezvous_is_fail_fast_and_not_bootstrap_lookup(self):
-        start = HOOKS.index("#define MACWS_WK_RV_WAIT_MS 800")
+        start = HOOKS.index("#define MACWS_WK_RV_POP_MS 3000")
         end = HOOKS.index("macws_xpc_create_application_service")
         chunk = HOOKS[start:end]
-        self.assertIn("macws_wk_recv_peer_endpoint", chunk)
         self.assertIn("xpc_pipe_receive", chunk)
-        self.assertIn("endpoint-timeout", chunk)
+        self.assertIn("wk-peer pop-timeout", chunk)
+        self.assertIn("wk-peer grace-timeout", chunk)
+        self.assertIn("macws_wk_prewarm_if_needed", chunk)
+        self.assertIn("MACWS_WK_POOL_WEBCONTENT 8", chunk)
         self.assertIn("MACWS_WK_RV_SLOT", chunk)
         self.assertNotIn("usleep(20 * 1000)", chunk)
-        # Cap must stay well under the old 2 s-per-helper stall.
-        self.assertIn("MACWS_WK_RV_WAIT_MS 800", chunk)
-        self.assertLess(800, 2000)
+        self.assertNotIn("endpoint-timeout", chunk)
+        # Caller-thread pop is a single cap, not N serial long waits.
+        # Recv stays alive until grace so a slower WebContent can send.
+        self.assertIn("MACWS_WK_RV_POP_MS 3000", chunk)
+        self.assertIn("MACWS_WK_RV_GRACE_MS 5000", chunk)
+        self.assertLess(3000, 5000)
+        self.assertIn("recv kept until grace", chunk)
         # Parent publishes the unique name; helper may look it up after
         # exec if slot 1 did not survive the 0755 proxy. Not a 2 s loop
         # on Safari's application-service thread, and not macosbooter.

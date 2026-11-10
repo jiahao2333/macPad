@@ -15385,11 +15385,21 @@ static void macws_wk_peer_envp_free(char **envp) {
 // bootstrap_register + create_mach_service LISTENER is "Connection
 // invalid". Hand the helper a COPY_SEND of a parent-owned rendezvous
 // port and receive an anonymous-listener endpoint over xpc_pipe, which
-// is bootstrap-independent. Cap the wait so Safari's application-service
-// thread cannot stall for 2 s per helper. Do not check in or listen on
-// the public macosbooter.WebKit.* name.
+// is bootstrap-independent. Safari bootstrap_registers the unique name
+// so the helper can look it up after exec when slot 1 is missing
+// (field, net23: Networking connected this way).
+//
+// Do not stall Safari's application-service thread for a long wait
+// times N: pre-spawn the helper pool in parallel and only block to
+// pop an already-started peer. Keep the receive right alive until the
+// child sends or a grace timeout, so a slower WebContent can still
+// deliver the endpoint. Do not check in or listen on the public
+// macosbooter.WebKit.* name.
 #define MACWS_WK_RV_SLOT 1
-#define MACWS_WK_RV_WAIT_MS 800
+#define MACWS_WK_RV_POP_MS 3000
+#define MACWS_WK_RV_GRACE_MS 5000
+#define MACWS_WK_POOL_WEBCONTENT 8
+#define MACWS_WK_PENDING_MAX 32
 extern int posix_spawnattr_set_registered_ports_np(
     posix_spawnattr_t *attr, mach_port_t *portarray, unsigned int count);
 extern kern_return_t macws_bootstrap_register_raw(
@@ -15458,58 +15468,136 @@ static int macws_wk_send_peer_endpoint(xpc_object_t endpoint,
     return rc;
 }
 
-// Fail-fast: wait at most MACWS_WK_RV_WAIT_MS. On timeout, destroy the
-// receive right so the blocked xpc_pipe_receive unblocks. Never use a
-// 2 s bootstrap look-up loop on Safari's application-service thread.
-static xpc_object_t macws_wk_recv_peer_endpoint(mach_port_t *recv, int wait_ms,
-                                                int *timed_out) {
-    if (timed_out) *timed_out = 0;
-    if (!recv || !MACH_PORT_VALID(*recv)) return NULL;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    __block xpc_object_t msg = NULL;
-    __block int prc = -1;
-    mach_port_t port = *recv;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        xpc_object_t m = NULL;
-        prc = xpc_pipe_receive(port, &m);
-        msg = m;
-        dispatch_semaphore_signal(sem);
-    });
-    long waited = dispatch_semaphore_wait(
-        sem,
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_ms * NSEC_PER_MSEC));
-    if (waited != 0) {
-        if (timed_out) *timed_out = 1;
-        macws_wk_destroy_rendezvous_recv(recv);
-        (void)dispatch_semaphore_wait(
-            sem, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC));
-        if (msg) xpc_release(msg);
-        dispatch_release(sem);
-        return NULL;
+typedef struct {
+    int in_use;
+    int done;   /* 0 waiting, 1 endpoint ready, -1 failed */
+    int taken;
+    pid_t child;
+    mach_port_t recv;
+    char leaf[48];
+    char peer[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1];
+    dispatch_semaphore_t ready;
+    xpc_object_t endpoint;
+} macws_wk_pending_t;
+
+static macws_wk_pending_t g_macws_wk_pending[MACWS_WK_PENDING_MAX];
+static struct {
+    char leaf[48];
+    int gave_up;
+} g_macws_wk_leaf_wait[8];
+
+static int macws_wk_leaf_already_waited_locked(const char *leaf) {
+    if (!leaf) return 0;
+    for (int i = 0; i < 8; i++) {
+        if (g_macws_wk_leaf_wait[i].leaf[0] &&
+            strcmp(g_macws_wk_leaf_wait[i].leaf, leaf) == 0)
+            return g_macws_wk_leaf_wait[i].gave_up;
     }
-    dispatch_release(sem);
-    if (prc != 0 || !msg) {
-        if (msg) xpc_release(msg);
-        return NULL;
-    }
-    xpc_object_t ep = xpc_dictionary_get_value(msg, "endpoint");
-    if (ep) xpc_retain(ep);
-    xpc_release(msg);
-    return ep;
+    return 0;
 }
 
-// Spawn the WebKit chroot proxy ourselves and connect via the inherited
-// rendezvous port. iOS launchd/xpcproxy starts the proxy without a
-// SERVICE_SLOT receive right (field, net19). Do not check in or listen
-// on the public macosbooter.WebKit.* name.
-static xpc_connection_t macws_xpc_spawn_webkit_peer(
-        const char *activate, const char *leaf, dispatch_queue_t targetq) {
+static void macws_wk_leaf_mark_waited_locked(const char *leaf, int gave_up) {
+    if (!leaf) return;
+    int free_i = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_macws_wk_leaf_wait[i].leaf[0] &&
+            strcmp(g_macws_wk_leaf_wait[i].leaf, leaf) == 0) {
+            g_macws_wk_leaf_wait[i].gave_up = gave_up;
+            return;
+        }
+        if (free_i < 0 && !g_macws_wk_leaf_wait[i].leaf[0])
+            free_i = i;
+    }
+    if (free_i >= 0) {
+        snprintf(g_macws_wk_leaf_wait[free_i].leaf,
+                 sizeof(g_macws_wk_leaf_wait[free_i].leaf), "%s", leaf);
+        g_macws_wk_leaf_wait[free_i].gave_up = gave_up;
+    }
+}
+
+static dispatch_queue_t macws_wk_pool_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.macwsguide.wk.peer-pool",
+                                  DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+static void macws_wk_pending_fail_locked(macws_wk_pending_t *p, int sigkill) {
+    if (!p || p->done != 0) return;
+    p->done = -1;
+    if (sigkill && p->child > 0) {
+        (void)kill(p->child, SIGKILL);
+        (void)waitpid(p->child, NULL, WNOHANG);
+    }
+    macws_wk_destroy_rendezvous_recv(&p->recv);
+    if (p->ready) dispatch_semaphore_signal(p->ready);
+}
+
+static void macws_wk_arm_pending_receive(macws_wk_pending_t *p) {
+    if (!p || !MACH_PORT_VALID(p->recv)) return;
+    mach_port_t port = p->recv;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        xpc_object_t msg = NULL;
+        int prc = xpc_pipe_receive(port, &msg);
+        dispatch_sync(macws_wk_pool_queue(), ^{
+            if (p->done != 0) {
+                if (msg) xpc_release(msg);
+                return;
+            }
+            xpc_object_t ep = NULL;
+            if (prc == 0 && msg)
+                ep = xpc_dictionary_get_value(msg, "endpoint");
+            if (ep) {
+                xpc_retain(ep);
+                p->endpoint = ep;
+                p->done = 1;
+                macws_wk_destroy_rendezvous_recv(&p->recv);
+                macws_xpc_app_logf(
+                    "pid=%d wk-peer ready child=%d peer=%s leaf=%s\n",
+                    getpid(), (int)p->child, p->peer, p->leaf);
+                if (p->ready) dispatch_semaphore_signal(p->ready);
+            } else {
+                macws_xpc_app_logf(
+                    "pid=%d wk-peer recv-fail child=%d peer=%s prc=%d\n",
+                    getpid(), (int)p->child, p->peer, prc);
+                macws_wk_pending_fail_locked(p, 1);
+            }
+            if (msg) xpc_release(msg);
+        });
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)MACWS_WK_RV_GRACE_MS * NSEC_PER_MSEC),
+                   macws_wk_pool_queue(), ^{
+        if (p->done != 0) return;
+        macws_xpc_app_logf(
+            "pid=%d wk-peer grace-timeout child=%d peer=%s grace_ms=%d\n",
+            getpid(), (int)p->child, p->peer, MACWS_WK_RV_GRACE_MS);
+        /* Destroy recv to unblock pipe_receive only after the grace
+         * period, so a slower WebContent can still look the name up. */
+        macws_wk_pending_fail_locked(p, 1);
+    });
+}
+
+/* Register + posix_spawn only. The receive right stays alive until the
+ * child sends an endpoint or MACWS_WK_RV_GRACE_MS elapses. */
+static macws_wk_pending_t *macws_wk_start_peer_locked(const char *activate,
+                                                      const char *leaf) {
     if (!activate || !leaf) return NULL;
-    if (strcmp(activate, WEBKIT_WEBCONTENT_SERVICE_NEW) &&
-        strcmp(activate, WEBKIT_NETWORKING_SERVICE_NEW) &&
-        strcmp(activate, WEBKIT_GPU_SERVICE_NEW) &&
-        strcmp(activate, SAFARI_SANDBOX_BROKER_SERVICE_NEW))
+    macws_wk_pending_t *slot = NULL;
+    for (int i = 0; i < MACWS_WK_PENDING_MAX; i++) {
+        if (!g_macws_wk_pending[i].in_use) {
+            slot = &g_macws_wk_pending[i];
+            break;
+        }
+    }
+    if (!slot) {
+        macws_xpc_app_logf("pid=%d wk-peer pool-full leaf=%s\n", getpid(), leaf);
         return NULL;
+    }
+    memset(slot, 0, sizeof(*slot));
 
     char peer[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1];
     macws_wk_peer_make_name(peer, sizeof(peer));
@@ -15554,15 +15642,14 @@ static xpc_connection_t macws_xpc_spawn_webkit_peer(
                            getpid(), (int)kr);
         return NULL;
     }
-    // Publish a send right under the unique name without giving the
-    // receive to launchd (chroot probe: typ stays 0x30000). The 0755
-    // proxy may not inherit slot 1; the helper can look this up after
-    // exec. Not a public macosbooter check-in.
+    /* Publish a send right under the unique name without giving the
+     * receive to launchd (chroot probe: typ stays 0x30000). The 0755
+     * proxy may not inherit slot 1; the helper can look this up after
+     * exec. Not a public macosbooter check-in. */
     kr = macws_bootstrap_register_raw(bootstrap_port, peer, rvrecv);
     macws_xpc_app_logf("pid=%d wk-peer register kr=%d peer=%s recv=0x%x\n",
                        getpid(), (int)kr, peer, (unsigned)rvrecv);
     if (kr != KERN_SUCCESS) {
-        // Still try inherited slot 1; helper look_up will also fail.
         macws_xpc_app_logf("pid=%d wk-peer register-fail; trying slots only\n",
                            getpid());
     }
@@ -15604,32 +15691,159 @@ static xpc_connection_t macws_xpc_spawn_webkit_peer(
         return NULL;
     }
 
-    int timed_out = 0;
-    xpc_object_t endpoint = macws_wk_recv_peer_endpoint(
-        &rvrecv, MACWS_WK_RV_WAIT_MS, &timed_out);
-    if (!endpoint) {
+    slot->in_use = 1;
+    slot->done = 0;
+    slot->taken = 0;
+    slot->child = child;
+    slot->recv = rvrecv;
+    snprintf(slot->leaf, sizeof(slot->leaf), "%s", leaf);
+    snprintf(slot->peer, sizeof(slot->peer), "%s", peer);
+    slot->ready = dispatch_semaphore_create(0);
+    slot->endpoint = NULL;
+    macws_wk_arm_pending_receive(slot);
+    return slot;
+}
+
+static void macws_wk_prewarm_if_needed(void) {
+    static _Atomic int started = 0;
+    if (atomic_exchange_explicit(&started, 1, memory_order_acq_rel))
+        return;
+    macws_xpc_app_logf("pid=%d wk-peer prewarm wc=%d net=1 gpu=1 sandbox=1\n",
+                       getpid(), MACWS_WK_POOL_WEBCONTENT);
+    dispatch_sync(macws_wk_pool_queue(), ^{
+        for (int i = 0; i < MACWS_WK_POOL_WEBCONTENT; i++)
+            (void)macws_wk_start_peer_locked(WEBKIT_WEBCONTENT_SERVICE_NEW,
+                                             "WebContentProxy.xpc");
+        (void)macws_wk_start_peer_locked(WEBKIT_NETWORKING_SERVICE_NEW,
+                                         "WebNetworkingProxy.xpc");
+        (void)macws_wk_start_peer_locked(WEBKIT_GPU_SERVICE_NEW,
+                                         "WebGPUProxy.xpc");
+        (void)macws_wk_start_peer_locked(SAFARI_SANDBOX_BROKER_SERVICE_NEW,
+                                         "SafariSandboxProxy.xpc");
+    });
+}
+
+static macws_wk_pending_t *macws_wk_claim_or_start_locked(const char *activate,
+                                                          const char *leaf) {
+    macws_wk_pending_t *ready = NULL;
+    macws_wk_pending_t *inflight = NULL;
+    for (int i = 0; i < MACWS_WK_PENDING_MAX; i++) {
+        macws_wk_pending_t *p = &g_macws_wk_pending[i];
+        if (!p->in_use || p->taken) continue;
+        if (strcmp(p->leaf, leaf) != 0) continue;
+        if (p->done == 1 && p->endpoint) {
+            ready = p;
+            break;
+        }
+        if (p->done == 0 && !inflight)
+            inflight = p;
+    }
+    macws_wk_pending_t *got = ready ? ready : inflight;
+    if (got && strcmp(leaf, "WebContentProxy.xpc") == 0) {
+        int unused = 0;
+        for (int i = 0; i < MACWS_WK_PENDING_MAX; i++) {
+            macws_wk_pending_t *p = &g_macws_wk_pending[i];
+            if (p->in_use && !p->taken && p != got &&
+                strcmp(p->leaf, leaf) == 0 && p->done != -1)
+                unused++;
+        }
+        if (unused < MACWS_WK_POOL_WEBCONTENT)
+            (void)macws_wk_start_peer_locked(activate, leaf);
+    }
+    if (got) return got;
+    return macws_wk_start_peer_locked(activate, leaf);
+}
+
+// Spawn (or take a pre-warmed) unique-name helper and connect via the
+// inherited / looked-up rendezvous port. iOS launchd/xpcproxy starts
+// the proxy without a SERVICE_SLOT receive right (field, net19). Do
+// not check in or listen on the public macosbooter.WebKit.* name.
+// Caller-thread wait is at most MACWS_WK_RV_POP_MS for a peer that
+// has usually already been starting in the parallel pool.
+static xpc_connection_t macws_xpc_spawn_webkit_peer(
+        const char *activate, const char *leaf, dispatch_queue_t targetq) {
+    if (!activate || !leaf) return NULL;
+    if (strcmp(activate, WEBKIT_WEBCONTENT_SERVICE_NEW) &&
+        strcmp(activate, WEBKIT_NETWORKING_SERVICE_NEW) &&
+        strcmp(activate, WEBKIT_GPU_SERVICE_NEW) &&
+        strcmp(activate, SAFARI_SANDBOX_BROKER_SERVICE_NEW))
+        return NULL;
+
+    macws_wk_prewarm_if_needed();
+
+    __block macws_wk_pending_t *slot = NULL;
+    dispatch_sync(macws_wk_pool_queue(), ^{
+        slot = macws_wk_claim_or_start_locked(activate, leaf);
+    });
+    if (!slot) return NULL;
+
+    __block int already_waited = 0;
+    dispatch_sync(macws_wk_pool_queue(), ^{
+        already_waited = macws_wk_leaf_already_waited_locked(leaf);
+    });
+    if (slot->done == 0 && already_waited) {
         macws_xpc_app_logf(
-            "pid=%d wk-peer endpoint-timeout child=%d peer=%s wait_ms=%d timed_out=%d\n",
-            getpid(), (int)child, peer, MACWS_WK_RV_WAIT_MS, timed_out);
-        (void)kill(child, SIGKILL);
-        (void)waitpid(child, NULL, WNOHANG);
-        macws_wk_destroy_rendezvous_recv(&rvrecv);
+            "pid=%d wk-peer pop-timeout child=%d peer=%s leaf=%s "
+            "pop_ms=%d skipped (already waited; recv kept until grace)\n",
+            getpid(), (int)slot->child, slot->peer, leaf,
+            MACWS_WK_RV_POP_MS);
         return NULL;
     }
-    macws_wk_destroy_rendezvous_recv(&rvrecv);
+    if (slot->done == 0 && slot->ready) {
+        long waited = dispatch_semaphore_wait(
+            slot->ready,
+            dispatch_time(DISPATCH_TIME_NOW,
+                          (int64_t)MACWS_WK_RV_POP_MS * NSEC_PER_MSEC));
+        if (waited != 0) {
+            dispatch_sync(macws_wk_pool_queue(), ^{
+                macws_wk_leaf_mark_waited_locked(leaf, 1);
+            });
+            macws_xpc_app_logf(
+                "pid=%d wk-peer pop-timeout child=%d peer=%s leaf=%s "
+                "pop_ms=%d (recv kept until grace)\n",
+                getpid(), (int)slot->child, slot->peer, leaf,
+                MACWS_WK_RV_POP_MS);
+            /* Do not SIGKILL and do not destroy recv here. The child may
+             * still reach xpc_main and send during the grace period. */
+            return NULL;
+        }
+    }
+
+    __block xpc_object_t endpoint = NULL;
+    __block pid_t child = 0;
+    char peerbuf[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1];
+    peerbuf[0] = 0;
+    char *peerbufp = peerbuf;
+    dispatch_sync(macws_wk_pool_queue(), ^{
+        child = slot->child;
+        snprintf(peerbufp, MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1,
+                 "%s", slot->peer);
+        if (slot->done == 1 && slot->endpoint && !slot->taken) {
+            endpoint = slot->endpoint;
+            slot->endpoint = NULL;
+            slot->taken = 1;
+            macws_wk_leaf_mark_waited_locked(leaf, 0);
+        }
+    });
+    if (!endpoint) {
+        macws_xpc_app_logf(
+            "pid=%d wk-peer pop-miss child=%d peer=%s leaf=%s\n",
+            getpid(), (int)child, peerbuf, leaf);
+        return NULL;
+    }
 
     xpc_connection_t conn = xpc_connection_create_from_endpoint(endpoint);
     xpc_release(endpoint);
     if (conn && targetq)
         xpc_connection_set_target_queue(conn, targetq);
     macws_xpc_app_logf("pid=%d wk-peer connected peer=%s conn=%p child=%d\n",
-                       getpid(), peer, conn, (int)child);
+                       getpid(), peerbuf, conn, (int)child);
     if (!conn) {
         (void)kill(child, SIGKILL);
         (void)waitpid(child, NULL, WNOHANG);
         return NULL;
     }
-    macws_xpc_remember_app_conn(conn, peer);
+    macws_xpc_remember_app_conn(conn, peerbuf);
     return conn;
 }
 
