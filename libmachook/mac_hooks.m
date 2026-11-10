@@ -15634,26 +15634,42 @@ static void macws_wk_arm_pending_receive(macws_wk_pending_t *p) {
             macws_wk_ep_from_port_fn from_port = macws_wk_ep_from_port();
             if (from_port && MACH_PORT_VALID(pport))
                 rebuilt = from_port(pport);
-            /* net28 deallocated pport after preferring the rebuilt
-             * endpoint. xpc_endpoint_create_mach_port_4sim may wrap
-             * that right without consuming it, leaving a dead name;
-             * Safari then vanished before create_from_endpoint. Keep
-             * the send right for the life of the endpoint. Only
-             * drop a port we did not hand to 4sim. */
+            /* Prefer the authentic xpc_endpoint_create object from the
+             * pipe message. net29 always preferred the 4sim-rebuilt
+             * endpoint whenever the port was valid: Safari popped
+             * create_from_endpoint, skipped set_instance, and sent 30
+             * send_message_with_reply, but helpers saw 0 accepts, 0
+             * xpc events, and 0 replies. A 4sim-rebuilt endpoint can
+             * yield a live-looking connection that does not actually
+             * attach to the helper listener. Keep the send right
+             * either way (net28 deallocated it and Safari vanished).
+             * Use the rebuilt object only if the original is missing. */
             int kept = 0;
-            if (rebuilt) {
+            const char *epsrc = "none";
+            if (ep && xpc_get_type(ep) == XPC_TYPE_ENDPOINT) {
+                xpc_retain(ep);
+                epsrc = "orig";
+                if (rebuilt)
+                    xpc_release(rebuilt);
+                rebuilt = NULL;
+            } else if (rebuilt) {
                 ep = rebuilt;
+                rebuilt = NULL;
+                epsrc = "rebuilt";
+            } else if (ep) {
+                xpc_retain(ep);
+                epsrc = "other";
+            }
+            if (MACH_PORT_VALID(pport)) {
                 p->ep_port = pport;
                 pport = MACH_PORT_NULL;
                 kept = 1;
-            } else if (ep) {
-                xpc_retain(ep);
             }
             macws_xpc_app_logf(
                 "pid=%d wk-peer recv-endpoint typ=%s port=0x%x port_typ=0x%x "
-                "rebuilt=%p kept_port=%d\n",
-                getpid(), eptyp, (unsigned)(kept ? p->ep_port : pport),
-                ptyp, rebuilt, kept);
+                "rebuilt_used=%d src=%s kept_port=%d\n",
+                getpid(), eptyp, (unsigned)p->ep_port, ptyp,
+                epsrc[0]=='r' ? 1 : 0, epsrc, kept);
             if (MACH_PORT_VALID(pport))
                 (void)mach_port_deallocate(mach_task_self(), pport);
             if (ep) {

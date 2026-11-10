@@ -100,12 +100,19 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("wk-peer recv-endpoint", HOOKS)
         self.assertIn("kept_port=", HOOKS)
         self.assertIn("p->ep_port = pport", HOOKS)
-        # net28 deallocated the 4sim send right after preferring
-        # the rebuilt endpoint; net29 must keep that right.
-        recv = HOOKS[HOOKS.index("net28 deallocated pport"):HOOKS.index("wk-peer ready child=")]
+        self.assertIn('epsrc = "orig"', HOOKS)
+        # Prefer the authentic xpc_endpoint_create object; keep the
+        # 4sim send right; use the rebuilt endpoint only as fallback.
+        recv = HOOKS[HOOKS.index("Prefer the authentic xpc_endpoint_create"):HOOKS.index("wk-peer ready child=")]
         self.assertIn("p->ep_port = pport", recv)
-        self.assertIn("kept = 1", recv)
+        self.assertIn('epsrc = "orig"', recv)
+        self.assertIn('epsrc = "rebuilt"', recv)
         self.assertIn("pport = MACH_PORT_NULL", recv)
+        # Must retain the original object and only assign ep = rebuilt
+        # in the fallback branch after the orig path.
+        self.assertLess(recv.index("xpc_retain(ep)"), recv.index('epsrc = "orig"') + 80)
+        self.assertGreater(recv.index("ep = rebuilt"), recv.index('epsrc = "orig"'))
+        self.assertGreater(recv.index("ep = rebuilt"), recv.index("else if (rebuilt)"))
         self.assertLess(
             chunk.index("macws_xpc_remember_app_conn(incoming, peer_for_accept)"),
             chunk.index("macws_webkit_xpc_main_connection(incoming)"))
