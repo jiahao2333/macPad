@@ -90,10 +90,24 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertLess(
             chunk.index("xpc_endpoint_create"),
             chunk.index("entering dispatch_main"))
-        self.assertIn("macws_xpc_remember_app_conn(listener, peer)", chunk)
+        self.assertIn("macws_xpc_remember_unique_listener(listener, peer)", chunk)
+        self.assertNotIn("macws_xpc_remember_app_conn(listener, peer)", chunk)
         self.assertIn("macws_xpc_remember_app_conn(incoming, peer_for_accept)", chunk)
         self.assertIn("com.macwsguide.wk.peer-listener", chunk)
         self.assertIn("macws_xpc_connection_set_event_handler_raw(listener", chunk)
+        self.assertLess(
+            chunk.index("macws_xpc_remember_unique_listener(listener, peer)"),
+            chunk.index("macws_xpc_connection_set_event_handler_raw(listener"))
+        # The helper wrap must skip unique listeners (direct raw calls
+        # still enter the wrap via DYLD_INTERPOSE / MSHook).
+        self.assertIn("macws_xpc_app_conn_is_unique_listener", HOOKS)
+        self.assertIn("wk-peer set-event-handler-raw", HOOKS)
+        self.assertIn("helper=0 wrap=0", HOOKS)
+        wrap = HOOKS[HOOKS.index("if (macws_is_webkit_helper_process() && handler)"):HOOKS.index("xpc_connection_set_target_queue(connection, dispatch_get_main_queue());")]
+        self.assertIn("macws_xpc_app_conn_is_unique_listener(connection)", wrap)
+        self.assertIn("orig(connection, handler)", wrap)
+        self.assertIn("helper=0 wrap=0", wrap)
+        self.assertNotIn("dispatch_get_main_queue()", wrap)
         self.assertIn("xpc_dictionary_set_mach_send", HOOKS)
         self.assertIn("xpc_endpoint_copy_listener_port_4sim", HOOKS)
         self.assertIn("xpc_endpoint_create_mach_port_4sim", HOOKS)

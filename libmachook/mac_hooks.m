@@ -15060,12 +15060,13 @@ static void macws_xpc_host_visible_proxy_path(char *path, size_t pathsz,
 static struct {
     xpc_connection_t conn;
     char name[96];
+    int unique_listener;
 } g_macws_xpc_app_conns[MACWS_XPC_APP_CONN_MAX];
 static int g_macws_xpc_app_conn_n = 0;
 static pthread_mutex_t g_macws_xpc_app_conn_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static void macws_xpc_remember_app_conn(xpc_connection_t conn,
-        const char *name) {
+static void macws_xpc_remember_app_conn_ex(xpc_connection_t conn,
+        const char *name, int unique_listener) {
     if (!conn || !name) return;
     pthread_mutex_lock(&g_macws_xpc_app_conn_mu);
     int slot = g_macws_xpc_app_conn_n;
@@ -15076,7 +15077,39 @@ static void macws_xpc_remember_app_conn(xpc_connection_t conn,
     g_macws_xpc_app_conns[slot].conn = conn;
     snprintf(g_macws_xpc_app_conns[slot].name,
              sizeof(g_macws_xpc_app_conns[slot].name), "%s", name);
+    g_macws_xpc_app_conns[slot].unique_listener = unique_listener ? 1 : 0;
     pthread_mutex_unlock(&g_macws_xpc_app_conn_mu);
+}
+
+static void macws_xpc_remember_app_conn(xpc_connection_t conn,
+        const char *name) {
+    macws_xpc_remember_app_conn_ex(conn, name, 0);
+}
+
+/* Mark the unique-path anonymous listener so the helper wrap does not
+ * force it onto the main queue. Direct calls to set_event_handler_raw
+ * still hit DYLD_INTERPOSE / the shared-cache MSHook (field, net32:
+ * 31 helper=1 lines on the listener). Both hooks enter
+ * macws_xpc_wrap_app_event_handler; skip the wrap there. Incoming
+ * accepted peers stay unmarked and still get the main-queue wrap. */
+static void macws_xpc_remember_unique_listener(xpc_connection_t conn,
+        const char *name) {
+    macws_xpc_remember_app_conn_ex(conn, name, 1);
+}
+
+static int macws_xpc_app_conn_is_unique_listener(xpc_connection_t conn) {
+    if (!conn) return 0;
+    pthread_mutex_lock(&g_macws_xpc_app_conn_mu);
+    int found = 0;
+    for (int i = 0; i < g_macws_xpc_app_conn_n && i < MACWS_XPC_APP_CONN_MAX;
+         i++) {
+        if (g_macws_xpc_app_conns[i].conn == conn) {
+            found = g_macws_xpc_app_conns[i].unique_listener;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_xpc_app_conn_mu);
+    return found;
 }
 
 __attribute__((visibility("hidden")))
@@ -15124,6 +15157,17 @@ void macws_xpc_wrap_app_event_handler(
     // isMainThread assertion holds.
     if (macws_is_webkit_helper_process() && handler) {
         const char *hsvc = macws_xpc_lookup_app_conn_name(connection);
+        /* Unique anonymous listener: do not force main or wrap the
+         * accept handler. The unsandboxed probe delivered on a live
+         * background serial queue without this wrap. */
+        if (macws_xpc_app_conn_is_unique_listener(connection)) {
+            macws_xpc_app_logf(
+                "pid=%d wk-peer set-event-handler-raw peer=%s conn=%p "
+                "helper=0 wrap=0\n",
+                getpid(), hsvc ? hsvc : "?", connection);
+            orig(connection, handler);
+            return;
+        }
         if (hsvc && !strncmp(hsvc, "com.macwsguide.wk.i.", 20))
             macws_xpc_app_logf(
                 "pid=%d wk-peer set-event-handler peer=%s conn=%p helper=1\n",
@@ -17706,7 +17750,7 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                      listener, rv, peer);
             macws_webkit_init_log(msg);
             if (listener) {
-                macws_xpc_remember_app_conn(listener, peer);
+                macws_xpc_remember_unique_listener(listener, peer);
                 const char *peer_for_accept = peer;
                 macws_xpc_connection_set_event_handler_raw(listener, ^(xpc_object_t event) {
                     if (event && xpc_get_type(event) == XPC_TYPE_CONNECTION) {
