@@ -81,7 +81,11 @@ int main(void) {
         self.assertLess(main.index("MacWSBuildChrootRootEnvironment"),
                         main.index("MacWSSyscall1(MACWS_SYS_chroot"))
         self.assertIn("svc #0x80\\n\\tcneg x0, x0, cs", source)
-        self.assertIn("MacWSCheckedSyscall3)) MacWSExit(118)", source)
+        self.assertIn("MacWSCheckedSyscall3", source)
+        self.assertIn("MacWSAdoptInheritedChrootRootEnvironment", source)
+        self.assertIn("MacWSExit(118)", source)
+        self.assertLess(source.index("MacWSAdoptInheritedChrootRootEnvironment"),
+                        source.rindex("MacWSExit(118)"))
 
 
     def test_webkit_zero_xpc_flags_reconstituted(self):

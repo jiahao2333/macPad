@@ -25121,7 +25121,8 @@ static int hooked_sandbox_check(pid_t pid, const char *operation, int type, ...)
         type == MACWS_MH_SANDBOX_FILTER_GLOBAL_NAME) {
         const char *svc = va_arg(ap, const char *);
         va_end(ap);
-        if (svc && !strncmp(svc, "com.apple.macosbooter.", 22))
+        if (svc && (!strncmp(svc, "com.apple.macosbooter.", 22) ||
+                    !strncmp(svc, "com.macwsguide.wk.i.", 20)))
             return 0;
         int checked = orig_sandbox_check(pid, operation, type, svc);
         if (checked != 0) {

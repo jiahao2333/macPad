@@ -11,6 +11,10 @@
 #import <dispatch/dispatch.h>
 #import <dlfcn.h>
 #import <xpc/xpc.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <signal.h>
+extern char **environ;
 #import <sys/sysctl.h>
 #import <sys/file.h>
 #import <malloc/malloc.h>
@@ -14734,7 +14738,12 @@ static char *macws_gigacage_enabled_default = "0";
 // Only applies inside MacWS chroot processes (DYLD-inserted libmachook).
 enum { MACWS_SANDBOX_FILTER_GLOBAL_NAME = 2 }; // SANDBOX_FILTER_GLOBAL_NAME
 static bool macws_sandbox_allow_macosbooter_mach_name(const char *name) {
-    return name && !strncmp(name, "com.apple.macosbooter.", 22);
+    if (!name) return false;
+    if (!strncmp(name, "com.apple.macosbooter.", 22)) return true;
+    // Unique per-instance WebKit peer listeners (not the public
+    // macosbooter.WebKit.* name).
+    if (!strncmp(name, "com.macwsguide.wk.i.", 20)) return true;
+    return false;
 }
 extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
 extern int sandbox_check_by_audit_token(audit_token_t token, const char *operation,
@@ -15274,6 +15283,175 @@ static void macws_issue_macosbooter_mach_extension(const char *serviceName) {
     }
 }
 
+
+#define MACWS_WK_PEER_ENV "MACWS_WK_PEER"
+#define MACWS_WK_PEER_PREFIX "com.macwsguide.wk.i."
+#define MACWS_WK_PEER_PREFIX_LEN 20
+#define MACWS_WK_PEER_HEX_LEN 32
+
+static int macws_wk_peer_name_valid(const char *name) {
+    if (!name || strncmp(name, MACWS_WK_PEER_PREFIX, MACWS_WK_PEER_PREFIX_LEN) != 0)
+        return 0;
+    const char *hex = name + MACWS_WK_PEER_PREFIX_LEN;
+    size_t n = 0;
+    while (hex[n]) {
+        char c = hex[n];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return 0;
+        n++;
+    }
+    return n == MACWS_WK_PEER_HEX_LEN;
+}
+
+static void macws_wk_peer_make_name(char *out, size_t outsz) {
+    unsigned char raw[16];
+    if (outsz < MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1) {
+        if (outsz) out[0] = 0;
+        return;
+    }
+    arc4random_buf(raw, sizeof(raw));
+    memcpy(out, MACWS_WK_PEER_PREFIX, MACWS_WK_PEER_PREFIX_LEN);
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        out[MACWS_WK_PEER_PREFIX_LEN + 2 * i] = hex[(raw[i] >> 4) & 0xf];
+        out[MACWS_WK_PEER_PREFIX_LEN + 2 * i + 1] = hex[raw[i] & 0xf];
+    }
+    out[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN] = 0;
+}
+
+static int macws_wk_proxy_executable_path(const char *leaf, char *path,
+                                          size_t pathsz) {
+    if (!leaf || !path || pathsz < 16) return -1;
+    size_t leafLen = strlen(leaf);
+    if (leafLen < 5 || strcmp(leaf + leafLen - 4, ".xpc") != 0)
+        return -1;
+    int n = snprintf(path, pathsz,
+        "/var/jb/usr/macOS/Frameworks/WebKit.framework/Versions/A/"
+        "XPCServices/%s/%.*s",
+        leaf, (int)(leafLen - 4), leaf);
+    if (n < 0 || (size_t)n >= pathsz) return -1;
+    return access(path, X_OK);
+}
+
+static char **macws_wk_peer_envp(const char *peerName) {
+    int n = 0;
+    if (environ)
+        while (environ[n]) n++;
+    char **envp = calloc((size_t)n + 8, sizeof(char *));
+    if (!envp) return NULL;
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+        if (!environ[i]) continue;
+        if (!strncmp(environ[i], MACWS_WK_PEER_ENV "=", 13))
+            continue;
+        if (!strncmp(environ[i], "XPC_FLAGS=", 10))
+            continue;
+        envp[o++] = environ[i];
+    }
+    char *peer = calloc(1, 13 + 64);
+    char *flags = strdup("XPC_FLAGS=8019");
+    if (!peer || !flags) {
+        free(peer);
+        free(flags);
+        free(envp);
+        return NULL;
+    }
+    snprintf(peer, 13 + 64, "%s=%s", MACWS_WK_PEER_ENV, peerName);
+    envp[o++] = peer;
+    envp[o++] = flags;
+    envp[o] = NULL;
+    return envp;
+}
+
+static void macws_wk_peer_envp_free(char **envp) {
+    if (!envp) return;
+    for (int i = 0; envp[i]; i++) {
+        if (!strncmp(envp[i], MACWS_WK_PEER_ENV "=", 13) ||
+            !strncmp(envp[i], "XPC_FLAGS=", 10))
+            free(envp[i]);
+    }
+    free(envp);
+}
+
+extern kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
+extern mach_port_t bootstrap_port;
+static int macws_wk_wait_for_peer(const char *peerName) {
+    mach_port_t bp = MACH_PORT_NULL;
+    (void)task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
+    if (bp == MACH_PORT_NULL)
+        bp = bootstrap_port;
+    for (int i = 0; i < 100; i++) {
+        mach_port_t sp = MACH_PORT_NULL;
+        kern_return_t kr = bootstrap_look_up(bp, peerName, &sp);
+        if (kr == KERN_SUCCESS && sp != MACH_PORT_NULL) {
+            (void)mach_port_deallocate(mach_task_self(), sp);
+            return 0;
+        }
+        usleep(20 * 1000);
+    }
+    return -1;
+}
+
+// Spawn the WebKit chroot proxy ourselves and connect to a unique
+// per-instance Mach listener. iOS launchd/xpcproxy starts the proxy
+// without a SERVICE_SLOT receive right (field, net19). Do not check in
+// or listen on the public macosbooter.WebKit.* name.
+static xpc_connection_t macws_xpc_spawn_webkit_peer(
+        const char *activate, const char *leaf, dispatch_queue_t targetq) {
+    if (!activate || !leaf) return NULL;
+    if (strcmp(activate, WEBKIT_WEBCONTENT_SERVICE_NEW) &&
+        strcmp(activate, WEBKIT_NETWORKING_SERVICE_NEW) &&
+        strcmp(activate, WEBKIT_GPU_SERVICE_NEW) &&
+        strcmp(activate, SAFARI_SANDBOX_BROKER_SERVICE_NEW))
+        return NULL;
+
+    char peer[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1];
+    macws_wk_peer_make_name(peer, sizeof(peer));
+    if (!macws_wk_peer_name_valid(peer)) {
+        macws_xpc_app_logf("pid=%d wk-peer name-invalid\n", getpid());
+        return NULL;
+    }
+
+    char path[PATH_MAX];
+    if (macws_wk_proxy_executable_path(leaf, path, sizeof(path)) != 0) {
+        macws_xpc_app_logf("pid=%d wk-peer path-fail leaf=%s errno=%d\n",
+                           getpid(), leaf, errno);
+        return NULL;
+    }
+
+    char **envp = macws_wk_peer_envp(peer);
+    if (!envp) return NULL;
+    char *argv[] = { path, NULL };
+    pid_t child = 0;
+    int rc = posix_spawn(&child, path, NULL, NULL, argv, envp);
+    macws_wk_peer_envp_free(envp);
+    macws_xpc_app_logf(
+        "pid=%d wk-peer spawn rc=%d errno=%d child=%d leaf=%s peer=%s path=%s\n",
+        getpid(), rc, rc ? errno : 0, (int)child, leaf, peer, path);
+    if (rc != 0 || child <= 0)
+        return NULL;
+
+    if (macws_wk_wait_for_peer(peer) != 0) {
+        macws_xpc_app_logf("pid=%d wk-peer lookup-timeout child=%d peer=%s\n",
+                           getpid(), (int)child, peer);
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, WNOHANG);
+        return NULL;
+    }
+
+    xpc_connection_t conn = macws_xpc_connection_create_mach_service_raw(
+        peer, targetq, 0);
+    macws_xpc_app_logf("pid=%d wk-peer connected peer=%s conn=%p child=%d\n",
+                       getpid(), peer, conn, (int)child);
+    if (!conn) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, WNOHANG);
+        return NULL;
+    }
+    macws_xpc_remember_app_conn(conn, peer);
+    return conn;
+}
+
 xpc_connection_t macws_xpc_create_application_service(
         const char *name, dispatch_queue_t targetq,
         xpc_connection_t (*create_fn)(const char *, dispatch_queue_t)) {
@@ -15328,11 +15506,6 @@ xpc_connection_t macws_xpc_create_application_service(
     else if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
         leaf = "SafariSandboxProxy.xpc";
     if (!leaf) return NULL;
-    macws_register_webkit_bundle_if_needed(leaf);
-    // Activate under private macosbooter.* name (proxies' CFBundleIdentifier).
-    // Avoids colliding with iOS WebKit peers that own the public names.
-    // Seatbelt: macws_sandbox_check_* allows com.apple.macosbooter.* lookups
-    // for all libmachook chroot processes (system-level, not per-app re-sign).
     const char *activate = name;
     if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
         activate = WEBKIT_WEBCONTENT_SERVICE_NEW;
@@ -15342,6 +15515,22 @@ xpc_connection_t macws_xpc_create_application_service(
         activate = WEBKIT_GPU_SERVICE_NEW;
     else if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
         activate = SAFARI_SANDBOX_BROKER_SERVICE_NEW;
+    // Prefer a host-handshake equivalent: posix_spawn the proxy with a
+    // unique peer name. Skip xpc_add_bundle so iOS launchd does not
+    // also start a helper with no receive right.
+    {
+        xpc_connection_t spawned =
+            macws_xpc_spawn_webkit_peer(activate, leaf, targetq);
+        if (spawned) return spawned;
+        macws_xpc_app_logf(
+            "pid=%d wk-peer fallback activate=%s leaf=%s\n",
+            getpid(), activate, leaf);
+    }
+    macws_register_webkit_bundle_if_needed(leaf);
+    // Fallback: previous add_bundle + macosbooter name activation.
+    // Avoids colliding with iOS WebKit peers that own the public names.
+    // Seatbelt: macws_sandbox_check_* allows com.apple.macosbooter.* lookups
+    // for all libmachook chroot processes (system-level, not per-app re-sign).
     macws_issue_macosbooter_mach_extension(activate);
     xpc_connection_t conn = create_fn(activate, targetq);
     macws_xpc_app_logf("pid=%d created activate=%s conn=%p leaf=%s\n",
@@ -16891,15 +17080,51 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
     if (macws_is_webkit_helper_process() && handler) {
         (void)macws_webkit_reapply_packed_xpc_flags();
         const char *flags = getenv("XPC_FLAGS");
-        char msg[256];
+        const char *peer = getenv(MACWS_WK_PEER_ENV);
+        char msg[320];
         snprintf(msg, sizeof(msg),
                  "xpc_main WebKit inherited path service=%s flags=%s "
-                 "uid=%d euid=%d (no Mach-listener fallback)",
+                 "uid=%d euid=%d peer=%s (no public macosbooter check-in)",
                  service ? service : "(null)",
                  flags ? flags : "(null)",
-                 (int)getuid(), (int)geteuid());
+                 (int)getuid(), (int)geteuid(),
+                 peer ? peer : "(null)");
         macws_webkit_init_log(msg);
         g_macws_webkit_xpc_main_user = handler;
+        if (macws_wk_peer_name_valid(peer)) {
+            // Unique per-instance listener. Not the public macosbooter name.
+            xpc_connection_t listener =
+                macws_xpc_connection_create_mach_service_raw(
+                    peer, dispatch_get_main_queue(),
+                    XPC_CONNECTION_MACH_SERVICE_LISTENER);
+            snprintf(msg, sizeof(msg),
+                     "xpc_main WebKit unique peer listener=%p name=%s",
+                     listener, peer);
+            macws_webkit_init_log(msg);
+            if (listener) {
+                xpc_connection_set_event_handler(listener, ^(xpc_object_t event) {
+                    if (event && xpc_get_type(event) == XPC_TYPE_CONNECTION)
+                        macws_webkit_xpc_main_connection((xpc_connection_t)event);
+                });
+                xpc_connection_resume(listener);
+                Class nsAppClass = objc_getClass("NSApplication");
+                if (nsAppClass) {
+                    id app = ((id (*)(Class, SEL))objc_msgSend)(
+                        nsAppClass, sel_registerName("sharedApplication"));
+                    if (app) {
+                        macws_webkit_init_log(
+                            "xpc_main WebKit unique peer entering NSApp run");
+                        ((void (*)(id, SEL))objc_msgSend)(
+                            app, sel_registerName("run"));
+                    }
+                }
+                macws_webkit_init_log(
+                    "xpc_main WebKit unique peer entering dispatch_main");
+                dispatch_main();
+            }
+            macws_webkit_init_log(
+                "xpc_main WebKit unique peer listener failed; stock xpc_main");
+        }
         macws_xpc_main_raw(macws_webkit_xpc_main_connection);
     }
     macws_xpc_main_raw(handler);

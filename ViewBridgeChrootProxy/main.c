@@ -505,7 +505,14 @@ int main(int argc, char *argv[], char *envp[]) {
     // launchdchrootexec. Without it, CoreServices sees a host root parent and
     // can traverse/cache paths that are not reachable inside this process.
     if (!MacWSBuildChrootRootEnvironment(MACWS_ROOTFS, rootEnvironment,
-            sizeof(rootEnvironment), MacWSCheckedSyscall3)) MacWSExit(118);
+            sizeof(rootEnvironment), MacWSCheckedSyscall3)) {
+        // Already inside the rootfs (client posix_spawn): F_GETPATH is "/".
+        // Keep the parent's canonical host root; do not exit 118 or use "/".
+        const char *inherited = MacWSEnvironmentValue(envp, MACWS_CHROOT_ROOT_KEY);
+        if (!MacWSAdoptInheritedChrootRootEnvironment(
+                inherited, rootEnvironment, sizeof(rootEnvironment)))
+            MacWSExit(118);
+    }
 
     const char *target = MacWSTargetForProxy(
         argc > 0 && argv ? argv[0] : (const char *)0, envp);
