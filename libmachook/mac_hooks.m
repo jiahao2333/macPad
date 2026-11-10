@@ -5625,7 +5625,7 @@ static void macws_webkit_init_log(const char *msg) {
     int fd = open("/tmp/macws-webkit-init.log",
                   O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return;
-    char line[384];
+    char line[768];
     const char *exe = "?";
     char **argv = *_NSGetArgv();
     if (argv && argv[0] && argv[0][0])
@@ -16714,6 +16714,92 @@ static BOOL macws_install_qlsatellite_connection_owner(void) {
 // unmodified Ventura implementations.
 // Function pointer (xpc_connection_handler_t is not a block type).
 // One xpc_main per process; the captured user handler is process-local.
+// After the setuid proxy execve, classic environ may have been overwritten
+// by libxpc unpacking xpcproxy's packed launch context (binprefs / registered
+// ports). On a real Mac, Application-type WebKit helpers keep XPC_FLAGS=8019
+// and stock xpc_main consumes the one-shot receive right from
+// mach_ports_lookup. Re-apply 8019 immediately before stock xpc_main and
+// inventory the inherited rights. Do not bootstrap_check_in the public
+// macosbooter name.
+#if !defined(MACWS_HAS_MACH_PORTS_LOOKUP)
+extern kern_return_t mach_ports_lookup(
+    task_t target_task, mach_port_array_t *init_port_set,
+    mach_msg_type_number_t *init_port_setCnt);
+#endif
+
+static int macws_xpc_flags_are_zero(const char *value) {
+    if (!value || !*value) return 1;
+    if (value[0] == '0' && (value[1] == 'x' || value[1] == 'X'))
+        value += 2;
+    if (!*value) return 1;
+    while (*value) {
+        if (*value != '0') return 0;
+        value++;
+    }
+    return 1;
+}
+
+static int macws_webkit_reapply_packed_xpc_flags(void) {
+    char msg[400];
+    mach_port_array_t ports = NULL;
+    mach_msg_type_number_t count = 0;
+    kern_return_t kr = mach_ports_lookup(mach_task_self(), &ports, &count);
+    int recv = 0;
+    int used = snprintf(msg, sizeof(msg), "ports_lookup kr=%d count=%u",
+                        (int)kr, (unsigned)count);
+    if (kr == KERN_SUCCESS && ports) {
+        for (mach_msg_type_number_t i = 0; i < count; i++) {
+            mach_port_type_t typ = 0;
+            kern_return_t tr = mach_port_type(mach_task_self(), ports[i], &typ);
+            int isrecv = (tr == KERN_SUCCESS &&
+                          (typ & MACH_PORT_TYPE_RECEIVE) != 0);
+            if (isrecv) recv++;
+            if (used > 0 && (size_t)used + 48 < sizeof(msg)) {
+                int w = snprintf(msg + used, sizeof(msg) - (size_t)used,
+                                 " [%u]=0x%x typ=0x%x%s",
+                                 (unsigned)i, (unsigned)ports[i],
+                                 (unsigned)typ, isrecv ? " RECV" : "");
+                if (w > 0) used += w;
+            }
+        }
+        // The names stay registered on the task; only the returned array
+        // is vm-allocated.
+        (void)vm_deallocate(mach_task_self(), (vm_address_t)ports,
+                            (vm_size_t)count * sizeof(*ports));
+    }
+    macws_webkit_init_log(msg);
+
+    used = snprintf(msg, sizeof(msg), "inherited_fds");
+    for (int fd = 0; fd < 32; fd++) {
+        if (fcntl(fd, F_GETFD) < 0) continue;
+        if (used > 0 && (size_t)used + 8 < sizeof(msg)) {
+            int w = snprintf(msg + used, sizeof(msg) - (size_t)used, " %d", fd);
+            if (w > 0) used += w;
+        }
+    }
+    macws_webkit_init_log(msg);
+
+    mach_port_t bootstrap = MACH_PORT_NULL;
+    kr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT,
+                               &bootstrap);
+    snprintf(msg, sizeof(msg), "bootstrap_special kr=%d port=0x%x recv_rights=%d",
+             (int)kr, (unsigned)bootstrap, recv);
+    macws_webkit_init_log(msg);
+
+    const char *flags = getenv("XPC_FLAGS");
+    if (macws_xpc_flags_are_zero(flags)) {
+        setenv("XPC_FLAGS", "8019", 1);
+        const char *now = getenv("XPC_FLAGS");
+        snprintf(msg, sizeof(msg),
+                 "reapplied XPC_FLAGS before xpc_main was=%s now=%s "
+                 "recv_rights=%d (no Mach-listener check-in)",
+                 flags && *flags ? flags : "(unset)",
+                 now ? now : "(null)", recv);
+        macws_webkit_init_log(msg);
+    }
+    return recv;
+}
+
 static xpc_connection_handler_t g_macws_webkit_xpc_main_user;
 
 static void macws_webkit_xpc_main_connection(xpc_connection_t conn) {
@@ -16803,6 +16889,7 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
     // isMainThread assertion without hooking InitializeWebKit2 or adding
     // a constructor main-queue dispatch_after.
     if (macws_is_webkit_helper_process() && handler) {
+        (void)macws_webkit_reapply_packed_xpc_flags();
         const char *flags = getenv("XPC_FLAGS");
         char msg[256];
         snprintf(msg, sizeof(msg),

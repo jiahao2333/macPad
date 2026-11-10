@@ -1044,3 +1044,33 @@ No second variant. net16 proxies stay deployed (window publish still works). Rol
 ### Paint / IPC conclusion
 
 Safari still publishes a capturable window and accepts example.com / baidu.com, but the content area stays white because WebContent never accepts a peer XPC connection, so it never runs InitializeWebProcess / CreateWebPage, never constructs a drawing area, and never creates a CAContext. net16 confirmed that iOS xpcproxy already starts the setuid proxy with `XPC_FLAGS=0x0`, that rewriting the classic `execve` environment to the stock Application-type value `8019` does not make that value (or a receive right) appear in the child at `xpc_main`, and that stock `xpc_main` therefore still never accepts a connection. Next work should find and fix the packed launch context (or otherwise put a real xpcproxy receive right into the task) across chroot+exec, not retry CAContext ports and not reintroduce a competing Mach listener on the same name.
+
+## 34. Child has no inherited receive right: registered ports are a send in slot 0 only (2026-11-10 20:18–20:22 CST / 04:18–04:22 PST)
+
+### What was tried
+
+net16 showed that putting `XPC_FLAGS=8019` on the proxy's classic `execve` environment did not make that value appear at `xpc_main` (still `0x0`, zero accepted connections). The leading hypothesis was that iOS xpcproxy's packed launch context (binprefs / registered ports / fileports) overwrote the flags and perhaps still carried a receive right. Darwin xpcproxy stashes the one-shot service port with `posix_spawnattr_set_registered_ports_np` (consumed in the child via `mach_ports_lookup`); libxpc also uses `__xpc_spawnattr_binprefs_pack/unpack`. The three-slot `mach_ports_register` layout is `NAME_SERVER_SLOT=0`, `ENVIRONMENT_SLOT=1`, `SERVICE_SLOT=2`.
+
+net17 keeps the net16 proxies and changes only libmachook: immediately before stock `xpc_main`, inventory `mach_ports_lookup`, inherited fds 0–31, and the bootstrap special port, then `setenv("XPC_FLAGS","8019")` if the flags still look zero, and call stock `xpc_main` (with the existing main-queue connection wrapper). No public `macosbooter` check-in, no CAContext port-retry, no new exported symbols (still 168 T symbols).
+
+### Deploy
+
+Backup tag `pre-net17-20261110-202135` (20:21:35 CST / 04:21:35 PST) saved live net15 libmachook from both trees into `/var/mobile/macws-rollback/libmachook.dylib.pre-net17-20261110-202135` (CDHash `86f08ac4b4fa875ec61799ce7e991a0576b8b57b`, sha1 `2b0e9195c0f12b00f4d0b76c0c42a32e0692c8d0`). New thin arm64e `libmachook.dylib` is 1,479,408 B, fresh rootfs inode 23425648, CDHash `94fa9ceb9ac4f45f1ccb975690d72afe412f83d2` (sha1 `353be580e6f9f5c2b2c56bd749d05456f65e4008`); arm64 slice CDHash `64fe840477160515868ac1b0b20a5f6737928eb4` (sha1 `b6fdf3ff7d1e9fae7a3847a2431f0e6d08b03f2f`). WebKit proxies stayed on net16 (WebContentProxy `5d3a9cec32167ad654d0796efaf141cbab6345a9`, 4755). Smoke at 20:21:40 CST / 04:21:40 PST: `SMOKE_OK` rc=0. IconServices 53067/53071 stayed loaded; iOS agent 1724 was left alone. No reboot, no 停止 macOS.
+
+### Safari run (one guarded attempt)
+
+20:21:47 CST / 04:21:47 PST onward, Safari pid 58039. `LAUNCH_WINDOW_OK`, example.com and baidu.com accepted. Safari RSS grew to ~496 MB (507728 KB). `comp_occ` 20701 → 20638 (no watchdog). Cleanup CORE_OK (WindowServer 51054, macwshostd 416, SpringBoard 391), WebKit LaunchDaemons unloaded. Screenshots: `/workspace/net17-example.png` and `/workspace/net17-baidu.png` (2732×2048, clock 04:22 PST), Safari in front, URLs example.com / baidu.com, Start Page + E/B Untitled, content still white. Because the window stayed capturable, net17 was **not** rolled back.
+
+### Field result
+
+The net16 proxy still logged `incoming=0x0 outgoing=8019` (26 WebContent + Networking + SandboxBroker). In the stock child, `mach_ports_lookup` succeeded on every helper (`kr=0`, `count=3`): slot 0 held a **send** right (`typ=0x10000` = `MACH_PORT_TYPE_SEND`, names such as `0x1503` / `0x1403`), and slots 1 and 2 (`ENVIRONMENT_SLOT`, `SERVICE_SLOT`) were `MACH_PORT_NULL`. `recv_rights=0` on all 27 helpers. Inherited fds were only 0, 1, and 2 — no leftover packed-context fileport. Bootstrap special port was present (`0x807`). After the pre-`xpc_main` `setenv`, stock `xpc_main` logged `flags=8019` (the earlier `was=8019` on the reapply line is not a reliable pre-image: `setenv` can invalidate the old `getenv` pointer; the post-reapply `inherited path flags=8019` line is authoritative). **Zero** `xpc_main accepted connection=` lines, no `xpc event`, no `InitializeWebProcess` / `CreateWebPage`, no drawing-area, no WebContent `remoteContextWithOptions`. Safari created 26 `com.apple.macosbooter.WebKit.WebContent` connections with no `xpc_error`; `add_bundle` still `errno=62` then `add_bundle_done` on the jb Frameworks path.
+
+So flags were not the remaining blocker once stock `xpc_main` actually saw `8019`. iOS xpcproxy never deposited an Application-type receive right into the task (no `SERVICE_SLOT` port, no extra fd). A send right in `NAME_SERVER_SLOT` plus a bootstrap special port is not enough for `xpc_main` to accept Safari's already-held peer.
+
+### What was not done
+
+No second variant. net17 libmachook and net16 proxies stay deployed (window publish still works). Rollback copies remain at `pre-net17-20261110-202135` (net15 dylib `86f08ac4…`) and `pre-net16-20261110-201123` (net15-era proxies, WebContent `181c64a6…`). No SkyLight hooks, no extra Safari CAContext IMPs, no constructor `dispatch_after`, no remapper export, no competing Mach listener, no CAContext port-retry, no reboot, no 停止 macOS. IconServices jobs were left loaded.
+
+### Paint / IPC conclusion
+
+Safari still publishes a capturable window and accepts example.com / baidu.com, but the content area stays white because WebContent never accepts a peer XPC connection, so it never runs InitializeWebProcess / CreateWebPage or creates a CAContext. net17 showed that even when stock `xpc_main` runs with `XPC_FLAGS=8019`, there is no inherited receive right to consume: `mach_ports_lookup` has only a send right in slot 0, empty service/environment slots, and no packed fd. Next work should get a real receive right into the helper task (fix the host-side xpcproxy / `xpc_add_bundle` handshake that should stash Safari's one-shot port, or an equivalent without checking in the public macosbooter name), not retry CAContext ports and not reintroduce a competing Mach listener.
