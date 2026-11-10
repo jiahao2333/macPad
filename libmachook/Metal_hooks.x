@@ -25066,12 +25066,74 @@ extern xpc_connection_t macws_xpc_create_application_service(
 extern void macws_xpc_wrap_app_event_handler(
     xpc_connection_t connection, xpc_handler_t handler,
     void (*orig)(xpc_connection_t, xpc_handler_t));
+extern void macws_xpc_app_logf(const char *fmt, ...);
+extern const char *macws_xpc_lookup_app_conn_name(xpc_connection_t conn);
 static void (*orig_xpc_connection_set_event_handler)(
     xpc_connection_t, xpc_handler_t);
 static void hooked_xpc_connection_set_event_handler(
         xpc_connection_t connection, xpc_handler_t handler) {
     macws_xpc_wrap_app_event_handler(
         connection, handler, orig_xpc_connection_set_event_handler);
+}
+
+// Shared-cache WebKit/libxpc never hits DYLD_INTERPOSE of
+// xpc_connection_set_instance (net25 logged 0 skips). Instance UUIDs are
+// launchd MultipleInstances metadata and can invalidate a
+// create_from_endpoint unique peer. Skip them here, and log resume / send
+// so the field run can tell whether Safari actually talks on that conn.
+static void (*orig_xpc_connection_set_instance)(
+    xpc_connection_t, const unsigned char[16]);
+static void hooked_xpc_connection_set_instance(
+        xpc_connection_t connection, const unsigned char instance[16]) {
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20)) {
+        macws_xpc_app_logf("pid=%d wk-peer skip-set-instance peer=%s\n",
+                           getpid(), svc);
+        return;
+    }
+    if (orig_xpc_connection_set_instance)
+        orig_xpc_connection_set_instance(connection, instance);
+}
+
+static void (*orig_xpc_connection_resume)(xpc_connection_t);
+static void hooked_xpc_connection_resume(xpc_connection_t connection) {
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20))
+        macws_xpc_app_logf("pid=%d wk-peer resume peer=%s conn=%p\n",
+                           getpid(), svc, connection);
+    if (orig_xpc_connection_resume)
+        orig_xpc_connection_resume(connection);
+}
+
+static void (*orig_xpc_connection_send_message)(xpc_connection_t, xpc_object_t);
+static void hooked_xpc_connection_send_message(
+        xpc_connection_t connection, xpc_object_t message) {
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20)) {
+        const char *typ = "other";
+        if (message && xpc_get_type(message) == XPC_TYPE_DICTIONARY)
+            typ = "dictionary";
+        macws_xpc_app_logf(
+            "pid=%d wk-peer send-message peer=%s conn=%p type=%s\n",
+            getpid(), svc, connection, typ);
+    }
+    if (orig_xpc_connection_send_message)
+        orig_xpc_connection_send_message(connection, message);
+}
+
+static void (*orig_xpc_connection_send_message_with_reply)(
+    xpc_connection_t, xpc_object_t, dispatch_queue_t, xpc_handler_t);
+static void hooked_xpc_connection_send_message_with_reply(
+        xpc_connection_t connection, xpc_object_t message,
+        dispatch_queue_t replyq, xpc_handler_t handler) {
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20))
+        macws_xpc_app_logf(
+            "pid=%d wk-peer send-message-with-reply peer=%s conn=%p\n",
+            getpid(), svc, connection);
+    if (orig_xpc_connection_send_message_with_reply)
+        orig_xpc_connection_send_message_with_reply(
+            connection, message, replyq, handler);
 }
 
 xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {
@@ -25184,6 +25246,26 @@ static void macws_install_private_xpc_name_hooks(void) {
         MSHookFunction(seteh,
                        (void *)hooked_xpc_connection_set_event_handler,
                        (void *)&orig_xpc_connection_set_event_handler);
+    void *setinst = MSFindSymbol(xpc, "_xpc_connection_set_instance");
+    if (setinst)
+        MSHookFunction(setinst,
+                       (void *)hooked_xpc_connection_set_instance,
+                       (void *)&orig_xpc_connection_set_instance);
+    void *res = MSFindSymbol(xpc, "_xpc_connection_resume");
+    if (res)
+        MSHookFunction(res,
+                       (void *)hooked_xpc_connection_resume,
+                       (void *)&orig_xpc_connection_resume);
+    void *send = MSFindSymbol(xpc, "_xpc_connection_send_message");
+    if (send)
+        MSHookFunction(send,
+                       (void *)hooked_xpc_connection_send_message,
+                       (void *)&orig_xpc_connection_send_message);
+    void *sendr = MSFindSymbol(xpc, "_xpc_connection_send_message_with_reply");
+    if (sendr)
+        MSHookFunction(sendr,
+                       (void *)hooked_xpc_connection_send_message_with_reply,
+                       (void *)&orig_xpc_connection_send_message_with_reply);
     macws_install_sandbox_mach_lookup_hooks();
 }
 

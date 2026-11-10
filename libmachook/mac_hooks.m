@@ -15023,7 +15023,8 @@ static const MacWSXpcAppServiceRow *macws_xpc_app_services_lookup(
 //   2. /var/jb/usr/macOS/Frameworks/... — the DockHelper pattern. access()
 //      may fail inside the chroot because rootfs /var/jb/usr is an absolute
 //      symlink loop; launchd still resolves the path on the host.
-static void macws_xpc_app_logf(const char *fmt, ...) {
+__attribute__((visibility("hidden")))
+void macws_xpc_app_logf(const char *fmt, ...) {
     int fd = open("/tmp/macws-xpc-app.log",
                   O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return;
@@ -15055,7 +15056,7 @@ static void macws_xpc_host_visible_proxy_path(char *path, size_t pathsz,
 
 // Remember Application-type connections so we can log XPC errors (Connection
 // invalid / interrupted) after the client installs its own event handler.
-#define MACWS_XPC_APP_CONN_MAX 32
+#define MACWS_XPC_APP_CONN_MAX 128
 static struct {
     xpc_connection_t conn;
     char name[96];
@@ -15078,7 +15079,8 @@ static void macws_xpc_remember_app_conn(xpc_connection_t conn,
     pthread_mutex_unlock(&g_macws_xpc_app_conn_mu);
 }
 
-static const char *macws_xpc_lookup_app_conn_name(xpc_connection_t conn) {
+__attribute__((visibility("hidden")))
+const char *macws_xpc_lookup_app_conn_name(xpc_connection_t conn) {
     if (!conn) return NULL;
     pthread_mutex_lock(&g_macws_xpc_app_conn_mu);
     const char *found = NULL;
@@ -15121,6 +15123,11 @@ void macws_xpc_wrap_app_event_handler(
     // any off-main handler onto the main queue so InitializeWebKit2's
     // isMainThread assertion holds.
     if (macws_is_webkit_helper_process() && handler) {
+        const char *hsvc = macws_xpc_lookup_app_conn_name(connection);
+        if (hsvc && !strncmp(hsvc, "com.macwsguide.wk.i.", 20))
+            macws_xpc_app_logf(
+                "pid=%d wk-peer set-event-handler peer=%s conn=%p helper=1\n",
+                getpid(), hsvc, connection);
         xpc_connection_set_target_queue(connection, dispatch_get_main_queue());
         xpc_handler_t user = handler;
         orig(connection, ^(xpc_object_t event) {
@@ -15162,6 +15169,10 @@ void macws_xpc_wrap_app_event_handler(
         return;
     }
     const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20))
+        macws_xpc_app_logf(
+            "pid=%d wk-peer set-event-handler peer=%s conn=%p helper=%d\n",
+            getpid(), svc, connection, macws_is_webkit_helper_process() ? 1 : 0);
     if (!svc || !handler) {
         orig(connection, handler);
         return;
@@ -17539,6 +17550,7 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                      listener, rv, peer);
             macws_webkit_init_log(msg);
             if (listener) {
+                macws_xpc_remember_app_conn(listener, peer);
                 macws_webkit_xpc_main_connection(listener);
                 macws_webkit_init_log(
                     "xpc_main WebKit unique peer handed to xpc_main handler");

@@ -83,6 +83,10 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertLess(
             chunk.index("xpc_endpoint_create"),
             chunk.index("entering dispatch_main"))
+        self.assertIn("macws_xpc_remember_app_conn(listener, peer)", chunk)
+        self.assertLess(
+            chunk.index("macws_xpc_remember_app_conn(listener, peer)"),
+            chunk.index("macws_webkit_xpc_main_connection(listener)"))
 
     def test_rendezvous_is_fail_fast_and_not_bootstrap_lookup(self):
         start = HOOKS.index("#define MACWS_WK_RV_POP_MS 3000")
@@ -109,6 +113,16 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("macws_wk_rendezvous_send", chunk)
         self.assertIn("macws_bootstrap_look_up_raw", chunk)
         self.assertNotIn("WEBKIT_WEBCONTENT_SERVICE_NEW);", chunk)
+
+    def test_unique_peer_skips_shared_cache_set_instance(self):
+        self.assertIn("MACWS_XPC_APP_CONN_MAX 128", HOOKS)
+        self.assertIn("wk-peer skip-set-instance", HOOKS)
+        metal = (ROOT / "libmachook" / "Metal_hooks.x").read_text()
+        self.assertIn("hooked_xpc_connection_set_instance", metal)
+        self.assertIn("_xpc_connection_set_instance", metal)
+        self.assertIn("wk-peer resume", metal)
+        self.assertIn("wk-peer send-message", metal)
+        self.assertIn("wk-peer set-event-handler", HOOKS)
 
     def test_sandbox_allows_unique_peer_prefix(self):
         self.assertIn('!strncmp(name, "com.macwsguide.wk.i.", 20)', HOOKS)
