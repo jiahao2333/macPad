@@ -815,3 +815,62 @@ Session-level capture and new-window publish are recovered (desktop + Activity M
 ### Still open
 
 Why Safari's CAContexts and helper processes do not yield a DisplayStream/AppKit window that `screencapture` can see, and why those processes are already gone by the post-open `ps`. Next recheck of net10b Safari (or a logging deploy) should wait until that window is visible; do not reintroduce SkyLight MSHooks, extra Safari CAContext IMPs, or constructor main-queue `dispatch_after`.
+
+## 30. Missing macOS IconServices caused the Safari SIGABRT; window is visible again, content still white (2026-11-10 19:23–19:30 CST)
+
+### Context
+
+After the user's unlock, desktop capture and Activity Monitor window publish worked (§29), but the 19:14 CST net10b Safari run left only the Finder desktop in `/workspace/net10b-recheck-*.png`. net10b stayed deployed (inode 23302283, size 1477120, mtime Nov 10 18:10 CST, arm64e CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e`). No new dylib, no reboot, no 停止 macOS, no `repair-desktop` / `rebuild-desktop-session`.
+
+### Why there was no on-screen Safari window
+
+The 19:14 launch-path message (`custom-path 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`) was a mis-report. Safari pid 51989 did publish an AppInput endpoint and hostd sent `application-reopen`, then died about 3 s after launch with `exit-status=6`. `RequestApplicationReopen` keeps that waitpid status local, so `LaunchRootExecutable` still saw `exitStatus=-1` and printed the 30-second timeout string. The reaper then logged `supervisor:path-or-process-absent`.
+
+Open-documents does not require a visible window (only the AppInput endpoint plus an ack). It therefore started fresh pids 52091 and 52334, both of which accepted the `.webloc` and then died with `waitpid:signal-6` (~8 s later). The script's empty `PROCS` listings were because those processes were already gone, not because the Cryptexes Safari path evaded the matcher. Helpers died with the Safari abort; they did not disappear independently.
+
+No new Safari/WebContent `.ips` was written in DiagnosticReports or CrashReporter for this abort (chroot ReportCrash appears not to have captured it). The evidence is stdout in `/var/mobile/Library/Logs/CustomApp.host.log` (O_TRUNC per launch, so only the last pid remains): Safari 52334 ended with
+
+`Assertion failed: (result), function NSISIconImageRepGetCGImage, file NSISIconImageRep.m, line 102.`
+
+That is SIGABRT in IconServices' AppKit image-rep path while building chrome (tabs / file icons), not a missing DisplayStream space or an off-screen/minimized window. Metrics sidecars for those pids were never left behind (`current-generation=0`). Activity Monitor at 19:13 CST had published a visible window (RSS 116384) because it does not take this Safari icon assertion path.
+
+`CGWindowList` / spaces were not needed as the primary explanation: Safari never stayed alive long enough to occupy a space.
+
+### Missing macOS IconServices after the WindowServer-only recover
+
+`macos_gui.sh` starts Ventura `iconservicesd` (uid 240, `com.macwsguide.iconservicesd`, Mach name `com.apple.macosbooter.iconservices.store`) and `iconservicesagent runAsRoot` (`com.macwsguide.iconservicesagent`, `com.apple.macosbooter.iconservices`). libmachook already remaps `com.apple.iconservices` / `.store` to those names. Both jobs were started at 11:03 CST (logs under `/var/jb/var/mobile/iconservices*.log`) and were **not loaded** by 19:23 CST: `launchctl print` said the services were absent, and the logs had not been written since 11:03. The 18:22 WindowServer recover only `launchctl load`'d Finder / Dock / SystemUIServer / ControlCenter / OSXvnc, not IconServices.
+
+The only live IconServices process was iPadOS `com.apple.iconservices.iconservicesagent` pid 1724 (boot-age, uid `_iconservices`). Safari's remapped lookup therefore had no macOS listener, icon rasterization returned nothing, and `NSISIconImageRepGetCGImage` aborted.
+
+Comparison with the 16:57 CST success (pid 38235, ~360 MB, DisplayStream window, Favorites then example.com / baidu with a white content area, cleaned with SIGTERM): that run was in the original 11:03 session while the macOS IconServices jobs still existed. Even then, 16:52–16:53 CST had three prior SIGABRT launches (pids 36668, 36740, 37269) before 38235 published `window-ready` at generation 1. So the abort can also race when the daemons are up; after 18:22 they were simply gone, and every 19:14 attempt aborted.
+
+### Step — reload existing IconServices jobs, then one guarded Safari
+
+At 19:27:15 CST / 03:27:15 PST the existing plists were `launchctl load`'d (store tree already uid 240 and marker `wrapgl-trust-v1`; no cache wipe). Both jobs came up immediately:
+
+- `iconservicesd` pid 53067, uid 240, `Ss`, ~25 MB, last exit never
+- `iconservicesagent runAsRoot` pid 53071, root, `Ss`, ~27 MB, last exit never
+
+iOS agent 1724 was left alone. No new hook dylib.
+
+One guarded net13 Safari (`/var/mobile/net13/safari.sh`, started 19:29:03 CST / 03:29:03 PST via nested sudo so chroot I/O worked; open-url was withheld unless launch-path returned `ok=yes`):
+
+- 19:29:07 CST / 03:29:07 PST: launch pid 53285. Endpoint-driven reopen sent. At 03:29:18, `application-reopen result=window-ready previous-generation=0 current-generation=1` and `launch-app window-ready path=DisplayStream`. RSS was already ~179 MB at +11 s, then ~389 MB (398528 KB) once pages were opened — the healthy ~360 MB class, not the hung ~51 MB class.
+- The probe line was `ok=yes launched-pid=53285 message=不支持的操作`; hostd's window-ready record is the authoritative witness. Same pid reused for both documents (`appkit-accepted`).
+- CustomApp.log had the usual empty-NSURL and Metal-library-format warnings, plus "Spell server connection invalidated", but **no** `NSISIconImageRepGetCGImage` assertion.
+- 18 WebContent + Networking + SandboxBroker stayed up (WebContent only logged `CAContext hooks`). Safari did CARenderServer rewrite (port `0x3d0b`), `remoteContextWithOptions`, and nine `contextWithCGSConnection`. GPU was not requested.
+- Cleanup was SIGTERM (`waitpid:signal-15`). No leftovers. `CORE_OK`. LaunchDaemons unloaded. `comp_occ` 12171 → 20926, under the emergency gate. IconServices jobs still running afterwards.
+
+### Screenshots
+
+`/workspace/net13-example.png` (861,269 bytes, 2732×2048, clock 03:29): a real Safari window is frontmost (Safari menu bar), the address bar shows `example.com`, two "Untitled" tabs, and a **blank white content area**. `/workspace/net13-baidu.png` (859,398 bytes): the same window after the baidu open; a third tab "B Untitled" appeared; the content area is still white.
+
+This reproduces the 16:57 CST paint result: Safari leaves the start/Favorites chrome, the URL is accepted, and WebContent still never creates a CAContext, so the page body stays white.
+
+### What was not done
+
+296254e / net11* was not deployed. No SkyLight/CGS/SLS MSHooks and no extra Safari CAContext IMPs. No device reboot and no 停止 macOS.
+
+### Paint-path conclusion
+
+The missing on-screen window in §29 was Safari aborting in IconServices after the post-WindowServer recover left `com.macwsguide.iconservicesd` / `iconservicesagent` unloaded. With those existing jobs loaded again, net10b Safari publishes a capturable window. The remaining WebKit issue is unchanged: WebContent never hosts a remote layer, so example.com and baidu stay white after leaving Favorites. A WebContent-only logging dylib (296254e) is now a reasonable next step, because there is once again a visible Safari window to observe.
