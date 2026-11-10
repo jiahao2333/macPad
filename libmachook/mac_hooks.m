@@ -5660,6 +5660,30 @@ static bool macws_is_webkit_helper_process(void) {
     return false;
 }
 
+static bool macws_exe_contains(const char *needle) {
+    if (!needle || !needle[0])
+        return false;
+    char **argv = *_NSGetArgv();
+    const char *p = (argv && argv[0]) ? argv[0] : "";
+    if (p[0] && strstr(p, needle))
+        return true;
+    char path[1024];
+    uint32_t sz = sizeof(path);
+    if (_NSGetExecutablePath(path, &sz) == 0 && strstr(path, needle))
+        return true;
+    return false;
+}
+
+// Narrower than macws_is_webkit_helper_process: only the WebContent XPC.
+static bool macws_is_webcontent_process(void) {
+    return macws_exe_contains("com.apple.WebKit.WebContent");
+}
+
+static bool macws_is_safari_process(void) {
+    // Safari.app itself, not SafariSandboxBroker / Safari services.
+    return macws_exe_contains("/Safari.app/Contents/MacOS/Safari");
+}
+
 static void hooked_InitializeWebKit2(void) {
     char msg[160];
     snprintf(msg, sizeof(msg), "InitializeWebKit2 call orig=%p",
@@ -5858,8 +5882,74 @@ static void macws_ctor_webkit_init_mainthread(void) {
 
 // WebKit in-process compositing hosts remote layers through CAContext /
 // CALayerHost over CARenderServer. Log the boundary so a blank content area can be distinguished from a missing GPU process.
+// Ventura WebKit-7615 TiledCoreAnimationDrawingArea::updateLayerHostingContext
+// uses LayerHostingContext::createForPort(compositingRenderServerPort), which
+// is [CAContext remoteContextWithOptions:@{ kCAContextPortNumber: port }].
+// The port is passed from Safari as [CARemoteLayerServer sharedServer].serverPort,
+// not looked up by WebContent itself.
+
+static mach_port_t macws_lookup_macosbooter_carender(void) {
+    // Call the original bootstrap_look_up (interpose does not recurse from
+    // this replacement TU) with the already-rewritten host name. Do not
+    // export a remapper symbol.
+    extern kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
+    mach_port_t bp = MACH_PORT_NULL;
+    mach_port_t sp = MACH_PORT_NULL;
+    // task_get_bootstrap_port is a macro around task_get_special_port.
+    if (task_get_bootstrap_port(mach_task_self(), &bp) != KERN_SUCCESS || !bp)
+        return MACH_PORT_NULL;
+    kern_return_t kr = bootstrap_look_up(
+        bp, "com.apple.macosbooter.CARenderServer", &sp);
+    if (kr != KERN_SUCCESS)
+        return MACH_PORT_NULL;
+    return sp;
+}
+
+static void macws_safari_log_remote_port(void);
+
+static unsigned macws_opts_port_number(id opts) {
+    if (!opts)
+        return 0;
+    id portObj = ((id (*)(id, SEL, id))objc_msgSend)(
+        opts, sel_registerName("objectForKey:"), @"portNumber");
+    if (!portObj)
+        return 0;
+    return ((unsigned (*)(id, SEL))objc_msgSend)(
+        portObj, sel_registerName("unsignedIntValue"));
+}
+
+static id macws_opts_with_port(id opts, mach_port_t port) {
+    id mutable = nil;
+    if (opts)
+        mutable = ((id (*)(id, SEL))objc_msgSend)(
+            opts, sel_registerName("mutableCopy"));
+    else
+        mutable = ((id (*)(id, SEL))objc_msgSend)(
+            objc_getClass("NSMutableDictionary"),
+            sel_registerName("dictionary"));
+    if (!mutable)
+        return opts;
+    id num = ((id (*)(id, SEL, unsigned))objc_msgSend)(
+        (id)objc_getClass("NSNumber"),
+        sel_registerName("numberWithUnsignedInt:"),
+        (unsigned)port);
+    if (num)
+        ((void (*)(id, SEL, id, id))objc_msgSend)(
+            mutable, sel_registerName("setObject:forKey:"), num, @"portNumber");
+    return mutable;
+}
+
 static id (*orig_CAContext_remoteContextWithOptions)(id, SEL, id);
 static id hooked_CAContext_remoteContextWithOptions(id self, SEL sel, id opts) {
+    unsigned portIn = macws_opts_port_number(opts);
+    unsigned nkeys = 0;
+    if (opts) {
+        id keys = ((id (*)(id, SEL))objc_msgSend)(
+            opts, sel_registerName("allKeys"));
+        if (keys)
+            nkeys = ((unsigned (*)(id, SEL))objc_msgSend)(
+                keys, sel_registerName("count"));
+    }
     id ctx = orig_CAContext_remoteContextWithOptions
         ? orig_CAContext_remoteContextWithOptions(self, sel, opts) : nil;
     unsigned cid = 0;
@@ -5867,11 +5957,48 @@ static id hooked_CAContext_remoteContextWithOptions(id self, SEL sel, id opts) {
         cid = ((unsigned (*)(id, SEL))objc_msgSend)(
             ctx, sel_registerName("contextId"));
     }
-    char msg[192];
+    char msg[256];
     snprintf(msg, sizeof(msg),
-             "CAContext remoteContextWithOptions -> %p contextId=%u",
-             ctx, cid);
+             "CAContext remoteContextWithOptions -> %p contextId=%u "
+             "portNumber=%u keys=%u",
+             ctx, cid, portIn, nkeys);
     macws_paint_log(msg);
+    if (macws_is_safari_process()) {
+        static _Atomic unsigned once;
+        if (atomic_fetch_add_explicit(&once, 1, memory_order_relaxed) == 0)
+            macws_safari_log_remote_port();
+    }
+
+    // Generic recovery: if WebContent was given a missing/dead render-server
+    // send right (port 0, nil context, or contextId 0), look up the host
+    // WindowServer endpoint and retry. No per-app env. Skip when the first
+    // call already produced a live context.
+    if (macws_is_webcontent_process() &&
+        orig_CAContext_remoteContextWithOptions &&
+        (portIn == 0 || !ctx || cid == 0)) {
+        mach_port_t recovered = macws_lookup_macosbooter_carender();
+        snprintf(msg, sizeof(msg),
+                 "CAContext remoteContext retry lookup port=%#x "
+                 "(was portNumber=%u ctx=%p contextId=%u)",
+                 recovered, portIn, ctx, cid);
+        macws_paint_log(msg);
+        if (recovered) {
+            id retryOpts = macws_opts_with_port(opts, recovered);
+            id ctx2 = orig_CAContext_remoteContextWithOptions(
+                self, sel, retryOpts);
+            unsigned cid2 = 0;
+            if (ctx2) {
+                cid2 = ((unsigned (*)(id, SEL))objc_msgSend)(
+                    ctx2, sel_registerName("contextId"));
+            }
+            snprintf(msg, sizeof(msg),
+                     "CAContext remoteContext retry -> %p contextId=%u",
+                     ctx2, cid2);
+            macws_paint_log(msg);
+            if (ctx2 && cid2)
+                return ctx2;
+        }
+    }
     return ctx;
 }
 
@@ -5903,12 +6030,168 @@ static void hooked_CALayerHost_setContextId(id self, SEL sel, unsigned cid) {
         orig_CALayerHost_setContextId(self, sel, cid);
 }
 
+static void (*orig_CAContext_setAllowsCGSConnections)(id, SEL, BOOL);
+static void hooked_CAContext_setAllowsCGSConnections(id self, SEL sel, BOOL allow) {
+    if (macws_is_webcontent_process()) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "CAContext setAllowsCGSConnections:%d",
+                 (int)allow);
+        macws_paint_log(msg);
+    }
+    if (orig_CAContext_setAllowsCGSConnections)
+        orig_CAContext_setAllowsCGSConnections(self, sel, allow);
+}
+
+static void (*orig_CALayer_setGeometryFlipped)(id, SEL, BOOL);
+static void hooked_CALayer_setGeometryFlipped(id self, SEL sel, BOOL flipped) {
+    // TiledCoreAnimationDrawingArea constructor sets geometryFlipped:YES on
+    // its hosting layer before createForPort. A breadcrumb that the drawing
+    // area constructor ran, since shared-cache C++ hooks do not intercept.
+    if (macws_is_webcontent_process()) {
+        static _Atomic unsigned n;
+        unsigned i = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+        if (i < 16) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "CALayer setGeometryFlipped:%d layer=%p n=%u "
+                     "(drawing-area ctor breadcrumb)",
+                     (int)flipped, self, i);
+            macws_paint_log(msg);
+        }
+    }
+    if (orig_CALayer_setGeometryFlipped)
+        orig_CALayer_setGeometryFlipped(self, sel, flipped);
+}
+
+static id (*orig_CARemoteLayerServer_sharedServer)(id, SEL);
+static id hooked_CARemoteLayerServer_sharedServer(id self, SEL sel) {
+    id server = orig_CARemoteLayerServer_sharedServer
+        ? orig_CARemoteLayerServer_sharedServer(self, sel) : nil;
+    if (macws_is_safari_process() || macws_is_webcontent_process()) {
+        unsigned port = 0;
+        if (server) {
+            port = ((unsigned (*)(id, SEL))objc_msgSend)(
+                server, sel_registerName("serverPort"));
+        }
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "CARemoteLayerServer sharedServer -> %p serverPort=%u",
+                 server, port);
+        macws_paint_log(msg);
+    }
+    return server;
+}
+
+static unsigned (*orig_CARemoteLayerServer_serverPort)(id, SEL);
+static unsigned hooked_CARemoteLayerServer_serverPort(id self, SEL sel) {
+    unsigned port = orig_CARemoteLayerServer_serverPort
+        ? orig_CARemoteLayerServer_serverPort(self, sel) : 0;
+    mach_port_t recovered = MACH_PORT_NULL;
+    if (port == 0 &&
+        (macws_is_safari_process() || macws_is_webcontent_process())) {
+        recovered = macws_lookup_macosbooter_carender();
+        if (recovered)
+            port = (unsigned)recovered;
+    }
+    if (macws_is_safari_process() || macws_is_webcontent_process()) {
+        static _Atomic unsigned n;
+        unsigned i = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+        if (i < 16) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "CARemoteLayerServer serverPort -> %u recovered=%#x n=%u",
+                     port, recovered, i);
+            macws_paint_log(msg);
+        }
+    }
+    return port;
+}
+
+// Do not MSHookFunction SkyLight CGS*/SLS* symbols. Hooking
+// CGSMainConnectionID from libmachook caused SIGBUS (signal 10):
+// globally in every process (net11) and in Safari before it could
+// publish an AppKit window (net11b). Call through dlsym instead.
+static uint32_t macws_dlsym_cgs_main(void) {
+    static uint32_t (*fn)(void);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "CGSMainConnectionID");
+    });
+    return fn ? fn() : 0;
+}
+
+static uint32_t macws_dlsym_sls_main(void) {
+    static uint32_t (*fn)(void);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "SLSMainConnectionID");
+    });
+    return fn ? fn() : 0;
+}
+
+static void macws_safari_log_remote_port(void) {
+    // Unhooked read of [CARemoteLayerServer sharedServer].serverPort.
+    // Replacing those IMPs in Safari coincided with a pre-window SIGBUS;
+    // just observe the port from a delayed main-queue block.
+    Class rls = objc_getClass("CARemoteLayerServer");
+    unsigned port = 0;
+    id server = nil;
+    if (rls) {
+        server = ((id (*)(id, SEL))objc_msgSend)(
+            rls, sel_registerName("sharedServer"));
+        if (server)
+            port = ((unsigned (*)(id, SEL))objc_msgSend)(
+                server, sel_registerName("serverPort"));
+    }
+    mach_port_t recovered = MACH_PORT_NULL;
+    if (port == 0)
+        recovered = macws_lookup_macosbooter_carender();
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "Safari CARemoteLayerServer sharedServer -> %p serverPort=%u "
+             "recovered=%#x",
+             server, port, recovered);
+    macws_paint_log(msg);
+}
+
+static void macws_webcontent_paint_heartbeat(const char *tag) {
+    uint32_t cgs = macws_dlsym_cgs_main();
+    uint32_t sls = macws_dlsym_sls_main();
+    unsigned car = 0;
+    unsigned nctx = 0;
+    Class rls = objc_getClass("CARemoteLayerServer");
+    if (rls) {
+        id server = ((id (*)(id, SEL))objc_msgSend)(
+            rls, sel_registerName("sharedServer"));
+        if (server)
+            car = ((unsigned (*)(id, SEL))objc_msgSend)(
+                server, sel_registerName("serverPort"));
+    }
+    Class ctxcls = objc_getClass("CAContext");
+    if (ctxcls) {
+        id all = ((id (*)(id, SEL))objc_msgSend)(
+            ctxcls, sel_registerName("allContexts"));
+        if (all)
+            nctx = ((unsigned (*)(id, SEL))objc_msgSend)(
+                all, sel_registerName("count"));
+    }
+    void *deny_sym = dlsym(RTLD_DEFAULT, "CGSSetDenyWindowServerConnections");
+    char msg[240];
+    snprintf(msg, sizeof(msg),
+             "heartbeat %s CGSMain=%u SLSMain=%u CARemotePort=%u allContexts=%u "
+             "CGSSetDeny_sym=%p",
+             tag ? tag : "?", cgs, sls, car, nctx, deny_sym);
+    macws_paint_log(msg);
+}
+
 static void macws_install_cacontext_paint_hooks(void) {
     static _Atomic bool installed = false;
     if (atomic_exchange_explicit(&installed, true, memory_order_acq_rel))
         return;
     Class ctx = objc_getClass("CAContext");
     Class host = objc_getClass("CALayerHost");
+    Class layer = objc_getClass("CALayer");
+    Class rls = objc_getClass("CARemoteLayerServer");
     if (ctx) {
         Method m = class_getClassMethod(ctx, @selector(remoteContextWithOptions:));
         if (m) {
@@ -5924,6 +6207,13 @@ static void macws_install_cacontext_paint_hooks(void) {
             method_setImplementation(m,
                 (IMP)hooked_CAContext_contextWithCGSConnection);
         }
+        m = class_getClassMethod(ctx, @selector(setAllowsCGSConnections:));
+        if (m) {
+            orig_CAContext_setAllowsCGSConnections =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CAContext_setAllowsCGSConnections);
+        }
     }
     if (host) {
         Method m = class_getInstanceMethod(host, @selector(setContextId:));
@@ -5932,9 +6222,52 @@ static void macws_install_cacontext_paint_hooks(void) {
             method_setImplementation(m, (IMP)hooked_CALayerHost_setContextId);
         }
     }
-    char msg[96];
-    snprintf(msg, sizeof(msg), "CAContext hooks ctx=%p host=%p", ctx, host);
+    // New ObjC hooks stay WebContent-only. Hooking CGSMainConnectionID
+    // (and installing CARemoteLayerServer IMPs in Safari) caused SIGBUS
+    // before Safari published an AppKit window (net11b). Observe Safari
+    // serverPort without replacing methods.
+    bool wc = macws_is_webcontent_process();
+    if (wc && layer) {
+        Method m = class_getInstanceMethod(layer, @selector(setGeometryFlipped:));
+        if (m) {
+            orig_CALayer_setGeometryFlipped = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_CALayer_setGeometryFlipped);
+        }
+    }
+    if (wc && rls) {
+        Method m = class_getClassMethod(rls, @selector(sharedServer));
+        if (m) {
+            orig_CARemoteLayerServer_sharedServer =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CARemoteLayerServer_sharedServer);
+        }
+        m = class_getInstanceMethod(rls, @selector(serverPort));
+        if (m) {
+            orig_CARemoteLayerServer_serverPort =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CARemoteLayerServer_serverPort);
+        }
+    }
+
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "CAContext hooks ctx=%p host=%p layer=%p rls=%p wc=%d safari=%d",
+             ctx, host, layer, rls,
+             wc ? 1 : 0, macws_is_safari_process() ? 1 : 0);
     macws_paint_log(msg);
+
+    // Do not dispatch_after onto the main queue from this constructor.
+    // net11c did that in Safari; the process stayed up but never published
+    // an AppKit window, and the delayed block never ran (main queue idle).
+    // Log Safari serverPort from the first remoteContextWithOptions instead.
+
+    if (macws_is_webcontent_process()) {
+        macws_paint_log("WebContent paint hooks installed; no ctor dispatch_after");
+        // Heartbeats run from the first XPC event instead of dispatch_after
+        // on the main queue during the constructor (see net11c Safari hang).
+    }
 }
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
@@ -14497,7 +14830,19 @@ int sandbox_check_new(pid_t pid, const char *operation, int type, ...) {
             }
             return 0;
         }
-        return sandbox_check(pid, operation, type, svc);
+        int checked = sandbox_check(pid, operation, type, svc);
+        if (checked != 0 && macws_is_webcontent_process()) {
+            static _Atomic unsigned denied;
+            unsigned n = atomic_fetch_add_explicit(&denied, 1, memory_order_relaxed);
+            if (n < 64) {
+                char msg[192];
+                snprintf(msg, sizeof(msg),
+                         "sandbox_check DENY mach-lookup %s result=%d",
+                         svc ? svc : "?", checked);
+                macws_paint_log(msg);
+            }
+        }
+        return checked;
     }
     // Non-mach-lookup or other filter types: forward without consuming args we
     // do not understand by calling through a typed helper where possible.
@@ -14837,14 +15182,40 @@ void macws_xpc_wrap_app_event_handler(
         xpc_connection_set_target_queue(connection, dispatch_get_main_queue());
         xpc_handler_t user = handler;
         orig(connection, ^(xpc_object_t event) {
-            if (pthread_main_np()) {
+            void (^run)(void) = ^{
+                if (macws_is_webcontent_process()) {
+                    const char *typ = "other";
+                    if (!event)
+                        typ = "null";
+                    else if (xpc_get_type(event) == XPC_TYPE_ERROR)
+                        typ = "error";
+                    else if (xpc_get_type(event) == XPC_TYPE_DICTIONARY)
+                        typ = "dictionary";
+                    char msg[192];
+                    snprintf(msg, sizeof(msg),
+                             "xpc event begin type=%s main=%d "
+                             "(InitializeWebProcess/CreateWebPage ride this conn)",
+                             typ, pthread_main_np());
+                    macws_paint_log(msg);
+                }
                 user(event);
+                if (macws_is_webcontent_process()) {
+                    static _Atomic unsigned n;
+                    unsigned i = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+                    macws_paint_log("xpc event end");
+                    if (i < 2) {
+                        char tag[16];
+                        snprintf(tag, sizeof(tag), "xpc%u", i);
+                        macws_webcontent_paint_heartbeat(tag);
+                    }
+                }
+            };
+            if (pthread_main_np()) {
+                run();
                 return;
             }
             macws_webkit_init_log("xpc event off main; dispatch_sync");
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                user(event);
-            });
+            dispatch_sync(dispatch_get_main_queue(), run);
         });
         return;
     }
@@ -15986,16 +16357,23 @@ kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_
     if (!steamRendezvous && result != KERN_SUCCESS)
         result = macws_steam_mach_rendezvous_look_up(
             originalName, sp, result);
-    if (carender) {
-        char msg[192];
-        snprintf(msg, sizeof(msg),
-                 "bootstrap_look_up '%s'%s%s%s -> %#x port=%#x",
-                 originalName ?: "(null)",
-                 name != originalName ? " -> '" : "",
-                 name != originalName ? name : "",
-                 name != originalName ? "'" : "",
-                 result, sp ? *sp : MACH_PORT_NULL);
-        macws_paint_log(msg);
+    if (carender || macws_is_webcontent_process()) {
+        bool should_log = carender;
+        if (!should_log) {
+            static _Atomic unsigned n;
+            should_log = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed) < 48;
+        }
+        if (should_log) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "bootstrap_look_up '%s'%s%s%s -> %#x port=%#x",
+                     originalName ?: "(null)",
+                     name != originalName ? " -> '" : "",
+                     name != originalName ? name : "",
+                     name != originalName ? "'" : "",
+                     result, sp ? *sp : MACH_PORT_NULL);
+            macws_paint_log(msg);
+        }
     }
     if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr,

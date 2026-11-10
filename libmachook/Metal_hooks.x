@@ -25123,7 +25123,28 @@ static int hooked_sandbox_check(pid_t pid, const char *operation, int type, ...)
         va_end(ap);
         if (svc && !strncmp(svc, "com.apple.macosbooter.", 22))
             return 0;
-        return orig_sandbox_check(pid, operation, type, svc);
+        int checked = orig_sandbox_check(pid, operation, type, svc);
+        if (checked != 0) {
+            char **argv = *_NSGetArgv();
+            const char *exe = (argv && argv[0]) ? argv[0] : "";
+            if (strstr(exe, "com.apple.WebKit.WebContent")) {
+                static _Atomic unsigned denied;
+                unsigned n = atomic_fetch_add_explicit(&denied, 1, memory_order_relaxed);
+                if (n < 64) {
+                    char line[256];
+                    int len = snprintf(line, sizeof(line),
+                        "pid=%d exe=%s sandbox_check DENY mach-lookup %s result=%d\n",
+                        getpid(), exe, svc ? svc : "?", checked);
+                    int fd = open("/tmp/macws-webkit-paint.log",
+                                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+                    if (fd >= 0) {
+                        if (len > 0) (void)write(fd, line, (size_t)len);
+                        close(fd);
+                    }
+                }
+            }
+        }
+        return checked;
     }
     if (type == 0) {
         va_end(ap);

@@ -589,3 +589,51 @@ Screenshots (menu clock 12:57 / 12:58 PT): `/workspace/net10-example.png`, `/wor
 ### Still open
 
 The CARender XPC-table sync is the correct generic fix for clients that look up `com.apple.CARenderServer` through libxpc, but it is not sufficient by itself for WebContent paint. Safari can talk to CARenderServer and create CAContexts; WebContent never creates a CAContext, and Safari never calls `setContextId` on `CALayerHost`. Leading next hypotheses: WebContent uses an unhooked CAContext / C API to create the remote context; a drawing-area or GPU-process expectation prevents in-process context creation even though Safari never requests the GPU process; or an IOSurface / sandbox extension on the WebContent side still blocks backing stores (`IOSurfaceCreate_new` already exists and only decompresses compressed surfaces; no WebContent-specific IOSurface failure was logged this run). A per-app env disable of GPU or compositing was not used: GPU was never requested, and compositing is the path that still needs to work.
+
+## 24. WebContent paint logging; CGS MSHook and ctor dispatch_after are unsafe (2026-11-10 17:43–18:04 CST)
+
+### Context
+
+The Mac Pro returned at 17:43 CST (`OK了`). The iPad was still up from the 10:57 CST button reset (about 7 h, no second reboot). `CORE_OK` (WindowServer, macwshostd, SpringBoard). `com.macwsguide.webkit.*` LaunchDaemons stayed unloaded. Compressor emergency only: `comp_occ` held around 16488–16492 (well under start+25000 / 80000). Finder, Dock, SystemUIServer, ControlCenter, and OSXvnc were `Ts` at 17:46 CST; the Safari script SIGCONT'd only those already-stopped macOS chrome processes and never SIGSTOP'd anyone. After that they stayed `Ss`. Nested `/var/jb/usr/bin/sudo -n` is required for deploy and rollback (the outer expect `sudo -S` no longer elevates). Stale hung expect sessions were left alone.
+
+The net10b diagnosis still stood: Safari can create CAContexts, GPU is never requested, WebContent never hosts a remote `CAContext`, and Safari never `setContextId`. This turn added WebContent-only paint logging and a generic CARender port recovery, then stopped after two guarded Safari attempts showed the new hooks themselves were unsafe.
+
+### net11 first deploy — Bus error in every process (17:52 CST)
+
+The first build installed CGS / SLS / `CARemoteLayerServer` / `CALayer setGeometryFlipped:` hooks from the libmachook constructor in every process, plus WebContent logging of CAContext options / `kCAContextPortNumber`, `bootstrap_look_up` results, sandbox mach-lookup denials, XPC event begin/end (InitializeWebProcess / CreateWebPage ride that connection), and a drawing-area constructor breadcrumb. Generic recovery: if WebContent `remoteContextWithOptions` sees `portNumber` 0, a nil context, or `contextId` 0, look up `com.apple.macosbooter.CARenderServer` and retry. No new exported symbols (`task_get_bootstrap_port` is a macro, not an `extern`).
+
+Device arm64e CDHash `6f1acc3033dd778069d56b2116d7d3c976e3d543` (sha1 `73dc0c3113530258d77fa71e380aa18decce03c2`). Rollback `*.pre-net11-20261110-175218` (a copy of working net10b). Smoke via `run_bash.sh -c 'echo SMOKE_OK'` died in `launchdchrootexec` with `Bus error: 10`. Immediate rollback to net10b CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e` (sha1 `b027e89499f34b6bd3c74b55b66a9439f1b8e1d7`), arm64 `b9638f5dad1ee8cf7db3ff9e2d12b492abc12d06`. Restored-dylib smoke was `SMOKE_OK` at 17:54:54 CST. That crashing dylib must not be left deployed.
+
+### net11b — hooks scoped to Safari/WebContent; Safari SIGBUS (17:54–17:58 CST)
+
+`CGSNewConnection` was dropped (private ABI, unused after the scoping). The new CGS / `CARemoteLayerServer` / `setGeometryFlipped:` hooks were restricted to Safari and WebContent. The net10b global CAContext / CALayerHost hooks stayed global. No new exports.
+
+Deploy 17:54:48 CST, no macOS restart. Device arm64e CDHash `24c947bee6902299eb865bd6e4d4808fce51e93c` (sha1 `69e0f3a98a67c379e8a1dabeeef96e4af14e56a1`), arm64 `75531a078cec8f18829e13803dd6fecc96633d39` (sha1 `b9aa0475e849cd857b8a1d85b3f18ed818b8620e`). Size 1479488. Fresh inodes 44238 / 23284267. Rollback `*.pre-net11b-20261110-175448`. Smoke `SMOKE_OK` at 17:54:54 CST.
+
+Guarded Safari started 17:55:07 CST after SIGCONT of the already-`T` chrome. `macws_control_probe launch-path` reported `custom-path 在发布 AppKit 窗口前被信号 10 终止`. Safari never published a window; no helpers; both captures timed out; no screenshots. The paint log showed three short-lived Safari pids, each:
+
+`CAContext hooks … deny=0x0 CGSMain=0xfd50000104c68000 SLSMain=0x0`
+
+`CGSSetDenyWindowServerConnections` and `SLSMainConnectionID` were not found. `CGSMainConnectionID` was hooked (PAC-signed orig). bash and screencapture did not install those hooks (`CGSMain=0x0`) and did not crash. This is the same Bus error class as the global net11 install, now isolated to Safari, which calls `CGSMainConnectionID` while publishing an AppKit window. Immediate rollback to `*.pre-net11b-20261110-175448` (net10b). Smoke `SMOKE_OK` at 17:58:50 CST.
+
+### System-level response
+
+Do not `MSHookFunction` SkyLight `CGS*` / `SLS*` symbols. Observe `CGSMainConnectionID` / `SLSMainConnectionID` / `CGSSetDeny_sym` through `dlsym` only, from WebContent heartbeats. `CARemoteLayerServer` and `setGeometryFlipped:` IMPs stay WebContent-only. Safari's `[CARemoteLayerServer sharedServer].serverPort` is logged without replacing methods. The WebContent CARender port-retry in `remoteContextWithOptions` is unchanged (generic, no per-app env, no new exports).
+
+### net11c — Safari stays up but never publishes an AppKit window (17:59–18:03 CST)
+
+Deploy 17:59:42 CST, no macOS restart. Device arm64e CDHash `fb1ed24c51d6020571a4892d5e84508899850086` (sha1 `68162ad4803950fe269978e7615f55da7ef8bc32`), arm64 `ba48b70cb27b047518eb3433f49bfb3fac5d5bf0` (sha1 `1cfc9f3b1bb3fc017d24904b358c39602b8db077`). Size 1479856. Fresh inodes 44251 / 23297618. Rollback `*.pre-net11c-20261110-175942`. Smoke `SMOKE_OK` at 17:59:48 CST.
+
+This was the allowed follow-up after the SIGBUS fix, once the net11b run had been cleaned up. Guarded Safari 17:59:52–18:03 CST: pid 44257 stayed up (~51 MB, `S`) for the whole window, but the probe reported `custom-path 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`, and document events were never confirmed. Zero WebContent / Networking / GPU helpers. XPC and init logs were empty. The paint log had only the constructor line `wc=0 safari=1` plus the bash/screencapture installer lines. The delayed 2 s `dispatch_after(..., dispatch_get_main_queue(), …)` that was supposed to log Safari `serverPort` **never ran**, so the main queue was idle or stuck. No `remoteContextWithOptions`, no `setContextId`. Both captures timed out. No `/workspace/net11-example.png` or `/workspace/net11-baidu.png`. Mid-run `free_mb` 46–84, `comp_occ` 16489 → 16442. After cleanup `CORE_OK`, LaunchDaemons unloaded, no leftover macOS Safari/helpers, uptime still from the 10:57 CST button reset. GUI left `Ss` (SIGCONT only).
+
+Rolled back immediately to `*.pre-net11c-20261110-175942` (net10b `cffee750…` / `b9638f5d…`, size 1477120). Smoke `SMOKE_OK` at 18:04:10 CST. net11c must not be left deployed: unlike net10b, Safari never published a window.
+
+### Source left in the tree (not deployed)
+
+Constructor `dispatch_after` on the main queue is removed for both Safari and WebContent. Safari `serverPort` is logged from the first `remoteContextWithOptions` (unhooked read). WebContent heartbeats run from the first two XPC events. The tree compiles; that dylib was not deployed or Safari-tested (stop after the net11c hang; do not stack a third Safari run).
+
+Logs: `field-artifacts/net11-safari.out` (net11c run), `field-artifacts/net11-webkit-paint.log`. Currently deployed is net10b.
+
+### Still open
+
+WebContent still never creates a CAContext (the net10b diagnosis stands; net11 / net11b / net11c never reached a paint-capable Safari+WebContent session). The next deploy should be the no-ctor-`dispatch_after` tree, with one guarded Safari only after smoke. Remaining leads are unchanged: `InitializeWebProcess` / `CreateWebPage` or the drawing-area constructor never completing, or a dropped compositing send-right (the port-retry is in the tree and untested).
