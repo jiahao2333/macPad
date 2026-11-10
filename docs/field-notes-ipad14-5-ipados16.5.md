@@ -762,3 +762,56 @@ Desktop `screencapture` at 18:30:09 CST timed out at 20 s. `/workspace/ws-unlock
 
 The uncapturable-window / empty final-composite problem is **not** explained by an iOS lock screen. The diagnosis in §27 still stands. Desktop repair / session rebuild remains a later option if approved; it was not run this turn.
 
+## 29. User unlock restored desktop capture; net10b Safari still has no visible window (2026-11-10 19:13–19:16 CST)
+
+### Context
+
+The user unlocked the session and reported that windows were visible. `macos_gui.sh repair-desktop` had been approved earlier but was **not started**; the follow-up steering cancelled it, and `rebuild-desktop-session` was not run either. No device reboot, no 停止 macOS, no new dylib. net10b stayed deployed: `/var/mnt/rootfs/usr/local/lib/libmachook.dylib`, inode 23302283, size 1477120, mtime Nov 10 18:10 CST (the post-net11d rollback), arm64e CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e` (sha1 `b027e89499f34b6bd3c74b55b66a9439f1b8e1d7`).
+
+Health at 19:13:14 CST / 03:13:15 PST: up 8:16 from the 10:57 CST / 18:57 PST Nov 9 button reset. `CORE_OK`. WindowServer 51054 `Ss` (~168 MB, etime 51:16). macwshostd 416, SpringBoard 391. Finder 51453 / Dock 51460 / SystemUIServer 51468 / ControlCenter 51476 / OSXvnc 51484 all `Ss`. `macwsinputd` 51354 / `macwsdisplayd` 51356. WebKit LaunchDaemons unloaded. No leftover Safari. `comp_occ=11329`, `free_mb=256`.
+
+### Step 1 — capture and Activity Monitor recovered
+
+`/var/mobile/net10b-recheck/ws-postunlock-verify.sh` at 19:13:42–19:13:48 CST / 03:13:42–03:13:49 PST:
+
+- Desktop `screencapture` succeeded almost immediately (`DESK_CAPTURE_OK`): `/var/mnt/rootfs/tmp/ws-repair-desktop.png` and `/var/mobile/ws-repair-desktop.png`, 9,188,051 bytes.
+- Activity Monitor: `ok=yes launched-pid=51885 message=已启动 activity-monitor，AppKit 窗口已进入 DisplayStream 列表`, RSS 116384 (healthy, not the hung ~35 MB), etime 4 s. It was then SIGKILL'd; none left.
+- `CORE_OK`, WindowServer 51054 still `Ss`, LaunchDaemons unloaded.
+
+The PNG was pulled to `/workspace/ws-unlock-desktop.png` (clearer name: repair was skipped) and also saved as `/workspace/ws-repair-desktop.png`. Visual check: a real Aqua desktop — Finder menu bar (File / Edit / View / Go / Window / Help), the forest-lake wallpaper, the Data icon, and the Dock. Menu-bar clock 03:13. This is the first successful chroot desktop capture since the session wedge in §26–§28, and it happened after the user's unlock, without repair-desktop or a session rebuild.
+
+### Step 2 — one guarded net10b Safari (example.com, then baidu)
+
+`/var/mobile/net10b-recheck/safari.sh` started at 19:14:14 CST / 03:14:14 PST (wrapper pid 51928). `comp_occ` 11318 → 11832 after example → 12197 after baidu (under the emergency gate). Finder / Dock / SystemUIServer / ControlCenter / OSXvnc were `Ss` and were not SIGSTOP'd.
+
+- Launch-path: `ok=no launched-pid=0 message=custom-path 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`.
+- Open `example.com`: `ok=yes launched-pid=52091 message=已由目标应用接收 1 个文稿`. `CAPTURE_OK` `/var/mobile/net10b-recheck-example.png` (9,143,716 bytes) at 19:14 CST.
+- Open baidu: `ok=yes launched-pid=52334 message=已由目标应用接收 1 个文稿`. `CAPTURE_OK` `/var/mobile/net10b-recheck-baidu.png` (9,144,022 bytes) at 19:15 CST.
+- Script `PROCS after example` and `PROCS after baidu` listings were empty: Safari / WebContent / Networking had already exited by the time `ps` ran. No new Safari or WebContent `.ips` was written for this run.
+- Cleanup: no leftover Safari/WebKit processes, `CORE_OK`, macOS WebKit LaunchDaemons unloaded, `MEM_AFTER` `free_mb=186` `comp_occ=12197`. WindowServer 51054 still `Ss` (~169 MB) at 19:16:42 CST.
+
+Both captures and `/workspace/net10b-recheck-example.png` / `/workspace/net10b-recheck-baidu.png` were pulled and inspected. They show the same Finder desktop as the unlock shot (menu bar still Finder, wallpaper, Dock). Menu-bar clocks are 03:14 and 03:15, so the captures are live — but **no Safari window is on screen**.
+
+### Paint log
+
+`/var/mobile/net10b-recheck-webkit-paint.log` (also under field-artifacts). Three Safari processes ran:
+
+- 51989 (initial launch-path): `bootstrap_look_up 'com.apple.CARenderServer' -> 'com.apple.macosbooter.CARenderServer' -> 0 port=0x2d0b`; `CAContext remoteContextWithOptions` → contextId 2895057297; two `contextWithCGSConnection:118035`.
+- 52091 (example.com): same CARenderServer rewrite, port=0x2e0b; `remoteContextWithOptions` → contextId 4163271898; nine `contextWithCGSConnection:118315`.
+- 52334 (baidu): rewrite, port=0x2d0b; `remoteContextWithOptions` → contextId 2786964797; nine `contextWithCGSConnection:95495`.
+
+WindowServer 51054 `CALayerHost setContextId` logged many of those non-zero context IDs. 31 WebContent processes, 3 Networking, and 3 SafariSandboxBroker started and only logged `CAContext hooks` (hook install). **No WebContent `remoteContextWithOptions` or `contextWithCGSConnection`.** GPU was not requested.
+
+So Safari can still talk to CARenderServer and create CAContexts, and helpers do start, but WebContent still never hosts a layer — and unlike the 16:57 CST run, the Safari UI itself never appeared in the chroot screenshot (the launch-path probe also never saw a capturable AppKit window, even while 51989 was creating CAContexts during the 30 s wait).
+
+### What was not done
+
+No `repair-desktop` or `rebuild-desktop-session`. No new libmachook (296254e was not deployed). No device reboot and no 停止 macOS. The 16:57 CST Favorites → blank-white visual result could not be re-checked, because no Safari window was on screen.
+
+### Paint-path conclusion
+
+Session-level capture and new-window publish are recovered (desktop + Activity Monitor). net10b Safari still does not present a visible, capturable window in this session; WebContent still never creates a CAContext. Do not deploy the logging dylib until a Safari window is actually on screen again.
+
+### Still open
+
+Why Safari's CAContexts and helper processes do not yield a DisplayStream/AppKit window that `screencapture` can see, and why those processes are already gone by the post-open `ps`. Next recheck of net10b Safari (or a logging deploy) should wait until that window is visible; do not reintroduce SkyLight MSHooks, extra Safari CAContext IMPs, or constructor main-queue `dispatch_after`.
