@@ -874,3 +874,66 @@ This reproduces the 16:57 CST paint result: Safari leaves the start/Favorites ch
 ### Paint-path conclusion
 
 The missing on-screen window in §29 was Safari aborting in IconServices after the post-WindowServer recover left `com.macwsguide.iconservicesd` / `iconservicesagent` unloaded. With those existing jobs loaded again, net10b Safari publishes a capturable window. The remaining WebKit issue is unchanged: WebContent never hosts a remote layer, so example.com and baidu stay white after leaving Favorites. A WebContent-only logging dylib (296254e) is now a reasonable next step, because there is once again a visible Safari window to observe.
+
+## 31. WebContent-only logging (net14): window still publishes, content still white, no CAContext in WebContent (2026-11-10 19:36–19:41 CST)
+
+### Context
+
+After §30 reloaded the existing macOS IconServices jobs, net10b Safari published a capturable window again (pid 53285, `/workspace/net13-*.png`), but pages still left Favorites / Start Page with a white content area and WebContent still never called `remoteContextWithOptions`. A WebContent-only logging pass was now allowed because a visible Safari window existed. Hard limits this turn: no SkyLight / CGS / SLS hooks; no extra CAContext IMPs in Safari and no change to Safari's window-publish / `remoteContextWithOptions` path just to log `serverPort`; no constructor main-queue `dispatch_after`; no new exported libmachook remapper symbols; keep IconServices loaded; no reboot and no 停止 macOS; backup, smoke with `launchdchrootexec`, and roll back immediately to net10b (CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e`) if smoke failed or Safari again failed to publish a window, with no second variant; one guarded Safari run only after smoke passed.
+
+296254e (`fix(ipad14.5): log WebContent paint path without SkyLight MSHooks`) was already on the branch but was not a compliant deploy: it called `macws_safari_log_remote_port()` from Safari's `remoteContextWithOptions` hook, installed `setAllowsCGSConnections:` globally (an extra CAContext IMP in Safari), and retried WebContent `remoteContextWithOptions` with a looked-up CARenderServer port. net11d had deployed that tree as-is and was rolled back when the window failed to publish. This turn stripped those Safari-path and retry behaviors and left observational logging on existing hook points plus WebContent-only paths after those processes exist.
+
+### Deploy and smoke
+
+Built thin slices on the Mac Pro (Theos), `misc/set_macos_version.py` (LC_BUILD_VERSION macOS 13.0), `/usr/local/Cellar/ldid/2.1.5_2/bin/ldid -S` twice, `codesign -f -s -`, then ldid twice again. `_macws_private_bootstrap_service_name` is not exported (168 T symbols per slice).
+
+- arm64e `libmachook.dylib`: 1,479,040 B, CDHash `c1b7b43906bad65e33ba3d832f97e509aafb0bd0`, CandidateCDHash sha1 `bf2937513363df4b89d9f08e8e8bf9972fea04ac`, file sha1 `dfa42390b0d41e343c5064649cbcaea0d6f0e5c4`
+- arm64 `libmachook_arm64.dylib`: 1,486,352 B, CDHash `4b8997065d588e1a789ae06ea69181d9379b2f3e`, CandidateCDHash sha1 `54219030b7859b601027f55635abeccf9b1af511`, file sha1 `24d691fef0a9c3999c730a04b58df17a6436724a`
+
+`jbctl trustcache add` accepted the 40-character CDHashes and sha1 candidates; the 64-character `CandidateCDHashFull sha256` values failed as usual and were ignored.
+
+Deploy at 19:36:37 CST / 03:36:37 PST via nested `/var/jb/usr/bin/sudo -n sh /var/mobile/net14/deploy.sh`. Live net10b (inode 23302283, 1,477,120 B, mtime Nov 10 18:10 CST) was backed up as rollback tag **`pre-net14-20261110-193637`** (rootfs sidecar inode 23352808 and `/var/mobile/macws-rollback/libmachook.dylib.pre-net14-20261110-193637`). Fresh inodes: rootfs `libmachook.dylib` 23352813 and `libmachook_arm64.dylib` 23352814, also copied to `/var/jb/usr/macOS/lib/`.
+
+Smoke at 19:36:54 CST / 03:36:54 PST: `run_bash.sh` / `launchdchrootexec` inserted `/usr/local/lib/libmachook.dylib` (arch=arm64e) and printed `SMOKE_OK` with rc=0. No Bus error. IconServices 53067 / 53071 stayed `Ss`. `CORE_OK`. Because smoke passed, rollback was not used.
+
+### One guarded Safari run
+
+`/var/mobile/net14/safari.sh` started 19:40:04 CST / 03:40:04 PST via nested sudo (chroot I/O). Open-url was withheld unless launch-path returned `ok=yes`. IconServices jobs were still loaded beforehand.
+
+- 19:40:08.413 CST / 03:40:08.413 PST: launch-path accepted custom-path pid **54348**. Endpoint-driven reopen sent immediately.
+- 19:40:18.766 CST / 03:40:18.766 PST: `application-reopen result=window-ready previous-generation=0 current-generation=1` and `launch-app window-ready path=DisplayStream`. Probe line was `ok=yes launched-pid=54348 message=不支持的操作`; hostd's window-ready record is the authoritative witness (`LAUNCH_WINDOW_OK`).
+- 19:40:21.629 CST / 03:40:21.629 PST: example.com `.webloc` `appkit-accepted`. 19:40:38.458 CST / 03:40:38.458 PST: baidu.com likewise, same pid.
+- Safari RSS grew to ~413 MB (423440 KB) — the healthy class, not the hung ~51 MB class. At the baidu diag, 20 WebContent processes plus Networking 54363 and SandboxBroker were still `Ss`, but every WebContent RSS stayed ~28 MB (28704–28848 KB) for the whole run, including the two helpers spawned around the baidu open (54755, 54758). GPU was not requested.
+- CustomApp.host.log had the usual empty-NSURL, Metal-library-format, openAndSavePanelService, and spell-server warnings; **no** `NSISIconImageRepGetCGImage` assertion.
+- Cleanup was SIGTERM at 19:40:55.080 CST / 03:40:55.080 PST (`waitpid:signal-15`). No leftover Safari/WebContent (only the unrelated iOS WebContent pid 703). `CORE_OK`. LaunchDaemons unloaded. `comp_occ` 20811 → 20773, under the emergency gate. IconServices 53067 / 53071 still `Ss` afterwards. Live dylib remained net14 (inode 23352813).
+
+### Screenshots
+
+`/workspace/net14-example.png` (859,650 bytes, 2732×2048, menu-bar clock 03:40): Safari is frontmost (Safari menu bar), the address bar shows `example.com`, tabs are "Start Page" and "E Untitled", and the content area is **blank white**. `/workspace/net14-baidu.png` (862,343 bytes): the same window after the baidu open; the address bar shows `baidu.com`, a third tab "B Untitled" appeared, and the content area is still white.
+
+This matches the 16:57 CST and net13 visual result: the UI leaves Favorites / Start Page, the URL is accepted, and the page body never paints.
+
+### Paint / IPC logs
+
+Appended logs (chroot `/tmp`, also copied under `/var/mobile/net14/`):
+
+- `/tmp/macws-webkit-paint.log` (215 lines in the post-run full copy)
+- `/tmp/macws-webkit-init.log` (110 lines)
+- `/tmp/macws-xpc-app.log` (108 lines)
+- `/tmp/macws-sandbox-allow.log` (24 lines)
+
+Safari 54348: `bootstrap_look_up 'com.apple.CARenderServer' -> 'com.apple.macosbooter.CARenderServer' -> 0 port=0x3b0b` succeeded; ten `CAContext contextWithCGSConnection:102159` calls produced contextIds that WindowServer 51054 later hosted via `CALayerHost setContextId` (chrome). One Safari `CAContext remoteContextWithOptions -> contextId=638302839 portNumber=0 keys=0` (empty options dict). That contextId was **never** hosted by any `setContextId`. `screencapture` used the same empty-options `remoteContextWithOptions` shape; this is not treated as the WebContent compositing-port handoff. CARemoteLayerServer IMPs were not installed in Safari (WebContent-only), so Safari `serverPort` was not logged, per the guardrail.
+
+WebContent (20 pids): each logged only `CAContext hooks ... wc=1` and `WebContent paint hooks installed; no ctor dispatch_after`. **No** `CAContext remoteContextWithOptions`, **no** dropped-port line, **no** `CALayer setGeometryFlipped` drawing-area constructor breadcrumb, **no** `CARemoteLayerServer sharedServer` / `serverPort`, **no** `setAllowsCGSConnections`, **no** `sandbox_check DENY` in the paint log. Networking 54363 only logged hook install.
+
+The XPC event wrapper in `macws_xpc_wrap_app_event_handler` (intended to log `xpc event begin/end` on the connection that `InitializeWebProcess` / `CreateWebPage` ride, plus the first two WebContent heartbeats) never fired in any helper. Safari did create the remapped services: 20× `created activate=com.apple.macosbooter.WebKit.WebContent`, plus Networking and SandboxBroker, and `sandbox-allow.log` recorded the matching `com.apple.webkit.extension.mach` extensions. `xpc_add_bundle` of the host-visible proxy paths still returns `access=-1 errno=62` (ELOOP on in-chroot `/var/jb`, previously known); `add_bundle_done` still ran and the helpers did spawn, so this is not a new spawn failure. No `xpc_error` lines.
+
+`macws-webkit-init.log` only shows hook *installation* in each helper (`InitializeWebKit2 raw=...`, `hooked InitializeWebKit2 via offset-unsigned ... orig=0x0`, same for `runInitializationCode`). There is no `InitializeWebKit2 call` / `orig returned` and no `runInitializationCode call`. That is the net8d pattern already commented in `mac_hooks.m`: an unsigned shared-cache offset hook can log install with `orig=0x0` while the real function keeps running unhooked. Absence of those call lines is therefore **not** proof that `InitializeWebKit2` never ran. The independent, installed WebContent breadcrumbs (drawing-area `setGeometryFlipped`, `remoteContextWithOptions`, XPC event begin) still never appeared, and RSS never left the ~28 MB prewarm class.
+
+### What was not done, and why there is no fix deploy this turn
+
+The logs do **not** show a dropped compositing port reaching WebContent, because WebContent never called `remoteContextWithOptions` at all. The prepared port-retry is therefore not justified and was left disabled. No per-app env hacks, no second dylib variant, and no second Safari run. net14 stays deployed (observational only; window publish still works). Rollback copies remain at `pre-net14-20261110-193637` (net10b CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e`). No SkyLight hooks, no extra Safari CAContext IMPs, no constructor `dispatch_after`, no remapper export, no reboot, no 停止 macOS. IconServices jobs were left loaded.
+
+### Paint-path conclusion
+
+Safari chrome still talks to CARenderServer and publishes a capturable AppKit window. example.com and baidu.com are accepted, but the content area stays white because WebContent never constructs a TiledCoreAnimation drawing area and never creates a CAContext. The new logging narrows the gap to *before* layer hosting: UI-process connections to `com.apple.macosbooter.WebKit.WebContent` are created and helpers stay up, yet no XPC events (and no drawing-area / remote-context breadcrumbs) were observed inside WebContent. Next work should follow that IPC path, not a CAContext port retry, and should not reintroduce Safari-path CAContext IMPs or constructor main-queue `dispatch_after`.

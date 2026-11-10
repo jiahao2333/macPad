@@ -5905,8 +5905,6 @@ static mach_port_t macws_lookup_macosbooter_carender(void) {
     return sp;
 }
 
-static void macws_safari_log_remote_port(void);
-
 static unsigned macws_opts_port_number(id opts) {
     if (!opts)
         return 0;
@@ -5916,27 +5914,6 @@ static unsigned macws_opts_port_number(id opts) {
         return 0;
     return ((unsigned (*)(id, SEL))objc_msgSend)(
         portObj, sel_registerName("unsignedIntValue"));
-}
-
-static id macws_opts_with_port(id opts, mach_port_t port) {
-    id mutable = nil;
-    if (opts)
-        mutable = ((id (*)(id, SEL))objc_msgSend)(
-            opts, sel_registerName("mutableCopy"));
-    else
-        mutable = ((id (*)(id, SEL))objc_msgSend)(
-            objc_getClass("NSMutableDictionary"),
-            sel_registerName("dictionary"));
-    if (!mutable)
-        return opts;
-    id num = ((id (*)(id, SEL, unsigned))objc_msgSend)(
-        (id)objc_getClass("NSNumber"),
-        sel_registerName("numberWithUnsignedInt:"),
-        (unsigned)port);
-    if (num)
-        ((void (*)(id, SEL, id, id))objc_msgSend)(
-            mutable, sel_registerName("setObject:forKey:"), num, @"portNumber");
-    return mutable;
 }
 
 static id (*orig_CAContext_remoteContextWithOptions)(id, SEL, id);
@@ -5963,41 +5940,18 @@ static id hooked_CAContext_remoteContextWithOptions(id self, SEL sel, id opts) {
              "portNumber=%u keys=%u",
              ctx, cid, portIn, nkeys);
     macws_paint_log(msg);
-    if (macws_is_safari_process()) {
-        static _Atomic unsigned once;
-        if (atomic_fetch_add_explicit(&once, 1, memory_order_relaxed) == 0)
-            macws_safari_log_remote_port();
-    }
 
-    // Generic recovery: if WebContent was given a missing/dead render-server
-    // send right (port 0, nil context, or contextId 0), look up the host
-    // WindowServer endpoint and retry. No per-app env. Skip when the first
-    // call already produced a live context.
+    // WebContent-only observation of a null/dropped compositing port from
+    // the UI process. Do not alter Safari's remoteContextWithOptions path,
+    // and do not retry here until logs show a generic fix is warranted.
     if (macws_is_webcontent_process() &&
-        orig_CAContext_remoteContextWithOptions &&
         (portIn == 0 || !ctx || cid == 0)) {
         mach_port_t recovered = macws_lookup_macosbooter_carender();
         snprintf(msg, sizeof(msg),
-                 "CAContext remoteContext retry lookup port=%#x "
-                 "(was portNumber=%u ctx=%p contextId=%u)",
-                 recovered, portIn, ctx, cid);
+                 "CAContext remoteContext dropped portNumber=%u ctx=%p "
+                 "contextId=%u lookup=%#x",
+                 portIn, ctx, cid, recovered);
         macws_paint_log(msg);
-        if (recovered) {
-            id retryOpts = macws_opts_with_port(opts, recovered);
-            id ctx2 = orig_CAContext_remoteContextWithOptions(
-                self, sel, retryOpts);
-            unsigned cid2 = 0;
-            if (ctx2) {
-                cid2 = ((unsigned (*)(id, SEL))objc_msgSend)(
-                    ctx2, sel_registerName("contextId"));
-            }
-            snprintf(msg, sizeof(msg),
-                     "CAContext remoteContext retry -> %p contextId=%u",
-                     ctx2, cid2);
-            macws_paint_log(msg);
-            if (ctx2 && cid2)
-                return ctx2;
-        }
     }
     return ctx;
 }
@@ -6129,31 +6083,6 @@ static uint32_t macws_dlsym_sls_main(void) {
     return fn ? fn() : 0;
 }
 
-static void macws_safari_log_remote_port(void) {
-    // Unhooked read of [CARemoteLayerServer sharedServer].serverPort.
-    // Replacing those IMPs in Safari coincided with a pre-window SIGBUS;
-    // just observe the port from a delayed main-queue block.
-    Class rls = objc_getClass("CARemoteLayerServer");
-    unsigned port = 0;
-    id server = nil;
-    if (rls) {
-        server = ((id (*)(id, SEL))objc_msgSend)(
-            rls, sel_registerName("sharedServer"));
-        if (server)
-            port = ((unsigned (*)(id, SEL))objc_msgSend)(
-                server, sel_registerName("serverPort"));
-    }
-    mach_port_t recovered = MACH_PORT_NULL;
-    if (port == 0)
-        recovered = macws_lookup_macosbooter_carender();
-    char msg[192];
-    snprintf(msg, sizeof(msg),
-             "Safari CARemoteLayerServer sharedServer -> %p serverPort=%u "
-             "recovered=%#x",
-             server, port, recovered);
-    macws_paint_log(msg);
-}
-
 static void macws_webcontent_paint_heartbeat(const char *tag) {
     uint32_t cgs = macws_dlsym_cgs_main();
     uint32_t sls = macws_dlsym_sls_main();
@@ -6207,13 +6136,6 @@ static void macws_install_cacontext_paint_hooks(void) {
             method_setImplementation(m,
                 (IMP)hooked_CAContext_contextWithCGSConnection);
         }
-        m = class_getClassMethod(ctx, @selector(setAllowsCGSConnections:));
-        if (m) {
-            orig_CAContext_setAllowsCGSConnections =
-                (void *)method_getImplementation(m);
-            method_setImplementation(m,
-                (IMP)hooked_CAContext_setAllowsCGSConnections);
-        }
     }
     if (host) {
         Method m = class_getInstanceMethod(host, @selector(setContextId:));
@@ -6226,7 +6148,18 @@ static void macws_install_cacontext_paint_hooks(void) {
     // (and installing CARemoteLayerServer IMPs in Safari) caused SIGBUS
     // before Safari published an AppKit window (net11b). Observe Safari
     // serverPort without replacing methods.
+    // New ObjC hooks stay WebContent-only. Do not install extra CAContext
+    // IMPs in Safari, and do not hook SkyLight CGS*/SLS*.
     bool wc = macws_is_webcontent_process();
+    if (wc && ctx) {
+        Method m = class_getClassMethod(ctx, @selector(setAllowsCGSConnections:));
+        if (m) {
+            orig_CAContext_setAllowsCGSConnections =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CAContext_setAllowsCGSConnections);
+        }
+    }
     if (wc && layer) {
         Method m = class_getInstanceMethod(layer, @selector(setGeometryFlipped:));
         if (m) {
@@ -6261,7 +6194,7 @@ static void macws_install_cacontext_paint_hooks(void) {
     // Do not dispatch_after onto the main queue from this constructor.
     // net11c did that in Safari; the process stayed up but never published
     // an AppKit window, and the delayed block never ran (main queue idle).
-    // Log Safari serverPort from the first remoteContextWithOptions instead.
+    // Do not log Safari serverPort from remoteContextWithOptions either.
 
     if (macws_is_webcontent_process()) {
         macws_paint_log("WebContent paint hooks installed; no ctor dispatch_after");
