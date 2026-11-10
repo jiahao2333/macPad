@@ -25037,6 +25037,17 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
 extern xpc_connection_t macws_xpc_create_application_service(
     const char *name, dispatch_queue_t targetq,
     xpc_connection_t (*create_fn)(const char *, dispatch_queue_t));
+extern void macws_xpc_wrap_app_event_handler(
+    xpc_connection_t connection, xpc_handler_t handler,
+    void (*orig)(xpc_connection_t, xpc_handler_t));
+static void (*orig_xpc_connection_set_event_handler)(
+    xpc_connection_t, xpc_handler_t);
+static void hooked_xpc_connection_set_event_handler(
+        xpc_connection_t connection, xpc_handler_t handler) {
+    macws_xpc_wrap_app_event_handler(
+        connection, handler, orig_xpc_connection_set_event_handler);
+}
+
 xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {
     const char *originalName = name;
     if (name && (!strcmp(name, "com.apple.FileCoordination") ||
@@ -25120,6 +25131,11 @@ static void macws_install_private_xpc_name_hooks(void) {
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"),
                    hooked_xpc_connection_create,
                    (void *)&orig_xpc_connection_create);
+    void *seteh = MSFindSymbol(xpc, "_xpc_connection_set_event_handler");
+    if (seteh)
+        MSHookFunction(seteh,
+                       (void *)hooked_xpc_connection_set_event_handler,
+                       (void *)&orig_xpc_connection_set_event_handler);
     macws_install_sandbox_mach_lookup_hooks();
 }
 

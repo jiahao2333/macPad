@@ -408,10 +408,64 @@ One guarded attempt (`net5_safari.sh`: mem_guard, watchdog, only macOS Safari/We
 - No new panic-full; kernel uptime still counts from the 10:57 button reset (not a second unexplained reboot).
 - Screenshots were **not** produced (`field-artifacts/net5-*.png` / `/workspace/net5-*.png` are not present).
 
-### Still open
+### Still open (superseded)
 
-Safari has not yet been shown to request WebKit XPC or render a page under this fix. The in-chroot probe still shows the host-visible `xpc_add_bundle` path can keep stock WebContent up. Next guarded run needs the macOS GUI apps un-stopped **and** free pages ≳ 300 MB, plus a hard timeout on `screencapture`.
+The 11:36 CST run did not show a TSV-hit. Later runs did — see §19–§20. The path this section preferred (`/var/mnt/rootfs/usr/local/libexec/macws-xpc/...`) is **not** the path that keeps helpers up; §20 prefers the jb Frameworks path.
 
 ### Rollback
 
-`/var/mobile/macws-rollback/` + `NOTES.txt`: `libmachook*.pre-net5-*`, `macos_gui.sh.pre-net5-*`, prior `*.pre-admit-*` / `xpc_bundle_probe2.pre-admit-*`. Re-trust of existing CDHashes does not rewrite the proxies.
+`/var/mobile/macws-rollback/` + `NOTES.txt`: `libmachook*.pre-net7-*`, `*.pre-net6-*`, `libmachook*.pre-net5-*`, `macos_gui.sh.pre-net5-*`, prior `*.pre-admit-*` / `xpc_bundle_probe2.pre-admit-*`. Re-trust of existing CDHashes does not rewrite the proxies.
+
+## 19. Guarded Safari after GUI un-stop (2026-11-10 13:28 CST / 21:28 PT)
+
+User-authorized one guarded Safari run even though free pages were still under the ~300 MB floor after unlock (started 345 MB, dropped to 185, recovered to 214; compressor steady). Watchdog tripped mid `launch-path` at free=148 (`wc_mb=0`). `open-documents` then started macOS Safari pid 12614 (~155 MB RSS).
+
+Safari **did** enter `macws_xpc_create_application_service`: TSV-hits WebContent ×4, Networking ×3, SandboxBroker ×1; sandbox extensions issued OK. No macOS WebContent / Networking / GPU / proxy process stayed up. Free fell to 19 MB; the script aborted before baidu and before screencapture. No new crash / jetsam / AMFI / dmesg line explained the missing helpers. Safari 12614 and a leftover 12728 were cleaned. Free recovered 83 → 310 → 287 MB; compressor occupied stayed ~9210. LaunchDaemons `com.macwsguide.webkit.*` stayed unloaded. No second reboot (uptime still from the 10:57 CST button reset). No screenshots (`/workspace/net5-*.png` not produced). Cause of helper exit was not yet pinned, so no code commit in that window.
+
+Safari's own ~155 MB RSS plus the watchdog floor is a real limiter for a full render test on this iPad: a launch can drop free under 180 MB mid-start even when the compressor is idle.
+
+## 20. XPC path logging and jb-Frameworks preference (2026-11-10 14:59–15:16 CST / 22:59–23:16 PT)
+
+### Diagnostics added (libmachook)
+
+In the XPC Application-service create path: log the resolved absolute `xpc_add_bundle` path (`access` / errno), `add_bundle_done`, `created activate=… conn=`, and wrap the connection event handler (DYLD_INTERPOSE + `MSHookFunction` of `_xpc_connection_set_event_handler`) to log `Connection invalid` / `interrupted` with the activate service name to `/tmp/macws-xpc-app.log`. `xpc_add_bundle` is `void`; the useful result is a later XPC error or a spawned helper.
+
+### Deploy net6 (logging only)
+
+Thin libmachook, macOS 13 LC_BUILD_VERSION, fresh inodes, `ldid -S` ×2 + `jbctl trustcache add` (CDHash and sha1 candidate) on jb and rootfs. Did **not** restart macOS.
+
+- arm64e CDHash `28c37f95e918741e2707fb1c9ba62deecff98a6d` (sha1 `935768a32ade484ea54c120bb9ff146126693491`)
+- arm64 CDHash `466c69a5d69439e574739b3ecee48ff3efa95345` (sha1 `f780341bfcc9d7e5696db55087e1e937a8b9107b`)
+- Rollback `*.pre-net6-20261110-145918`. New log strings and the host-visible format string were present in the deployed dylib.
+
+### Same-boot probes (no Safari)
+
+`run_bash.sh` / `launchdchrootexec` always inserts `/usr/local/lib/libmachook.dylib`. Timeout 8 s, watchdog, cleanup. Both proxy trees are the same setuid `4755` binary (CDHash `181c64a699f325458491544c309f5d397bdd5007`), same Info.plist (`CFBundleIdentifier` = `com.apple.macosbooter.WebKit.WebContent`, `ServiceType=Application`, `_MultipleInstances`).
+
+1. **Path Safari's hook actually registered** (preferred by the 8b53f0a resolver because in-chroot `access()` succeeds):  
+   `/var/mnt/rootfs/usr/local/libexec/macws-xpc/WebKit.framework/Versions/A/XPCServices/WebContentProxy.xpc`  
+   + activate `com.apple.macosbooter.WebKit.WebContent`.  
+   `access_R_X=0`, `xpc_add_bundle` returned, `conn` non-NULL, then **`xpc_error: Connection interrupted`**. No WebContent or `WebContentProxy` process appeared in 1 s samples. `/tmp/macws-xpc-app.log` recorded `app-xpc name=com.apple.macosbooter.WebKit.WebContent` twice (the create hook only TSV-hits / hardcodes the public name `com.apple.WebKit.WebContent`, so a private-name probe does not log `add_bundle tag=`). free 156 → 119 MB; compressor occupied stayed 8785. No new crash, jetsam, or AMFI report.
+
+2. **DockHelper-style jb path** (in-chroot `access_R_X=-1` because `/var/jb` is a symlink loop — this is expected and must not be used as a gate):  
+   `/var/jb/usr/macOS/Frameworks/WebKit.framework/Versions/A/XPCServices/WebContentProxy.xpc`  
+   + the same activate name.  
+   **Stock macOS WebContent spawned and stayed up** until the memory watchdog: pid 21371, ppid 1, `Ss`, ~29 MB RSS, path `/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent`. No `xpc_error` while it was up. Started at free=100 MB; watchdog killed the helper at free=59 MB. Cleaned; no leftovers. compressor occupied stayed 8770.
+
+So the helper-stay-up failure after Safari's TSV-hits is explained by the **path recorded for host launchd/xpcproxy**, not by missing trust, stripped setuid, or an unlogged crash. `/var/mnt/rootfs/usr/local/libexec/macws-xpc/...` is visible in both namespaces but does not keep a helper up; `/var/jb/usr/macOS/Frameworks/...` does, matching DockHelper.
+
+### System-level fix
+
+`macws_xpc_host_visible_proxy_path` now always registers `/var/jb/usr/macOS/Frameworks/<relative>` (shared by the TSV registrar and the WebKit fast path). It does **not** use in-chroot `access()` as a gate and still never registers the chroot-only `/usr/local/libexec/...` path. TSV relatives are all under `WebKit.framework/Versions/A/XPCServices/*.xpc`, which exist in the jb Frameworks tree.
+
+### Deploy net7 (path preference + logging)
+
+- arm64e CDHash `24b0fbf91195cbe5b451b3fd07322cbf5567792f` (sha1 `0d8f3ab33d516594a8190f445fa24f445b951475`)
+- arm64 CDHash `7f4d7d650ccc8c91a5bf11301d206488dbfdde05` (sha1 `d807b8069c768e9742a8454ca8af5914f64ac351`)
+- Rollback `*.pre-net7-*`. Deployed dylib contains `/var/jb/usr/macOS/Frameworks/%s` (and no longer the `macws-xpc/%s` format string). No macOS restart.
+
+### Skipped
+
+A hook-path probe with the public name `com.apple.WebKit.WebContent` (to log `add_bundle tag=` of the new jb path through `macws_xpc_create_application_service`) was aborted at free=81 MB. Guarded Safari (example.com / baidu, `/workspace/net5-*.png`) was skipped: free settled ~91–94 MB for 10+ minutes with compressor occupied steady at ~8768–8770, well under the ~300 MB floor. A later lighter render test (minimal `WKWebView` helper, or the existing 8 s `xpc_bundle_probe2` which already proved stay-up on the jb path) is cheaper than Safari's ~155 MB plus the watchdog floor.
+
+No second unexplained reboot (uptime still from the 10:57 CST button reset). `com.macwsguide.webkit.*` LaunchDaemons stayed unloaded. No leftover probe/WebContent processes.

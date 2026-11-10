@@ -14375,13 +14375,114 @@ static const MacWSXpcAppServiceRow *macws_xpc_app_services_lookup(
 //   2. /var/jb/usr/macOS/Frameworks/... — the DockHelper pattern. access()
 //      may fail inside the chroot because rootfs /var/jb/usr is an absolute
 //      symlink loop; launchd still resolves the path on the host.
+static void macws_xpc_app_logf(const char *fmt, ...) {
+    int fd = open("/tmp/macws-xpc-app.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char line[640];
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (len > 0) {
+        if ((size_t)len >= sizeof(line)) len = (int)sizeof(line) - 1;
+        (void)write(fd, line, (size_t)len);
+    }
+    close(fd);
+}
+
 static void macws_xpc_host_visible_proxy_path(char *path, size_t pathsz,
         const char *relativeProxy) {
     if (!path || pathsz == 0 || !relativeProxy) return;
-    snprintf(path, pathsz, "/var/mnt/rootfs/usr/local/libexec/macws-xpc/%s",
-             relativeProxy);
-    if (access(path, F_OK) == 0) return;
+    // Prefer the DockHelper pattern. launchd/xpcproxy resolve xpc_add_bundle
+    // paths in the iOS host namespace. /var/jb/usr/macOS/Frameworks/<rel> is
+    // host-visible; access() of that path fails inside the chroot because
+    // /var/jb is a symlink loop, so do not use in-chroot access() as a gate.
+    // Same-boot probe 2026-11-10 15:15 CST: this path spawned stock
+    // WebContent (~29 MB, Ss, ppid 1) and kept it up. The previously
+    // preferred /var/mnt/rootfs/usr/local/libexec/macws-xpc/<rel> is visible
+    // in both namespaces but produced Connection interrupted and no helper.
     snprintf(path, pathsz, "/var/jb/usr/macOS/Frameworks/%s", relativeProxy);
+}
+
+// Remember Application-type connections so we can log XPC errors (Connection
+// invalid / interrupted) after the client installs its own event handler.
+#define MACWS_XPC_APP_CONN_MAX 32
+static struct {
+    xpc_connection_t conn;
+    char name[96];
+} g_macws_xpc_app_conns[MACWS_XPC_APP_CONN_MAX];
+static int g_macws_xpc_app_conn_n = 0;
+static pthread_mutex_t g_macws_xpc_app_conn_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void macws_xpc_remember_app_conn(xpc_connection_t conn,
+        const char *name) {
+    if (!conn || !name) return;
+    pthread_mutex_lock(&g_macws_xpc_app_conn_mu);
+    int slot = g_macws_xpc_app_conn_n;
+    if (slot < MACWS_XPC_APP_CONN_MAX)
+        g_macws_xpc_app_conn_n++;
+    else
+        slot = slot % MACWS_XPC_APP_CONN_MAX; // overwrite oldest-ring
+    g_macws_xpc_app_conns[slot].conn = conn;
+    snprintf(g_macws_xpc_app_conns[slot].name,
+             sizeof(g_macws_xpc_app_conns[slot].name), "%s", name);
+    pthread_mutex_unlock(&g_macws_xpc_app_conn_mu);
+}
+
+static const char *macws_xpc_lookup_app_conn_name(xpc_connection_t conn) {
+    if (!conn) return NULL;
+    pthread_mutex_lock(&g_macws_xpc_app_conn_mu);
+    const char *found = NULL;
+    for (int i = 0; i < g_macws_xpc_app_conn_n && i < MACWS_XPC_APP_CONN_MAX;
+         i++) {
+        if (g_macws_xpc_app_conns[i].conn == conn) {
+            found = g_macws_xpc_app_conns[i].name;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_xpc_app_conn_mu);
+    return found;
+}
+
+static void macws_xpc_log_and_add_bundle(const char *path, const char *tag) {
+    int acc = (path && path[0]) ? access(path, F_OK) : -1;
+    int err = (acc == 0) ? 0 : errno;
+    macws_xpc_app_logf(
+        "pid=%d add_bundle tag=%s path=%s access=%d errno=%d\n",
+        getpid(), tag ? tag : "?", path ? path : "", acc, err);
+    if (path && path[0])
+        xpc_add_bundle((char *)path, 2);
+    // xpc_add_bundle is void; the useful result is a later XPC error
+    // (Connection invalid) or a spawned helper.
+    macws_xpc_app_logf("pid=%d add_bundle_done tag=%s path=%s\n",
+                       getpid(), tag ? tag : "?", path ? path : "");
+}
+
+// Wrap a client's event handler so Connection invalid / interrupted are
+// logged with the activate service name. orig must be the unhooked
+// xpc_connection_set_event_handler (or MSHook's saved original).
+void macws_xpc_wrap_app_event_handler(
+        xpc_connection_t connection, xpc_handler_t handler,
+        void (*orig)(xpc_connection_t, xpc_handler_t)) {
+    if (!orig) return;
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (!svc || !handler) {
+        orig(connection, handler);
+        return;
+    }
+    char *nameCopy = strdup(svc);
+    xpc_handler_t user = handler;
+    orig(connection, ^(xpc_object_t event) {
+        if (event && xpc_get_type(event) == XPC_TYPE_ERROR) {
+            const char *desc = xpc_dictionary_get_string(
+                event, XPC_ERROR_KEY_DESCRIPTION);
+            macws_xpc_app_logf("pid=%d xpc_error service=%s desc=%s\n",
+                               getpid(), nameCopy ? nameCopy : "?",
+                               desc ? desc : "?");
+        }
+        user(event);
+    });
 }
 
 static void macws_register_xpc_app_proxy_bundle(const char *relativeProxy) {
@@ -14396,7 +14497,7 @@ static void macws_register_xpc_app_proxy_bundle(const char *relativeProxy) {
                  "%s", relativeProxy);
     char path[PATH_MAX];
     macws_xpc_host_visible_proxy_path(path, sizeof(path), relativeProxy);
-    xpc_add_bundle(path, 2);
+    macws_xpc_log_and_add_bundle(path, relativeProxy);
 }
 
 // Safari WebKit XPC services are Application-type (_MultipleInstances +
@@ -14426,7 +14527,7 @@ static void macws_register_webkit_bundle_if_needed(const char *proxyLeaf) {
         snprintf(rel, sizeof(rel),
                  "WebKit.framework/Versions/A/XPCServices/%s", proxyLeaf);
         macws_xpc_host_visible_proxy_path(path, sizeof(path), rel);
-        xpc_add_bundle(path, 2);
+        macws_xpc_log_and_add_bundle(path, rel);
         return;
     }
 }
@@ -14524,7 +14625,11 @@ xpc_connection_t macws_xpc_create_application_service(
             }
         }
         macws_issue_macosbooter_mach_extension(row->privateName);
-        return create_fn(row->privateName, targetq);
+        xpc_connection_t conn = create_fn(row->privateName, targetq);
+        macws_xpc_app_logf("pid=%d created activate=%s conn=%p\n",
+                           getpid(), row->privateName, conn);
+        macws_xpc_remember_app_conn(conn, row->privateName);
+        return conn;
     }
     // Hardcoded WebKit / Safari SandboxBroker bootstrap (same-name activate).
     const char *leaf = NULL;
@@ -14552,7 +14657,11 @@ xpc_connection_t macws_xpc_create_application_service(
     else if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
         activate = SAFARI_SANDBOX_BROKER_SERVICE_NEW;
     macws_issue_macosbooter_mach_extension(activate);
-    return create_fn(activate, targetq);
+    xpc_connection_t conn = create_fn(activate, targetq);
+    macws_xpc_app_logf("pid=%d created activate=%s conn=%p leaf=%s\n",
+                       getpid(), activate, conn, leaf);
+    macws_xpc_remember_app_conn(conn, activate);
+    return conn;
 }
 
 #define GEOD_XPC_SERVICE "com.apple.geod"
@@ -16010,6 +16119,18 @@ DYLD_INTERPOSE(macws_xpc_connection_create_mach_service_early,
                macws_xpc_connection_create_mach_service_raw);
 DYLD_INTERPOSE(macws_xpc_connection_set_instance_early,
                macws_xpc_connection_set_instance_raw);
+
+extern void macws_xpc_connection_set_event_handler_raw(
+    xpc_connection_t connection, xpc_handler_t handler)
+    __asm("_xpc_connection_set_event_handler");
+
+void macws_xpc_connection_set_event_handler_early(
+        xpc_connection_t connection, xpc_handler_t handler) {
+    macws_xpc_wrap_app_event_handler(
+        connection, handler, macws_xpc_connection_set_event_handler_raw);
+}
+DYLD_INTERPOSE(macws_xpc_connection_set_event_handler_early,
+               macws_xpc_connection_set_event_handler_raw);
 DYLD_INTERPOSE(macws_xpc_connection_create_listener_early,
                macws_xpc_connection_create_listener_raw);
 DYLD_INTERPOSE(macws_xpc_connection_create_early, xpc_connection_create);
