@@ -24653,8 +24653,19 @@ static const char *macws_private_lsd_service_name(const char *name) {
         ? rewritten : name;
 }
 
+// Shared-cache xpc_connection_create_mach_service uses this table. It must
+// include the CARenderServer rewrite that macws_private_bootstrap_service_name
+// already applies: WindowServer publishes only
+// com.apple.macosbooter.CARenderServer. QuartzCore looks the name up through
+// libxpc in the shared cache, so DYLD_INTERPOSE on bootstrap_look_up is not
+// enough. A missing rewrite leaves WebKit's CAContext/CALayerHost with no
+// render server and a blank content view (AppKit chrome still paints via CGS).
+// Do not call macws_private_bootstrap_service_name from this file: it is
+// static, and exporting it broke dyld interposing (flat-namespace abort).
 static const char *macws_private_chroot_service_name(const char *name) {
     if (!name) return name;
+    if (!strcmp(name, "com.apple.CARenderServer"))
+        return "com.apple.macosbooter.CARenderServer";
     // RunningBoard names the launchd endpoints from the registered iOS first
     // image, while Ventura's ExtensionFoundation names them from the real
     // application-extension record.  `launchctl procinfo` runtime-confirmed
@@ -25012,6 +25023,21 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
         return orig_xpc_connection_create(name, targetq);
     }
     name = macws_private_chroot_service_name(name);
+    if (originalName && strstr(originalName, "CARenderServer")) {
+        char line[256];
+        int n = snprintf(line, sizeof(line),
+            "pid=%d xpc_connection_create_mach_service '%s'%s%s%s flags=%#llx\n",
+            getpid(), originalName,
+            name != originalName ? " -> '" : "",
+            name != originalName ? name : "",
+            name != originalName ? "'" : "",
+            (unsigned long long)flags);
+        if (n > 0) {
+            int fd = open("/tmp/macws-webkit-paint.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) { (void)write(fd, line, (size_t)n); close(fd); }
+        }
+    }
     // Connection tracing is a diagnostic flight recorder.  Terminal used to
     // enable it implicitly, making an ordinary production shell write every
     // XPC lookup to stderr.  Keep the functional privileged-flag translation

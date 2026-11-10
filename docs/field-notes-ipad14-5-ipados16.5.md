@@ -546,3 +546,46 @@ Screenshots (menu clock 12:35 PT): `/workspace/net9-example.png`, `/workspace/ne
 
 Function-offset `MSHookFunction` on this WebKit shared-cache text is not a reliable intercept (`orig=0`). The XPC main-queue path is the working system-level fix for the isMainThread assert and keeps helpers up. Next is why the page stays blank with a loading bar while WebContent/Networking are `Ss` — the missing GPU process is the leading lead.
 
+## 23. CARenderServer XPC rewrite; GPU never requested; WebContent never hosts a CAContext (2026-11-10 16:51–16:59 CST / 00:51–00:59 PT)
+
+### GPU process is never requested (not a launch failure)
+
+Safari defaults have no `UseGPUProcessForDOMRendering`, `UseGPUProcessForMedia`, or `UseGPUProcessForCanvas` keys. The TSV and the setuid `WebGPUProxy` already exist (flat layout `WebGPUProxy.xpc/WebGPUProxy`, not `Contents/MacOS`; same family as `WebContentProxy`, mode 4755). Across net9 / net10 / net10b there was no TSV-hit for `com.apple.WebKit.GPU`, no `xpc_connection_create` of that name, and no GPU process. For a static page such as example.com, in-process DOM rendering is the expected Ventura path, so a missing GPU process is not by itself why the content area stays blank.
+
+### CARenderServer table drift
+
+iOS launchd never publishes `com.apple.CARenderServer`. WindowServer checks in `com.apple.macosbooter.CARenderServer` (confirmed live on the WindowServer / `UIKitApplication:com.macwsguide.windowserver` process). Clients must rewrite the bootstrap / XPC name; without a remote `CAContext`, window *content* never reaches WindowServer (AppKit chrome still paints via CGS).
+
+Two rewrite tables had drifted:
+
+- `macws_private_bootstrap_service_name` (`DYLD_INTERPOSE` of `bootstrap_look_up`, in `mac_hooks.m`) already remapped `com.apple.CARenderServer`.
+- `macws_private_chroot_service_name` (shared-cache `MSHook` of `xpc_connection_create_mach_service`, in `Metal_hooks.x`) did not.
+
+QuartzCore often looks the name up through libxpc in the shared cache, so the interpose alone is not enough.
+
+### net10 abort: do not export the remapper
+
+The first net10 build removed `static` from `macws_private_bootstrap_service_name` so `Metal_hooks.x` could call it, and added a shared-cache `MSHook` of `bootstrap_look_up`. libmachook is built with hidden visibility. The result was `dyld: warning could not apply interposing tuples`, `symbol not found in flat namespace '_macws_private_bootstrap_service_name'`, and Abort trap 6 in every libmachook process, including `run_bash.sh`. Safari launched into that abort; captures timed out; no screenshots. arm64e CDHash `8f133c690ca5672277c0c69b1436834213690eaa` (sha1 `320edab6c3c20229295c9db551dd066058fc0685`). Rollback `*.pre-net10-20261110-165218`. That dylib must not be left deployed. The remapper is `static` again; the shared-cache `bootstrap_look_up` hook that depended on the export was removed.
+
+### System-level fix (net10b)
+
+Duplicate the CARender rewrite into `macws_private_chroot_service_name`. Do not export the bootstrap remapper. Paint-boundary logs (`/tmp/macws-webkit-paint.log`, chroot path `/var/mnt/rootfs/tmp/macws-webkit-paint.log`) record `CAContext remoteContextWithOptions:` / `contextWithCGSConnection:options:`, `CALayerHost setContextId:`, and `bootstrap_look_up` / `xpc_connection_create_mach_service` of CARenderServer.
+
+Deploy net10b, no macOS restart. Pre-Safari smoke of the dylib was `SMOKE_OK`. arm64e CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e` (sha1 `b027e89499f34b6bd3c74b55b66a9439f1b8e1d7`), arm64 `b9638f5dad1ee8cf7db3ff9e2d12b492abc12d06` (sha1 `15635f36cffe4754c309c5385eb54e5505572a6d`). Fresh inodes 44208 / 23174388. Size 1477120. Rollback `*.pre-net10b-20261110-165707`.
+
+### Guarded Safari (one attempt, 16:57–16:59 CST / 00:57–00:59 PT)
+
+Safari pid 38235 launched (~360–361 MB) and received both weblocs; both captures returned `CAPTURE_OK`. Helpers stayed up (Networking 38250 plus a dozen WebContent, `Ss`, ~28 MB, etime 15–42 s). Zero `Connection interrupted` / `Connection invalid`. No GPU process. No new WebKit `.ips` (the last remain the 15:35 CST net7 reports). After cleanup `CORE_OK`, LaunchDaemons unloaded, no leftover macOS Safari/helpers, uptime still from the 10:57 CST button reset. Mid-run `free_mb` 30, `comp_occ` 12036 → 17274 (delta 5238, under the compressor emergency).
+
+Paint log (8339 B):
+
+- Safari `bootstrap_look_up 'com.apple.CARenderServer' -> 'com.apple.macosbooter.CARenderServer' -> 0 port=0x3a0b`.
+- Safari `remoteContextWithOptions` produced `contextId=4279728157`, plus several `contextWithCGSConnection:110135` with nonzero ids.
+- `screencapture`, QuickLookUI, and `openAndSavePanelService` also rewrote CARender and created remote contexts, so the XPC-table sync is a real system-level fix, not a Safari-only path.
+- WebContent pids logged only `CAContext hooks ctx=… host=…` (the installer ran). Zero WebContent `remoteContextWithOptions` / `contextWithCGSConnection`, zero `xpc_connection_create_mach_service` CARender lines, and **zero** `CALayerHost setContextId:` in Safari. RemoteLayerTree hosting never attached.
+
+Screenshots (menu clock 12:57 / 12:58 PT): `/workspace/net10-example.png`, `/workspace/net10-baidu.png`, `field-artifacts/net10-*.png`. The URL bar shows `example.com` / `baidu.com` with a loading indicator still drawn; baidu grew a "B" favicon on an Untitled tab; a Start Page tab remains. The content area is still **blank white**, the same visual result as net9.
+
+### Still open
+
+The CARender XPC-table sync is the correct generic fix for clients that look up `com.apple.CARenderServer` through libxpc, but it is not sufficient by itself for WebContent paint. Safari can talk to CARenderServer and create CAContexts; WebContent never creates a CAContext, and Safari never calls `setContextId` on `CALayerHost`. Leading next hypotheses: WebContent uses an unhooked CAContext / C API to create the remote context; a drawing-area or GPU-process expectation prevents in-process context creation even though Safari never requests the GPU process; or an IOSurface / sandbox extension on the WebContent side still blocks backing stores (`IOSurfaceCreate_new` already exists and only decompresses compressed surfaces; no WebContent-specific IOSurface failure was logged this run). A per-app env disable of GPU or compositing was not used: GPU was never requested, and compositing is the path that still needs to work.

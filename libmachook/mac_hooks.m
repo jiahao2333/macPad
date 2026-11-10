@@ -5603,6 +5603,24 @@ static void macws_configure_controlcenter_airplay_settings_route(void) {
 static void (*orig_InitializeWebKit2)(void);
 static _Atomic bool g_macws_webkit_init_hooked = false;
 
+
+static void macws_install_cacontext_paint_hooks(void);
+
+static void macws_paint_log(const char *msg) {
+    int fd = open("/tmp/macws-webkit-paint.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char line[512];
+    const char *exe = "?";
+    char **argv = *_NSGetArgv();
+    if (argv && argv[0] && argv[0][0])
+        exe = argv[0];
+    int n = snprintf(line, sizeof(line), "pid=%d exe=%s %s\n",
+                     getpid(), exe, msg ? msg : "?");
+    if (n > 0) (void)write(fd, line, (size_t)n);
+    close(fd);
+}
+
 static void macws_webkit_init_log(const char *msg) {
     int fd = open("/tmp/macws-webkit-init.log",
                   O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -5834,6 +5852,89 @@ static void macws_ctor_webkit_init_mainthread(void) {
     }
     // Many libmachook processes never load WebKit; stay quiet unless a later
     // add-image callback finds the UUID-matched image and still cannot hook.
+    macws_install_cacontext_paint_hooks();
+}
+
+
+// WebKit in-process compositing hosts remote layers through CAContext /
+// CALayerHost over CARenderServer. Log the boundary so a blank content area can be distinguished from a missing GPU process.
+static id (*orig_CAContext_remoteContextWithOptions)(id, SEL, id);
+static id hooked_CAContext_remoteContextWithOptions(id self, SEL sel, id opts) {
+    id ctx = orig_CAContext_remoteContextWithOptions
+        ? orig_CAContext_remoteContextWithOptions(self, sel, opts) : nil;
+    unsigned cid = 0;
+    if (ctx) {
+        cid = ((unsigned (*)(id, SEL))objc_msgSend)(
+            ctx, sel_registerName("contextId"));
+    }
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "CAContext remoteContextWithOptions -> %p contextId=%u",
+             ctx, cid);
+    macws_paint_log(msg);
+    return ctx;
+}
+
+static id (*orig_CAContext_contextWithCGSConnection)(id, SEL, uint32_t, id);
+static id hooked_CAContext_contextWithCGSConnection(id self, SEL sel,
+                                                    uint32_t conn, id opts) {
+    id ctx = orig_CAContext_contextWithCGSConnection
+        ? orig_CAContext_contextWithCGSConnection(self, sel, conn, opts) : nil;
+    unsigned cid = 0;
+    if (ctx) {
+        cid = ((unsigned (*)(id, SEL))objc_msgSend)(
+            ctx, sel_registerName("contextId"));
+    }
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "CAContext contextWithCGSConnection:%u -> %p contextId=%u",
+             conn, ctx, cid);
+    macws_paint_log(msg);
+    return ctx;
+}
+
+static void (*orig_CALayerHost_setContextId)(id, SEL, unsigned);
+static void hooked_CALayerHost_setContextId(id self, SEL sel, unsigned cid) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "CALayerHost setContextId:%u host=%p",
+             cid, self);
+    macws_paint_log(msg);
+    if (orig_CALayerHost_setContextId)
+        orig_CALayerHost_setContextId(self, sel, cid);
+}
+
+static void macws_install_cacontext_paint_hooks(void) {
+    static _Atomic bool installed = false;
+    if (atomic_exchange_explicit(&installed, true, memory_order_acq_rel))
+        return;
+    Class ctx = objc_getClass("CAContext");
+    Class host = objc_getClass("CALayerHost");
+    if (ctx) {
+        Method m = class_getClassMethod(ctx, @selector(remoteContextWithOptions:));
+        if (m) {
+            orig_CAContext_remoteContextWithOptions =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CAContext_remoteContextWithOptions);
+        }
+        m = class_getClassMethod(ctx, @selector(contextWithCGSConnection:options:));
+        if (m) {
+            orig_CAContext_contextWithCGSConnection =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CAContext_contextWithCGSConnection);
+        }
+    }
+    if (host) {
+        Method m = class_getInstanceMethod(host, @selector(setContextId:));
+        if (m) {
+            orig_CALayerHost_setContextId = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_CALayerHost_setContextId);
+        }
+    }
+    char msg[96];
+    snprintf(msg, sizeof(msg), "CAContext hooks ctx=%p host=%p", ctx, host);
+    macws_paint_log(msg);
 }
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
@@ -5844,6 +5945,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
     // each image for the InitializeWebKit2 symbol until hooked.
     if (!atomic_load_explicit(&g_macws_webkit_init_hooked, memory_order_acquire))
         macws_install_webkit_init_mainthread(header);
+    if (info.dli_fname && strstr(info.dli_fname, "QuartzCore") != NULL)
+        macws_install_cacontext_paint_hooks();
     if (info.dli_fname &&
         strstr(info.dli_fname, "/AirPlaySupport.framework/") != NULL) {
         macws_configure_controlcenter_airplay_settings_route();
@@ -15867,6 +15970,7 @@ kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_
     macws_trace_xpc_name("bootstrap_look_up", originalName);
     if (name != originalName)
         macws_trace_xpc_name("bootstrap_look_up.mapped", name);
+    bool carender = originalName && strstr(originalName, "CARenderServer");
     bool steamRendezvous =
         macws_is_steam_mach_rendezvous_name(originalName);
     // The iPadOS bootstrap namespace cannot provide Chromium's per-browser
@@ -15882,6 +15986,17 @@ kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_
     if (!steamRendezvous && result != KERN_SUCCESS)
         result = macws_steam_mach_rendezvous_look_up(
             originalName, sp, result);
+    if (carender) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "bootstrap_look_up '%s'%s%s%s -> %#x port=%#x",
+                 originalName ?: "(null)",
+                 name != originalName ? " -> '" : "",
+                 name != originalName ? name : "",
+                 name != originalName ? "'" : "",
+                 result, sp ? *sp : MACH_PORT_NULL);
+        macws_paint_log(msg);
+    }
     if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr,
                 "#### BOOTSTRAP look_up '%s'%s%s%s -> %#x port=%#x\n",
