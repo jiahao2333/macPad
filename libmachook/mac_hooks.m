@@ -5583,9 +5583,177 @@ static void macws_configure_controlcenter_airplay_settings_route(void) {
     fflush(stderr);
 }
 
+
+// Ventura WebKit InitializeWebKit2 (WebKit2InitializeCocoa.mm:51):
+//   RELEASE_ASSERT_WITH_MESSAGE([NSThread isMainThread],
+//       "InitializeWebKit2 should be called on the main thread");
+// Stock WebContent/Networking are linked with a new-enough SDK that
+// InitializeWebKit2 calls runInitializationCode() immediately when
+// linkedOnOrAfterSDK(InitializeWebKit2MainThreadAssertion) is true,
+// instead of bouncing to the main queue. Apple's xpcproxy delivers the
+// first Application-type XPC event on the main NSRunLoop; our setuid
+// chroot proxy execve's the stock image after xpcproxy has already
+// treated the proxy as the service, so the inherited XPC event can
+// arrive on a libdispatch queue. Field crash 2026-11-10 15:35 CST:
+// WTFCrashWithInfo line 51, same BRK in WebContent and Networking
+// (PAC_EXCEPTION reports are the same BRK). The idle xpc_bundle_probe2
+// stays up because its empty message never enters InitializeWebKit2.
+// System-level: run InitializeWebKit2 on the main thread for every
+// libmachook process (same policy as WebKit's old-SDK fallback).
+static void (*orig_InitializeWebKit2)(void);
+static _Atomic bool g_macws_webkit_init_hooked = false;
+
+static void macws_webkit_init_log(const char *msg) {
+    int fd = open("/tmp/macws-webkit-init.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char line[384];
+    const char *exe = "?";
+    char **argv = *_NSGetArgv();
+    if (argv && argv[0] && argv[0][0])
+        exe = argv[0];
+    int n = snprintf(line, sizeof(line), "pid=%d exe=%s %s pthread_main=%d\n",
+                     getpid(), exe, msg ? msg : "?", pthread_main_np());
+    if (n > 0) (void)write(fd, line, (size_t)n);
+    close(fd);
+}
+
+// The net7 crash is in the stock WebContent/Networking XPCs. Hooking
+// InitializeWebKit2 inside Safari.app or the control probe is unnecessary
+// and, after the UUID-offset hook was first deployed, coincided with
+// launch-path failing to publish an AppKit window (16:13 CST).
+static bool macws_is_webkit_helper_process(void) {
+    char **argv = *_NSGetArgv();
+    const char *p = (argv && argv[0]) ? argv[0] : "";
+    if (strstr(p, "com.apple.WebKit.WebContent") ||
+        strstr(p, "com.apple.WebKit.Networking") ||
+        strstr(p, "com.apple.WebKit.GPU") ||
+        strstr(p, "com.apple.Safari.SandboxBroker"))
+        return true;
+    char path[1024];
+    uint32_t sz = sizeof(path);
+    if (_NSGetExecutablePath(path, &sz) == 0) {
+        if (strstr(path, "com.apple.WebKit.WebContent") ||
+            strstr(path, "com.apple.WebKit.Networking") ||
+            strstr(path, "com.apple.WebKit.GPU") ||
+            strstr(path, "com.apple.Safari.SandboxBroker"))
+            return true;
+    }
+    return false;
+}
+
+static void hooked_InitializeWebKit2(void) {
+    if (pthread_main_np()) {
+        orig_InitializeWebKit2();
+        return;
+    }
+    macws_webkit_init_log("InitializeWebKit2 off main; dispatch_sync");
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        orig_InitializeWebKit2();
+    });
+}
+
+// Ventura 13.4 (22F66) WebKit-7615.1.26.11.5, crash 2026-11-10 15:35 CST.
+// InitializeWebKit2 is not in the shared-cache export trie (MSFindSymbol and
+// dlsym both miss), but IPS imageOffset 126680 symbolLocation 84 pins the
+// start at +126596 in UUID 72317905-49DA-3A07-A8C1-D93B91F653CB.
+enum { kMacWSInitializeWebKit2Offset = 126596 };
+static const uint8_t kMacWSWebKitUUID[16] = {
+    0x72, 0x31, 0x79, 0x05, 0x49, 0xda, 0x3a, 0x07,
+    0xa8, 0xc1, 0xd9, 0x3b, 0x91, 0xf6, 0x53, 0xcb,
+};
+
+static bool macws_header_uuid_equals(const struct mach_header *header,
+                                     const uint8_t expected[16]) {
+    if (!header || (header->magic != MH_MAGIC_64 && header->magic != MH_CIGAM_64))
+        return false;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)header;
+    const uint8_t *p = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmdsize < sizeof(*lc))
+            return false;
+        if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+            const struct uuid_command *u = (const struct uuid_command *)lc;
+            return memcmp(u->uuid, expected, 16) == 0;
+        }
+        p += lc->cmdsize;
+    }
+    return false;
+}
+
+static void *macws_resolve_initializewebkit2_by_offset(const struct mach_header *header) {
+    if (!header || !macws_header_uuid_equals(header, kMacWSWebKitUUID))
+        return NULL;
+    const uint32_t *words =
+        (const uint32_t *)((const uint8_t *)header + kMacWSInitializeWebKit2Offset);
+    // arm64e C++ functions in this image start with PACIBSP.
+    if (words[0] != 0xd503237f) {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "InitializeWebKit2 prologue mismatch 0x%08x", words[0]);
+        macws_webkit_init_log(msg);
+        return NULL;
+    }
+    return ptrauth_sign_unauthenticated((void *)(uintptr_t)words,
+                                        ptrauth_key_function_pointer, 0);
+}
+
+static void macws_install_webkit_init_mainthread(const struct mach_header *header) {
+    if (!macws_is_webkit_helper_process())
+        return;
+    if (atomic_exchange_explicit(&g_macws_webkit_init_hooked, true,
+                                 memory_order_acq_rel))
+        return;
+    void *sym = NULL;
+    if (header) {
+        sym = MSFindSymbol((MSImageRef)header,
+                           "__ZN6WebKit16InitializeWebKit2Ev");
+        if (!sym)
+            sym = MSFindSymbol((MSImageRef)header,
+                               "_ZN6WebKit16InitializeWebKit2Ev");
+    }
+    if (!sym)
+        sym = dlsym(RTLD_DEFAULT, "_ZN6WebKit16InitializeWebKit2Ev");
+    if (!sym)
+        sym = dlsym(RTLD_DEFAULT, "__ZN6WebKit16InitializeWebKit2Ev");
+    const char *how = "symbol";
+    if (!sym && header) {
+        sym = macws_resolve_initializewebkit2_by_offset(header);
+        how = "offset";
+    }
+    if (!sym) {
+        atomic_store_explicit(&g_macws_webkit_init_hooked, false,
+                              memory_order_release);
+        return;
+    }
+    MSHookFunction(sym, (void *)hooked_InitializeWebKit2,
+                   (void **)&orig_InitializeWebKit2);
+    char msg[80];
+    snprintf(msg, sizeof(msg), "hooked InitializeWebKit2 via %s", how);
+    macws_webkit_init_log(msg);
+}
+
+__attribute__((constructor))
+static void macws_ctor_webkit_init_mainthread(void) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        if (atomic_load_explicit(&g_macws_webkit_init_hooked, memory_order_acquire))
+            break;
+        macws_install_webkit_init_mainthread(_dyld_get_image_header(i));
+    }
+    // Many libmachook processes never load WebKit; stay quiet unless a later
+    // add-image callback finds the UUID-matched image and still cannot hook.
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info = {};
     (void)dladdr(header, &info);
+    // WebKit may live in the dyld shared cache, where dladdr() reports the
+    // cache path rather than .../WebKit.framework/Versions/A/WebKit. Probe
+    // each image for the InitializeWebKit2 symbol until hooked.
+    if (!atomic_load_explicit(&g_macws_webkit_init_hooked, memory_order_acquire))
+        macws_install_webkit_init_mainthread(header);
     if (info.dli_fname &&
         strstr(info.dli_fname, "/AirPlaySupport.framework/") != NULL) {
         macws_configure_controlcenter_airplay_settings_route();

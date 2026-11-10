@@ -469,3 +469,53 @@ So the helper-stay-up failure after Safari's TSV-hits is explained by the **path
 A hook-path probe with the public name `com.apple.WebKit.WebContent` (to log `add_bundle tag=` of the new jb path through `macws_xpc_create_application_service`) was aborted at free=81 MB. Guarded Safari (example.com / baidu, `/workspace/net5-*.png`) was skipped: free settled ~91–94 MB for 10+ minutes with compressor occupied steady at ~8768–8770, well under the ~300 MB floor. A later lighter render test (minimal `WKWebView` helper, or the existing 8 s `xpc_bundle_probe2` which already proved stay-up on the jb path) is cheaper than Safari's ~155 MB plus the watchdog floor.
 
 No second unexplained reboot (uptime still from the 10:57 CST button reset). `com.macwsguide.webkit.*` LaunchDaemons stayed unloaded. No leftover probe/WebContent processes.
+
+## 21. Safari helper crash is InitializeWebKit2 off-main, not Gigacage (2026-11-10 15:35–16:23 CST / 23:35 PT Nov 9 – 00:23 PT Nov 10)
+
+User waived the free-page gate ([pt132u](pt132u)); watchdog is compressor spike (`comp_occ > start+25000` or `>80000`), jetsam of WindowServer / macwshostd / SpringBoard, or SSH drop only.
+
+### Leading env hypothesis — false
+
+Helpers spawned through the setuid ViewBridgeChrootProxy already get libmachook's required environment. The production proxy (WebKit targets, `MACWS_WEBKIT_PROXY_EXPERIMENT`) injects `DYLD_INSERT_LIBRARIES=/usr/local/lib/libmachook.dylib` and `GIGACAGE_ENABLED=0` (strings present in the deployed thin arm64e binary, CDHash `181c64a699f325458491544c309f5d397bdd5007`, setuid 4755). A 15:52 CST idle `xpc_bundle_probe2` WebContent (pid 27409, `Ss`, ~29 MB) had libmachook mapped (`TEXT` at `0x102ae8000`) and stayed up the full window; compressor unchanged. `sysctl kern.procargs2` could not dump the child env from the chroot, but the mapping is enough. Full 80 GiB / 32 GiB-align Gigacage remains VA-infeasible on this iPad; the getenv default and explicit proxy env are already in place for that.
+
+### Decoded crash (net7, 15:35 CST / 23:35 PT Nov 9)
+
+Safari-driven WebContent and Networking died at `EXC_BREAKPOINT` `0x1bde2d9ac` (WebKit base `0x1bddd2000` + `0x5b9ac`). The fully symbolicated report (`com.apple.WebKit.WebContent-2026-11-10-153522.ips`):
+
+- `WTFCrashWithInfo(int, char const*, char const*, int)` at imageOffset 375212, symbolLocation 20
+- `WebKit::runInitializationCode(void*)` at 2342788, symbolLocation 92
+- `std::call_once` (libc++)
+- `WebKit::InitializeWebKit2()` at 126680, symbolLocation 84
+- `WebContentServiceInitializer` at 125852, symbolLocation 196
+- `WebKit::XPCServiceEventHandler` block, then `_dispatch_sync_f_slow` / `_xpc_connection_call_event_handler`
+
+Registers: `x0=51` is the **source line**, not a Gigacage constant. Ventura WebKit-7615.1.26.11.5 `WebKit2InitializeCocoa.mm:51` is `RELEASE_ASSERT_WITH_MESSAGE([NSThread isMainThread], "InitializeWebKit2 should be called on the main thread")`. `JSC::initialize()` (Gigacage) is line 58, after this assert, so the net7 crash never reached it. `x1`/`x2` point at nearby `__TEXT` strings (IPS mis-attributed them to a `ShareablePixelBuffer` `__PRETTY_FUNCTION__`). One-frame `PAC_EXCEPTION` reports are the same BRK, not a distinct arm64 vs arm64e entitlement problem (deployed proxy and libmachook are thin arm64e).
+
+The idle probe stays up because its empty XPC message never enters `InitializeWebKit2`. Safari's first real bootstrap message does, off the main thread. Stock Apple-linked helpers have `linkedOnOrAfterSDKWithBehavior(InitializeWebKit2MainThreadAssertion)`, so `InitializeWebKit2` calls `runInitializationCode()` immediately on the calling thread instead of `WorkQueue::main().dispatchSync`. Apple's xpcproxy delivers Application-type (`RunLoopType=_NSApplicationMain`) first events on the main NSRunLoop; our setuid chroot proxy `execve`s the stock image after xpcproxy has already treated the proxy as the service, so the first event can arrive on a libdispatch queue.
+
+Offsets in UUID `72317905-49DA-3A07-A8C1-D93B91F653CB` (image base in the crash and in live helpers was `0x1bddd2000`):
+
+- `InitializeWebKit2` start = 126680 − 84 = **126596**
+- `runInitializationCode` start = 2342788 − 92 = 2342696
+- `WTFCrashWithInfo` start = 375212 − 20 = 375192
+- `WebContentServiceInitializer` start = 125852 − 196 = 125656
+
+### System-level hook
+
+`libmachook` hooks `WebKit::InitializeWebKit2` and, when `!pthread_main_np()`, `dispatch_sync`s to the GCD main queue (same policy as WebKit's old-SDK fallback). `MSFindSymbol` / `dlsym` of `__ZN6WebKit16InitializeWebKit2Ev` miss: the symbol is not in the shared-cache export trie, and `dladdr` on a cache image does not report `.../WebKit.framework/Versions/A/WebKit`. The installer therefore walks dyld images, matches that UUID, checks the first instruction at +126596 is `PACIBSP` (`0xd503237f`), and `MSHookFunction`s that address. The hook is installed only in `com.apple.WebKit.WebContent`, `Networking`, `GPU`, and `com.apple.Safari.SandboxBroker`.
+
+### Field runs (one Safari attempt at a time; previous cleaned)
+
+Watchdog never tripped on compressor or core processes. `com.macwsguide.webkit.*` LaunchDaemons stayed unloaded. No leftover helpers. No second unexplained reboot (uptime still from the 10:57 CST button reset). Did not restart macOS; new processes load the new dylib. Rollback trees: `*.pre-net8-*`, `*.pre-net8b-*`, `*.pre-net8c-*`, `*.pre-net8d-*`.
+
+1. **net8** (~15:57–16:00 CST / 23:57–00:00 PT): path-based installer. arm64e CDHash `48e00431b5a9633c918505837e7e1ed7ebc8d7a4`. `/tmp/macws-webkit-init.log` empty — hook never installed. Safari presented; example.com / baidu URLs in the bar; Favorites start page, no web content. Fewer XPC errors than net7; no new `.ips`.
+2. **net8b** (~16:03–16:05 CST / 00:03–00:05 PT): symbol search on every image. arm64e CDHash `cdfc9c1f20e230501c84741b83a8f12f53127397`. Only "symbol not found at ctor" in non-WebKit processes; hook still not installed. Same Favorites-only result. Shots: `field-artifacts/net8b-*.png`.
+3. **net8c** (~16:13–16:14 CST / 00:13–00:14 PT): first UUID-offset hook, not yet scoped. arm64e CDHash `d6d4061238f556bb339dbc2a9cdc4db0263ed5ce`. Hook installed in 3 short-lived pids. `macws_control_probe launch-path` reported no AppKit window in 30 s; captures are the desktop only (`field-artifacts/net8c-*.png`). Finder / Dock / WindowServer stayed `Ss`; compressor ~9942. Hooking Safari or the control probe likely blocked window publish, so the hook was then scoped to helpers only.
+4. **net8d** (~16:21–16:23 CST / 00:21–00:23 PT): helper-scoped UUID-offset hook, log includes `argv0`. arm64e CDHash `9c0dbaac21659ebe8f1a9ebe1cae8524db62d5e3` (sha1 `0082b6513332843172fecc326819868b2773de42`), arm64 `bdb41467db2dcbc5141aee0b156055208cdb1db0`. Fresh inodes 44183 / 23172901. Safari pid 32403 launched (~204 MB); both weblocs were received. The hook **did** install in the stock WebContent, Networking, and SandboxBroker helpers (153 lines in `/tmp/macws-webkit-init.log`). It **never** logged `InitializeWebKit2 off main; dispatch_sync`, so the main-thread bounce did not run. Helpers respawned in a tight loop (~14 MB, etime ~1 s at snapshots). After example and after baidu, only Safari plus two fresh WebContent processes were visible; Networking did not stay up. XPC `Connection interrupted` / `invalid` counts were high. No new WebKit `.ips` (the 15:35 reports remain the last). Pages still did not render.
+
+Screenshots of the net8d attempt (Favorites start page, URL bar `https://example.com` then `https://www.baidu.com`, menu clock 12:22 PT): `/workspace/net8-example.png`, `/workspace/net8-baidu.png`, and `field-artifacts/net8-*.png`. Logs: `field-artifacts/net8d-safari.out`, `field-artifacts/net8d-webkit-init.log`. Mid-capture `free_mb` dipped to 54–56 with `comp_occ` 10007–10009 (start 9940); after cleanup `CORE_OK`.
+
+### Still open
+
+The crash reason and the system-level hook site are solid; pages are not rendering yet. Either `MSHookFunction` of the ptrauth-signed cache offset is a bad trampoline (so the first call to `InitializeWebKit2` dies before `hooked_InitializeWebKit2` can log a bounce — other shared-cache hooks in this file pass an unsigned `header+offset`), or the helpers now die on a later init path without writing a report. Next: try the unsigned QuartzCore-style address, and/or make the proxy / XPC path deliver the first Application-type event on the main NSRunLoop so stock `InitializeWebKit2` is already on main.
+
