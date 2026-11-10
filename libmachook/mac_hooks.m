@@ -15372,7 +15372,10 @@ static char **macws_wk_peer_envp(const char *peerName) {
         envp[o++] = environ[i];
     }
     char *peer = calloc(1, 13 + 64);
-    char *flags = strdup("XPC_FLAGS=8019");
+    // Unique peers have no inherited SERVICE_SLOT receive; do not
+    // set XPC_FLAGS=8019. The unsandboxed in-chroot probe delivered
+    // without Application-type managed flags.
+    char *flags = strdup("XPC_FLAGS=0");
     char *svc = calloc(1, 17 + 64);
     if (!peer || !flags || !svc) {
         free(peer);
@@ -17622,9 +17625,25 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
     // isMainThread assertion without hooking InitializeWebKit2 or adding
     // a constructor main-queue dispatch_after.
     if (macws_is_webkit_helper_process() && handler) {
-        (void)macws_webkit_reapply_packed_xpc_flags();
-        const char *flags = getenv("XPC_FLAGS");
         const char *peer = getenv(MACWS_WK_PEER_ENV);
+        const int uniquePeer = macws_wk_peer_name_valid(peer);
+        // Fallback helpers still reconstitute Application-type flags
+        // for stock xpc_main. Unique peers have no inherited
+        // SERVICE_SLOT receive (proxy handshake: recv_rights=0,
+        // slot 2 empty). Do not advertise Application-type
+        // XPC_FLAGS=8019 to libxpc — the unsandboxed in-chroot
+        // probe delivered CONNECTION + dictionaries without those
+        // managed flags.
+        if (!uniquePeer)
+            (void)macws_webkit_reapply_packed_xpc_flags();
+        const char *flags = getenv("XPC_FLAGS");
+        if (uniquePeer && !macws_xpc_flags_are_zero(flags)) {
+            setenv("XPC_FLAGS", "0", 1);
+            flags = getenv("XPC_FLAGS");
+            macws_webkit_init_log(
+                "xpc_main WebKit unique peer cleared XPC_FLAGS "
+                "(no inherited receive, skip 8019 reconstitution)");
+        }
         char msg[320];
         snprintf(msg, sizeof(msg),
                  "xpc_main WebKit inherited path service=%s flags=%s "
@@ -17635,7 +17654,7 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                  peer ? peer : "(null)");
         macws_webkit_init_log(msg);
         g_macws_webkit_xpc_main_user = handler;
-        if (macws_wk_peer_name_valid(peer)) {
+        if (uniquePeer) {
             // Anonymous peer via xpc_connection_create(NULL) + endpoint over
             // the inherited / looked-up rendezvous send right. Not a
             // bootstrap name, and not a named Mach LISTENER / public

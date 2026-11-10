@@ -33,15 +33,23 @@ static char *outenv[16];
 
 static void build(char **envp, int isWebKit) {
     const char *incoming = MacWSEnvironmentValue(envp, "XPC_FLAGS");
+    const char *peerEnv = MacWSEnvironmentValue(envp, "MACWS_WK_PEER");
+    const int isUniquePeer = peerEnv &&
+        strstr(peerEnv, "com.macwsguide.wk.i.") != 0;
     static char webkitFlags[] = "XPC_FLAGS=8019";
-    int replaceZeroFlags = isWebKit && MacWSFlagsAreZero(incoming);
+    static char uniqueFlags[] = "XPC_FLAGS=0";
+    int replaceZeroFlags = isWebKit && !isUniquePeer &&
+        MacWSFlagsAreZero(incoming);
+    int normalizeUniqueFlags = isWebKit && isUniquePeer;
     int n = 0;
     for (char **entry = envp; entry && *entry; entry++) {
-        if (replaceZeroFlags && MacWSHasEnvironmentKey(*entry, "XPC_FLAGS"))
+        if ((replaceZeroFlags || normalizeUniqueFlags) &&
+            MacWSHasEnvironmentKey(*entry, "XPC_FLAGS"))
             continue;
         outenv[n++] = *entry;
     }
     if (replaceZeroFlags) outenv[n++] = webkitFlags;
+    else if (normalizeUniqueFlags) outenv[n++] = uniqueFlags;
     outenv[n] = 0;
 }
 
@@ -75,5 +83,29 @@ int main(void) {
     assert(!strcmp(outenv[0], "XPC_FLAGS=0x0"));
     assert(!strcmp(outenv[1], "KEEP=1"));
     assert(outenv[2] == 0);
+    char *unique_zero[] = {
+        "XPC_FLAGS=0x0",
+        "MACWS_WK_PEER=com.macwsguide.wk.i.0123456789abcdef0123456789abcdef",
+        "KEEP=1",
+        0
+    };
+    build(unique_zero, 1);
+    assert(!strcmp(outenv[0],
+        "MACWS_WK_PEER=com.macwsguide.wk.i.0123456789abcdef0123456789abcdef"));
+    assert(!strcmp(outenv[1], "KEEP=1"));
+    assert(!strcmp(outenv[2], "XPC_FLAGS=0"));
+    assert(outenv[3] == 0);
+    char *unique_managed[] = {
+        "XPC_FLAGS=8019",
+        "MACWS_WK_PEER=com.macwsguide.wk.i.0123456789abcdef0123456789abcdef",
+        "KEEP=1",
+        0
+    };
+    build(unique_managed, 1);
+    assert(!strcmp(outenv[0],
+        "MACWS_WK_PEER=com.macwsguide.wk.i.0123456789abcdef0123456789abcdef"));
+    assert(!strcmp(outenv[1], "KEEP=1"));
+    assert(!strcmp(outenv[2], "XPC_FLAGS=0"));
+    assert(outenv[3] == 0);
     return 0;
 }

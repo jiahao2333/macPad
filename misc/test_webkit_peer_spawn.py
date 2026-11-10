@@ -170,6 +170,30 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("inherited[0] != '/'", ENV_H)
         self.assertIn("!inherited[1]", ENV_H)
 
+    def test_unique_peer_skips_managed_xpc_flags(self):
+        # posix_spawn envp must not advertise Application-type 8019.
+        start = HOOKS.index("static char **macws_wk_peer_envp")
+        end = HOOKS.index("static void macws_wk_peer_envp_free")
+        envp = HOOKS[start:end]
+        self.assertIn('strdup("XPC_FLAGS=0")', envp)
+        self.assertNotIn('strdup("XPC_FLAGS=8019")', envp)
+        # Fallback still reapplies 8019; the unique path must not.
+        self.assertIn("macws_webkit_reapply_packed_xpc_flags", HOOKS)
+        self.assertIn("if (!uniquePeer)", HOOKS)
+        self.assertIn("Do not advertise Application-type", HOOKS)
+        self.assertIn("unique peer cleared XPC_FLAGS", HOOKS)
+        self.assertIn("skip 8019 reconstitution", HOOKS)
+        start = HOOKS.index("Anonymous peer via xpc_connection_create(NULL)")
+        end = HOOKS.index("macws_xpc_main_raw(macws_webkit_xpc_main_connection);", start)
+        chunk = HOOKS[start:end]
+        self.assertNotIn("macws_webkit_reapply_packed_xpc_flags", chunk)
+        # Proxy must not reconstitute 8019 when MACWS_WK_PEER is set.
+        self.assertIn("Do not reconstitute XPC_FLAGS=8019", PROXY)
+        self.assertIn('uniqueFlags[] = "XPC_FLAGS=0"', PROXY)
+        self.assertIn("normalizeUniqueFlags", PROXY)
+        self.assertIn("unique_peer=", PROXY)
+        self.assertIn("MACWS_WK_PEER", PROXY)
+
 
 if __name__ == "__main__":
     unittest.main()

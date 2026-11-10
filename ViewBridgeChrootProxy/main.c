@@ -239,7 +239,8 @@ static void MacWSLogWebKitProxyLine(const char *line, size_t len) {
 
 // Host-visible path so the line lands in the chroot /tmp log tree.
 static void MacWSLogWebKitProxyFlags(const char *incoming, const char *outgoing,
-                                     const char *program, const char *target) {
+                                     const char *program, const char *target,
+                                     int uniquePeer) {
     char line[512];
     size_t len = 0;
     MacWSAppendString(line, sizeof(line), &len, "proxy XPC_FLAGS incoming=");
@@ -247,6 +248,9 @@ static void MacWSLogWebKitProxyFlags(const char *incoming, const char *outgoing,
                       incoming && *incoming ? incoming : "(unset)");
     MacWSAppendString(line, sizeof(line), &len, " outgoing=");
     MacWSAppendString(line, sizeof(line), &len, outgoing);
+    MacWSAppendString(line, sizeof(line), &len, " unique_peer=");
+    MacWSAppendUnsigned(line, sizeof(line), &len,
+                        (unsigned long)(uniquePeer ? 1 : 0));
     MacWSAppendString(line, sizeof(line), &len, " program=");
     MacWSAppendString(line, sizeof(line), &len, program);
     MacWSAppendString(line, sizeof(line), &len, " target=");
@@ -548,10 +552,22 @@ int main(int argc, char *argv[], char *envp[]) {
             isWebKit = 1;
     }
     const char *incomingFlags = MacWSEnvironmentValue(envp, "XPC_FLAGS");
+    const char *peerEnv = MacWSEnvironmentValue(envp, "MACWS_WK_PEER");
+    // Unique-peer children have no inherited SERVICE_SLOT receive
+    // (handshake: recv_rights=0). Do not reconstitute XPC_FLAGS=8019
+    // on the stock-image execve: the unsandboxed in-chroot probe
+    // delivered CONNECTION + dictionaries without Application-type
+    // managed flags.
+    const int isUniquePeer = peerEnv &&
+        MacWSStringContains(peerEnv, "com.macwsguide.wk.i.");
     static char webkitFlags[] = "XPC_FLAGS=8019";
-    const int replaceZeroFlags = isWebKit && MacWSFlagsAreZero(incomingFlags);
-    const char *outgoingFlags = replaceZeroFlags ? "8019"
-        : (incomingFlags && *incomingFlags ? incomingFlags : "(unset)");
+    static char uniqueFlags[] = "XPC_FLAGS=0";
+    const int replaceZeroFlags = isWebKit && !isUniquePeer &&
+        MacWSFlagsAreZero(incomingFlags);
+    const int normalizeUniqueFlags = isWebKit && isUniquePeer;
+    const char *outgoingFlags = normalizeUniqueFlags ? "0"
+        : (replaceZeroFlags ? "8019"
+           : (incomingFlags && *incomingFlags ? incomingFlags : "(unset)"));
         const char *program = argc > 0 && argv ? argv[0] : (const char *)0;
         const int alreadyPriv = MacWSEndsWith(program, ".priv");
         const long euid = MacWSSyscall0(MACWS_SYS_geteuid);
@@ -559,7 +575,7 @@ int main(int argc, char *argv[], char *envp[]) {
             MacWSPathHasSlash(program);
         if (isWebKit) {
             MacWSLogWebKitProxyFlags(incomingFlags, outgoingFlags,
-                program, target);
+                program, target, isUniquePeer);
             MacWSLogWebKitProxyHandshake(program, alreadyPriv, willExecPriv);
         }
         // Non-setuid CFBundleExecutable first; only elevate via *.priv when
@@ -582,7 +598,8 @@ int main(int argc, char *argv[], char *envp[]) {
             MacWSHasEnvironmentKey(*entry, MACWS_CHROOT_ROOT_KEY))
             continue;
 #if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
-        if (replaceZeroFlags && MacWSHasEnvironmentKey(*entry, "XPC_FLAGS"))
+        if ((replaceZeroFlags || normalizeUniqueFlags) &&
+            MacWSHasEnvironmentKey(*entry, "XPC_FLAGS"))
             continue;
 #endif
         // Five canonical values plus NULL remain. Reject an oversized launch
@@ -614,6 +631,9 @@ int main(int argc, char *argv[], char *envp[]) {
         if (replaceZeroFlags) {
             if (environmentCount + 1 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
             targetEnvironment[environmentCount++] = webkitFlags;
+        } else if (normalizeUniqueFlags) {
+            if (environmentCount + 1 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
+            targetEnvironment[environmentCount++] = uniqueFlags;
         }
     }
 #endif
