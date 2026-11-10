@@ -17221,6 +17221,15 @@ void macws_xpc_connection_set_instance_early(
         // stock setup/request dictionaries and reply protocol remain intact.
         return;
     }
+    /* Unique-peer connections are already bound via create_from_endpoint.
+     * An instance UUID is launchd MultipleInstances metadata and does
+     * not apply; forwarding it can invalidate the endpoint peer. */
+    const char *wkPeer = macws_xpc_lookup_app_conn_name(connection);
+    if (wkPeer && !strncmp(wkPeer, "com.macwsguide.wk.i.", 20)) {
+        macws_xpc_app_logf("pid=%d wk-peer skip-set-instance peer=%s\n",
+                           getpid(), wkPeer);
+        return;
+    }
     macws_xpc_connection_set_instance_raw(connection, instance);
 }
 
@@ -17504,10 +17513,23 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
         macws_webkit_init_log(msg);
         g_macws_webkit_xpc_main_user = handler;
         if (macws_wk_peer_name_valid(peer)) {
-            // Anonymous listener + endpoint over the inherited rendezvous
-            // send right. Not a bootstrap name and not the public
-            // macosbooter check-in. create_mach_service LISTENER on the
-            // unique name is not look-up-able in this chroot (net21).
+            // Anonymous peer via xpc_connection_create(NULL) + endpoint over
+            // the inherited / looked-up rendezvous send right. Not a
+            // bootstrap name, not a Mach LISTENER, and not the public
+            // macosbooter check-in (create_mach_service LISTENER on the
+            // unique name is not look-up-able in this chroot, net21).
+            //
+            // net24: 30 wk-peer connected and 31 endpoint-send rc=0, but
+            // 0 accepted connections / InitializeWebProcess. Two causes:
+            // 1) This object is the Safari peer; messages arrive as
+            //    dictionaries on it, not as XPC_TYPE_CONNECTION accepts.
+            //    Hand it to the stock xpc_main handler before sending
+            //    the endpoint so the first InitializeWebProcess is not
+            //    dropped. 2) Helpers logged endpoint-send and never
+            //    reached "entering NSApp run" or dispatch_main —
+            //    +[NSApplication sharedApplication] on this stack can
+            //    dispatch_sync a main queue that is not yet running.
+            //    Drain the main queue with dispatch_main() instead.
             mach_port_t rv = macws_wk_rendezvous_send(peer);
             xpc_connection_t listener = macws_xpc_connection_create_raw(
                 NULL, dispatch_get_main_queue());
@@ -17517,11 +17539,9 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                      listener, rv, peer);
             macws_webkit_init_log(msg);
             if (listener) {
-                xpc_connection_set_event_handler(listener, ^(xpc_object_t event) {
-                    if (event && xpc_get_type(event) == XPC_TYPE_CONNECTION)
-                        macws_webkit_xpc_main_connection((xpc_connection_t)event);
-                });
-                xpc_connection_resume(listener);
+                macws_webkit_xpc_main_connection(listener);
+                macws_webkit_init_log(
+                    "xpc_main WebKit unique peer handed to xpc_main handler");
                 xpc_object_t endpoint = xpc_endpoint_create(listener);
                 int src = macws_wk_send_peer_endpoint(endpoint, rv);
                 if (endpoint) xpc_release(endpoint);
@@ -17530,17 +17550,6 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                          "rv=0x%x",
                          src, rv);
                 macws_webkit_init_log(msg);
-                Class nsAppClass = objc_getClass("NSApplication");
-                if (nsAppClass) {
-                    id app = ((id (*)(Class, SEL))objc_msgSend)(
-                        nsAppClass, sel_registerName("sharedApplication"));
-                    if (app) {
-                        macws_webkit_init_log(
-                            "xpc_main WebKit unique peer entering NSApp run");
-                        ((void (*)(id, SEL))objc_msgSend)(
-                            app, sel_registerName("run"));
-                    }
-                }
                 macws_webkit_init_log(
                     "xpc_main WebKit unique peer entering dispatch_main");
                 dispatch_main();

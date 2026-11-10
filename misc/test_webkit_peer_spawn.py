@@ -63,13 +63,26 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("macws_wk_send_peer_endpoint", HOOKS)
         # Must not check in the public remapped name on this path,
         # and must not use a named Mach LISTENER (not look-up-able).
-        start = HOOKS.index("Anonymous listener + endpoint over the inherited")
+        start = HOOKS.index("Anonymous peer via xpc_connection_create(NULL)")
         end = HOOKS.index("macws_xpc_main_raw(macws_webkit_xpc_main_connection);", start)
         chunk = HOOKS[start:end]
         self.assertNotIn("WEBKIT_WEBCONTENT_SERVICE_NEW", chunk)
         self.assertNotIn("bootstrap_check_in", chunk)
         self.assertNotIn("XPC_CONNECTION_MACH_SERVICE_LISTENER", chunk)
         self.assertIn("macws_xpc_connection_create_raw", chunk)
+        # Hand the anonymous peer to WebKit before endpoint-send, and
+        # drain main with dispatch_main — do not call NSApp on this stack.
+        self.assertIn("macws_webkit_xpc_main_connection(listener)", chunk)
+        self.assertIn("handed to xpc_main handler", chunk)
+        self.assertIn("entering dispatch_main", chunk)
+        self.assertNotIn('sel_registerName("sharedApplication")', chunk)
+        self.assertNotIn('sel_registerName("run")', chunk)
+        self.assertLess(
+            chunk.index("macws_webkit_xpc_main_connection(listener)"),
+            chunk.index("xpc_endpoint_create"))
+        self.assertLess(
+            chunk.index("xpc_endpoint_create"),
+            chunk.index("entering dispatch_main"))
 
     def test_rendezvous_is_fail_fast_and_not_bootstrap_lookup(self):
         start = HOOKS.index("#define MACWS_WK_RV_POP_MS 3000")
