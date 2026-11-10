@@ -19,7 +19,13 @@ class WebKitPeerSpawnContract(unittest.TestCase):
 
     def test_client_posix_spawns_proxy_and_skips_add_bundle_on_success(self):
         self.assertIn("macws_xpc_spawn_webkit_peer", HOOKS)
-        self.assertIn("posix_spawn(&child, path, NULL, NULL, argv, envp)", HOOKS)
+        self.assertIn("posix_spawn(&child, path, NULL, &attr, argv, envp)", HOOKS)
+        self.assertIn("posix_spawnattr_set_registered_ports_np", HOOKS)
+        self.assertIn("xpc_connection_create_from_endpoint", HOOKS)
+        self.assertIn("xpc_pipe_simpleroutine", HOOKS)
+        self.assertIn("MACWS_WK_RV_WAIT_MS 150", HOOKS)
+        self.assertNotIn("macws_wk_wait_for_peer", HOOKS)
+        self.assertNotIn("lookup-timeout", HOOKS)
         self.assertIn("macws_wk_leaf_for_public_name", HOOKS)
         # Success path is attempted for public WebKit / SandboxBroker
         # names before any TSV-hit add_bundle / create_fn return.
@@ -47,14 +53,31 @@ class WebKitPeerSpawnContract(unittest.TestCase):
 
     def test_helper_listens_only_on_validated_unique_name(self):
         self.assertIn("macws_wk_peer_name_valid(peer)", HOOKS)
-        self.assertIn("XPC_CONNECTION_MACH_SERVICE_LISTENER", HOOKS)
-        self.assertIn("unique peer listener", HOOKS)
-        # Must not check in the public remapped name on this path.
-        start = HOOKS.index("xpc_main WebKit unique peer listener")
+        self.assertIn("unique peer anonymous listener", HOOKS)
+        self.assertIn("xpc_endpoint_create", HOOKS)
+        self.assertIn("macws_wk_send_peer_endpoint", HOOKS)
+        # Must not check in the public remapped name on this path,
+        # and must not use a named Mach LISTENER (not look-up-able).
+        start = HOOKS.index("Anonymous listener + endpoint over the inherited")
         end = HOOKS.index("macws_xpc_main_raw(macws_webkit_xpc_main_connection);", start)
         chunk = HOOKS[start:end]
         self.assertNotIn("WEBKIT_WEBCONTENT_SERVICE_NEW", chunk)
         self.assertNotIn("bootstrap_check_in", chunk)
+        self.assertNotIn("XPC_CONNECTION_MACH_SERVICE_LISTENER", chunk)
+        self.assertIn("macws_xpc_connection_create_raw", chunk)
+
+    def test_rendezvous_is_fail_fast_and_not_bootstrap_lookup(self):
+        start = HOOKS.index("#define MACWS_WK_RV_WAIT_MS 150")
+        end = HOOKS.index("macws_xpc_create_application_service")
+        chunk = HOOKS[start:end]
+        self.assertIn("macws_wk_recv_peer_endpoint", chunk)
+        self.assertIn("xpc_pipe_receive", chunk)
+        self.assertIn("endpoint-timeout", chunk)
+        self.assertIn("MACWS_WK_RV_SLOT", chunk)
+        self.assertNotIn("bootstrap_look_up(", chunk)
+        self.assertNotIn("usleep(20 * 1000)", chunk)
+        # Cap must stay well under the old 2 s-per-helper stall.
+        self.assertIn("MACWS_WK_RV_WAIT_MS 150", chunk)
 
     def test_sandbox_allows_unique_peer_prefix(self):
         self.assertIn('!strncmp(name, "com.macwsguide.wk.i.", 20)', HOOKS)

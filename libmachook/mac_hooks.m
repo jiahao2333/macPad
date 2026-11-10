@@ -15346,19 +15346,25 @@ static char **macws_wk_peer_envp(const char *peerName) {
             continue;
         if (!strncmp(environ[i], "XPC_FLAGS=", 10))
             continue;
+        if (!strncmp(environ[i], "XPC_SERVICE_NAME=", 17))
+            continue;
         envp[o++] = environ[i];
     }
     char *peer = calloc(1, 13 + 64);
     char *flags = strdup("XPC_FLAGS=8019");
-    if (!peer || !flags) {
+    char *svc = calloc(1, 17 + 64);
+    if (!peer || !flags || !svc) {
         free(peer);
         free(flags);
+        free(svc);
         free(envp);
         return NULL;
     }
     snprintf(peer, 13 + 64, "%s=%s", MACWS_WK_PEER_ENV, peerName);
+    snprintf(svc, 17 + 64, "XPC_SERVICE_NAME=%s", peerName);
     envp[o++] = peer;
     envp[o++] = flags;
+    envp[o++] = svc;
     envp[o] = NULL;
     return envp;
 }
@@ -15367,35 +15373,111 @@ static void macws_wk_peer_envp_free(char **envp) {
     if (!envp) return;
     for (int i = 0; envp[i]; i++) {
         if (!strncmp(envp[i], MACWS_WK_PEER_ENV "=", 13) ||
-            !strncmp(envp[i], "XPC_FLAGS=", 10))
+            !strncmp(envp[i], "XPC_FLAGS=", 10) ||
+            !strncmp(envp[i], "XPC_SERVICE_NAME=", 17))
             free(envp[i]);
     }
     free(envp);
 }
 
-extern kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
-extern mach_port_t bootstrap_port;
-static int macws_wk_wait_for_peer(const char *peerName) {
-    mach_port_t bp = MACH_PORT_NULL;
-    (void)task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
-    if (bp == MACH_PORT_NULL)
-        bp = bootstrap_port;
-    for (int i = 0; i < 100; i++) {
-        mach_port_t sp = MACH_PORT_NULL;
-        kern_return_t kr = bootstrap_look_up(bp, peerName, &sp);
-        if (kr == KERN_SUCCESS && sp != MACH_PORT_NULL) {
-            (void)mach_port_deallocate(mach_task_self(), sp);
-            return 0;
-        }
-        usleep(20 * 1000);
-    }
-    return -1;
+// Unique-name XPC LISTENER objects are not published into the chroot
+// bootstrap (field, net21/net22): bootstrap_look_up returns 1102, and
+// bootstrap_register + create_mach_service LISTENER is "Connection
+// invalid". Hand the helper a COPY_SEND of a parent-owned rendezvous
+// port and receive an anonymous-listener endpoint over xpc_pipe, which
+// is bootstrap-independent. Cap the wait so Safari's application-service
+// thread cannot stall for 2 s per helper. Do not check in or listen on
+// the public macosbooter.WebKit.* name.
+#define MACWS_WK_RV_SLOT 1
+#define MACWS_WK_RV_WAIT_MS 150
+extern int posix_spawnattr_set_registered_ports_np(
+    posix_spawnattr_t *attr, mach_port_t *portarray, unsigned int count);
+extern void *xpc_pipe_create_from_port(mach_port_t port, uint64_t flags);
+extern int xpc_pipe_simpleroutine(void *pipe, xpc_object_t msg);
+extern int xpc_pipe_receive(mach_port_t port, xpc_object_t *msg);
+extern xpc_connection_t macws_xpc_connection_create_raw(
+    const char *, dispatch_queue_t) __asm("_xpc_connection_create");
+
+static void macws_wk_destroy_rendezvous_recv(mach_port_t *recv) {
+    if (!recv || !MACH_PORT_VALID(*recv)) return;
+    (void)mach_port_mod_refs(mach_task_self(), *recv,
+                             MACH_PORT_RIGHT_SEND, -1);
+    (void)mach_port_mod_refs(mach_task_self(), *recv,
+                             MACH_PORT_RIGHT_RECEIVE, -1);
+    *recv = MACH_PORT_NULL;
 }
 
-// Spawn the WebKit chroot proxy ourselves and connect to a unique
-// per-instance Mach listener. iOS launchd/xpcproxy starts the proxy
-// without a SERVICE_SLOT receive right (field, net19). Do not check in
-// or listen on the public macosbooter.WebKit.* name.
+static mach_port_t macws_wk_rendezvous_send_from_slots(void) {
+    mach_port_array_t ports = NULL;
+    mach_msg_type_number_t count = 0;
+    if (mach_ports_lookup(mach_task_self(), &ports, &count) != KERN_SUCCESS)
+        return MACH_PORT_NULL;
+    mach_port_t p = MACH_PORT_NULL;
+    if (ports && count > MACWS_WK_RV_SLOT)
+        p = ports[MACWS_WK_RV_SLOT];
+    if (ports)
+        (void)vm_deallocate(mach_task_self(), (vm_address_t)ports,
+                            count * sizeof(*ports));
+    return p;
+}
+
+static int macws_wk_send_peer_endpoint(xpc_object_t endpoint,
+                                       mach_port_t rendezvousSend) {
+    if (!endpoint || !MACH_PORT_VALID(rendezvousSend)) return -1;
+    void *pipe = xpc_pipe_create_from_port(rendezvousSend, 0);
+    if (!pipe) return -1;
+    xpc_object_t payload = xpc_dictionary_create(NULL, NULL, 0);
+    if (!payload) return -1;
+    xpc_dictionary_set_value(payload, "endpoint", endpoint);
+    int rc = xpc_pipe_simpleroutine(pipe, payload);
+    xpc_release(payload);
+    return rc;
+}
+
+// Fail-fast: wait at most MACWS_WK_RV_WAIT_MS. On timeout, destroy the
+// receive right so the blocked xpc_pipe_receive unblocks. Never use a
+// 2 s bootstrap look-up loop on Safari's application-service thread.
+static xpc_object_t macws_wk_recv_peer_endpoint(mach_port_t *recv, int wait_ms,
+                                                int *timed_out) {
+    if (timed_out) *timed_out = 0;
+    if (!recv || !MACH_PORT_VALID(*recv)) return NULL;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block xpc_object_t msg = NULL;
+    __block int prc = -1;
+    mach_port_t port = *recv;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        xpc_object_t m = NULL;
+        prc = xpc_pipe_receive(port, &m);
+        msg = m;
+        dispatch_semaphore_signal(sem);
+    });
+    long waited = dispatch_semaphore_wait(
+        sem,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_ms * NSEC_PER_MSEC));
+    if (waited != 0) {
+        if (timed_out) *timed_out = 1;
+        macws_wk_destroy_rendezvous_recv(recv);
+        (void)dispatch_semaphore_wait(
+            sem, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC));
+        if (msg) xpc_release(msg);
+        dispatch_release(sem);
+        return NULL;
+    }
+    dispatch_release(sem);
+    if (prc != 0 || !msg) {
+        if (msg) xpc_release(msg);
+        return NULL;
+    }
+    xpc_object_t ep = xpc_dictionary_get_value(msg, "endpoint");
+    if (ep) xpc_retain(ep);
+    xpc_release(msg);
+    return ep;
+}
+
+// Spawn the WebKit chroot proxy ourselves and connect via the inherited
+// rendezvous port. iOS launchd/xpcproxy starts the proxy without a
+// SERVICE_SLOT receive right (field, net19). Do not check in or listen
+// on the public macosbooter.WebKit.* name.
 static xpc_connection_t macws_xpc_spawn_webkit_peer(
         const char *activate, const char *leaf, dispatch_queue_t targetq) {
     if (!activate || !leaf) return NULL;
@@ -15421,26 +15503,89 @@ static xpc_connection_t macws_xpc_spawn_webkit_peer(
 
     char **envp = macws_wk_peer_envp(peer);
     if (!envp) return NULL;
+
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) {
+        macws_wk_peer_envp_free(envp);
+        return NULL;
+    }
+    mach_port_t rvrecv = MACH_PORT_NULL;
+    kern_return_t kr = mach_port_allocate(
+        mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rvrecv);
+    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(rvrecv)) {
+        posix_spawnattr_destroy(&attr);
+        macws_wk_peer_envp_free(envp);
+        macws_xpc_app_logf("pid=%d wk-peer rv-alloc kr=%d\n",
+                           getpid(), (int)kr);
+        return NULL;
+    }
+    kr = mach_port_insert_right(mach_task_self(), rvrecv, rvrecv,
+                                MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) {
+        (void)mach_port_mod_refs(mach_task_self(), rvrecv,
+                                 MACH_PORT_RIGHT_RECEIVE, -1);
+        posix_spawnattr_destroy(&attr);
+        macws_wk_peer_envp_free(envp);
+        macws_xpc_app_logf("pid=%d wk-peer rv-insert kr=%d\n",
+                           getpid(), (int)kr);
+        return NULL;
+    }
+
+    mach_port_array_t pports = NULL;
+    mach_msg_type_number_t pcount = 0;
+    (void)mach_ports_lookup(mach_task_self(), &pports, &pcount);
+    mach_port_t slots[3] = { MACH_PORT_NULL, MACH_PORT_NULL, MACH_PORT_NULL };
+    if (pports && pcount > 0)
+        slots[0] = pports[0];
+    slots[MACWS_WK_RV_SLOT] = rvrecv;
+    if (pports && pcount > 2)
+        slots[2] = pports[2];
+    int sprc = posix_spawnattr_set_registered_ports_np(&attr, slots, 3);
+    if (pports) {
+        (void)vm_deallocate(mach_task_self(), (vm_address_t)pports,
+                            pcount * sizeof(*pports));
+        pports = NULL;
+    }
+    if (sprc != 0) {
+        macws_wk_destroy_rendezvous_recv(&rvrecv);
+        posix_spawnattr_destroy(&attr);
+        macws_wk_peer_envp_free(envp);
+        macws_xpc_app_logf("pid=%d wk-peer set-ports rc=%d errno=%d\n",
+                           getpid(), sprc, errno);
+        return NULL;
+    }
+
     char *argv[] = { path, NULL };
     pid_t child = 0;
-    int rc = posix_spawn(&child, path, NULL, NULL, argv, envp);
+    int rc = posix_spawn(&child, path, NULL, &attr, argv, envp);
+    posix_spawnattr_destroy(&attr);
     macws_wk_peer_envp_free(envp);
     macws_xpc_app_logf(
         "pid=%d wk-peer spawn rc=%d errno=%d child=%d leaf=%s peer=%s path=%s\n",
         getpid(), rc, rc ? errno : 0, (int)child, leaf, peer, path);
-    if (rc != 0 || child <= 0)
-        return NULL;
-
-    if (macws_wk_wait_for_peer(peer) != 0) {
-        macws_xpc_app_logf("pid=%d wk-peer lookup-timeout child=%d peer=%s\n",
-                           getpid(), (int)child, peer);
-        (void)kill(child, SIGKILL);
-        (void)waitpid(child, NULL, WNOHANG);
+    if (rc != 0 || child <= 0) {
+        macws_wk_destroy_rendezvous_recv(&rvrecv);
         return NULL;
     }
 
-    xpc_connection_t conn = macws_xpc_connection_create_mach_service_raw(
-        peer, targetq, 0);
+    int timed_out = 0;
+    xpc_object_t endpoint = macws_wk_recv_peer_endpoint(
+        &rvrecv, MACWS_WK_RV_WAIT_MS, &timed_out);
+    if (!endpoint) {
+        macws_xpc_app_logf(
+            "pid=%d wk-peer endpoint-timeout child=%d peer=%s wait_ms=%d timed_out=%d\n",
+            getpid(), (int)child, peer, MACWS_WK_RV_WAIT_MS, timed_out);
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, WNOHANG);
+        macws_wk_destroy_rendezvous_recv(&rvrecv);
+        return NULL;
+    }
+    macws_wk_destroy_rendezvous_recv(&rvrecv);
+
+    xpc_connection_t conn = xpc_connection_create_from_endpoint(endpoint);
+    xpc_release(endpoint);
+    if (conn && targetq)
+        xpc_connection_set_target_queue(conn, targetq);
     macws_xpc_app_logf("pid=%d wk-peer connected peer=%s conn=%p child=%d\n",
                        getpid(), peer, conn, (int)child);
     if (!conn) {
@@ -17109,14 +17254,17 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
         macws_webkit_init_log(msg);
         g_macws_webkit_xpc_main_user = handler;
         if (macws_wk_peer_name_valid(peer)) {
-            // Unique per-instance listener. Not the public macosbooter name.
-            xpc_connection_t listener =
-                macws_xpc_connection_create_mach_service_raw(
-                    peer, dispatch_get_main_queue(),
-                    XPC_CONNECTION_MACH_SERVICE_LISTENER);
+            // Anonymous listener + endpoint over the inherited rendezvous
+            // send right. Not a bootstrap name and not the public
+            // macosbooter check-in. create_mach_service LISTENER on the
+            // unique name is not look-up-able in this chroot (net21).
+            mach_port_t rv = macws_wk_rendezvous_send_from_slots();
+            xpc_connection_t listener = macws_xpc_connection_create_raw(
+                NULL, dispatch_get_main_queue());
             snprintf(msg, sizeof(msg),
-                     "xpc_main WebKit unique peer listener=%p name=%s",
-                     listener, peer);
+                     "xpc_main WebKit unique peer anonymous listener=%p "
+                     "rv=0x%x name=%s",
+                     listener, rv, peer);
             macws_webkit_init_log(msg);
             if (listener) {
                 xpc_connection_set_event_handler(listener, ^(xpc_object_t event) {
@@ -17124,6 +17272,14 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                         macws_webkit_xpc_main_connection((xpc_connection_t)event);
                 });
                 xpc_connection_resume(listener);
+                xpc_object_t endpoint = xpc_endpoint_create(listener);
+                int src = macws_wk_send_peer_endpoint(endpoint, rv);
+                if (endpoint) xpc_release(endpoint);
+                snprintf(msg, sizeof(msg),
+                         "xpc_main WebKit unique peer endpoint-send rc=%d "
+                         "rv=0x%x",
+                         src, rv);
+                macws_webkit_init_log(msg);
                 Class nsAppClass = objc_getClass("NSApplication");
                 if (nsAppClass) {
                     id app = ((id (*)(Class, SEL))objc_msgSend)(
