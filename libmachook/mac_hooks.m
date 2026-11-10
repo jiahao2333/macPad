@@ -16712,6 +16712,23 @@ static BOOL macws_install_qlsatellite_connection_owner(void) {
 // pass each connection to the original service handler.  Listener-name
 // requests, anonymous sublisteners, replies and protocol delegates remain the
 // unmodified Ventura implementations.
+// Function pointer (xpc_connection_handler_t is not a block type).
+// One xpc_main per process; the captured user handler is process-local.
+static xpc_connection_handler_t g_macws_webkit_xpc_main_user;
+
+static void macws_webkit_xpc_main_connection(xpc_connection_t conn) {
+    char m[192];
+    snprintf(m, sizeof(m),
+             "xpc_main accepted connection=%p main=%d "
+             "(InitializeWebProcess/CreateWebPage ride this conn)",
+             conn, pthread_main_np());
+    macws_webkit_init_log(m);
+    if (conn)
+        xpc_connection_set_target_queue(conn, dispatch_get_main_queue());
+    if (g_macws_webkit_xpc_main_user)
+        g_macws_webkit_xpc_main_user(conn);
+}
+
 void macws_xpc_main(xpc_connection_handler_t handler) {
     const char *program = getprogname();
     const char *service = getenv("XPC_SERVICE_NAME");
@@ -16750,27 +16767,19 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                (!strcmp(program, "com.apple.WebKit.WebContent") ||
                 !strcmp(program, "com.apple.WebKit.Networking") ||
                 !strcmp(program, "com.apple.WebKit.GPU") ||
-                !strcmp(program, "com.apple.Safari.SandboxBroker")) &&
-               service &&
-               (!strcmp(service, "com.macwsguide.webkit.webcontent") ||
-                !strcmp(service, "com.macwsguide.webkit.networking") ||
-                !strcmp(service, "com.macwsguide.webkit.gpu") ||
-                !strcmp(service, "com.macwsguide.safari.sandboxbroker") ||
-                !strcmp(service, WEBKIT_WEBCONTENT_SERVICE_NEW) ||
-                !strcmp(service, WEBKIT_NETWORKING_SERVICE_NEW) ||
-                !strcmp(service, WEBKIT_GPU_SERVICE_NEW) ||
-                !strcmp(service, SAFARI_SANDBOX_BROKER_SERVICE_NEW))) {
-        // Application-type WebKit proxies usually keep xpcproxy context via
-        // xpc_add_bundle. Adapt xpc_main as a fallback when that context is
-        // lost across chroot+exec (same pattern as HIServices).
-        if (!strcmp(program, "com.apple.WebKit.WebContent"))
-            privateMachService = WEBKIT_WEBCONTENT_SERVICE_NEW;
-        else if (!strcmp(program, "com.apple.WebKit.Networking"))
-            privateMachService = WEBKIT_NETWORKING_SERVICE_NEW;
-        else if (!strcmp(program, "com.apple.WebKit.GPU"))
-            privateMachService = WEBKIT_GPU_SERVICE_NEW;
-        else
-            privateMachService = SAFARI_SANDBOX_BROKER_SERVICE_NEW;
+                !strcmp(program, "com.apple.Safari.SandboxBroker"))) {
+        // Application-type (_MultipleInstances + _NSApplicationMain).
+        // xpc_add_bundle + the setuid proxy execve preserves xpcproxy's
+        // one-shot receive right in XPC_FLAGS / XPC_SERVICE_NAME. A new
+        // launchd Mach listener on the same macosbooter.* name check-in
+        // orphans that inherited connection: Safari already holds the
+        // xpcproxy port, WebContent sits in dispatch_main() with no
+        // peer, and InitializeWebProcess / CreateWebPage never arrive.
+        // Do not use the HIServices-style listener fallback here even
+        // when the service name matches. Stock xpc_main consumes the
+        // inherited context; the incoming-connection wrapper below puts
+        // the peer on the main queue (Apple xpcproxy policy).
+        privateMachService = NULL;
     }
     if (privateMachService && getuid() == 0 && geteuid() == 0) {
         xpc_connection_t listener =
@@ -16785,6 +16794,26 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
             xpc_connection_resume(listener);
             dispatch_main();
         }
+    }
+    // WebKit helpers: consume the inherited xpcproxy connection via stock
+    // xpc_main, and set the peer's target queue to main before the service
+    // handler installs its message callback. set_target_queue is called
+    // from this dylib (not a shared-cache interpose), so later
+    // InitializeWebProcess / CreateWebPage events meet WebKit's
+    // isMainThread assertion without hooking InitializeWebKit2 or adding
+    // a constructor main-queue dispatch_after.
+    if (macws_is_webkit_helper_process() && handler) {
+        const char *flags = getenv("XPC_FLAGS");
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "xpc_main WebKit inherited path service=%s flags=%s "
+                 "uid=%d euid=%d (no Mach-listener fallback)",
+                 service ? service : "(null)",
+                 flags ? flags : "(null)",
+                 (int)getuid(), (int)geteuid());
+        macws_webkit_init_log(msg);
+        g_macws_webkit_xpc_main_user = handler;
+        macws_xpc_main_raw(macws_webkit_xpc_main_connection);
     }
     macws_xpc_main_raw(handler);
 }

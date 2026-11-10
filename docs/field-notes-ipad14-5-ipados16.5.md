@@ -937,3 +937,66 @@ The logs do **not** show a dropped compositing port reaching WebContent, because
 ### Paint-path conclusion
 
 Safari chrome still talks to CARenderServer and publishes a capturable AppKit window. example.com and baidu.com are accepted, but the content area stays white because WebContent never constructs a TiledCoreAnimation drawing area and never creates a CAContext. The new logging narrows the gap to *before* layer hosting: UI-process connections to `com.apple.macosbooter.WebKit.WebContent` are created and helpers stay up, yet no XPC events (and no drawing-area / remote-context breadcrumbs) were observed inside WebContent. Next work should follow that IPC path, not a CAContext port retry, and should not reintroduce Safari-path CAContext IMPs or constructor main-queue `dispatch_after`.
+
+## 32. WebKit xpc_main Mach-listener fallback orphans Safari's connection; after exec, XPC_FLAGS is 0x0 (2026-11-10 19:52–19:54 CST)
+
+### Context
+
+net14 (§31, commit 35fb9b2, arm64e CDHash `c1b7b43906bad65e33ba3d832f97e509aafb0bd0`) stayed deployed with a visible Safari window and ~20 living WebContent helpers, but no `InitializeWebProcess` / `CreateWebPage` / drawing-area / CAContext / compositing-port logs inside WebContent. Safari created 20 `com.apple.macosbooter.WebKit.WebContent` connections. The next step was that IPC path, not a CAContext port-retry.
+
+Hard limits unchanged: IconServices kept loaded; no reboot and no 停止 macOS; no SkyLight / CGS / SLS hooks; no extra Safari CAContext IMPs; no constructor main-queue `dispatch_after`; no new exported remapper symbols. Backup and smoke before deploy. If smoke failed or Safari lost its visible window, roll back immediately to net14 (`c1b7b439…`) — the last build with a visible Safari window — and stop, with no second variant.
+
+### What the source showed
+
+`macws_xpc_main` treated WebContent / Networking / GPU / SandboxBroker like HIServices: when `XPC_SERVICE_NAME` was `com.apple.macosbooter.WebKit.*` (or the older `com.macwsguide.webkit.*` names) and the helper ran as root, it created a **new** launchd Mach listener on that name and called `dispatch_main()`, never reaching stock `xpc_main`.
+
+That conflicts with the Application-type design already documented for these proxies (`ServiceType=Application`, `RunLoopType=_NSApplicationMain`, `_MultipleInstances`, CFBundleIdentifier `com.apple.macosbooter.WebKit.WebContent`). `xpc_add_bundle` is supposed to let xpcproxy hand a one-shot receive right through `XPC_FLAGS` / `XPC_*`, and `ViewBridgeChrootProxy` is written to copy those variables across chroot+exec. A second `bootstrap_check_in` of the same name cannot inherit the port Safari already holds. That would leave helpers sitting with no peer — matching the net14 symptoms (helpers `Ss` at ~28 MB, no XPC events inside WebContent, no `xpc_error` on the UI-process connections).
+
+The net9 interpretation (helpers staying up meant events already arrived on the main queue) was not supported once net14 logged `xpc event begin` on that wrap and saw zero hits.
+
+### System-level change (net15)
+
+Skip the HIServices-style Mach-listener fallback for WebKit helpers. Call stock `xpc_main` so it can consume an inherited xpcproxy connection, and before the service's connection handler runs, call `xpc_connection_set_target_queue(conn, dispatch_get_main_queue())` from this dylib (not a shared-cache interpose) so later `InitializeWebProcess` / `CreateWebPage` messages meet WebKit's isMainThread assertion without hooking `InitializeWebKit2` and without a constructor `dispatch_after`. Log the chosen path (`service`, `XPC_FLAGS`, uid) and each accepted connection to `/tmp/macws-webkit-init.log`. No new exported symbols.
+
+Built on the Mac Pro with Theos `FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2`, then `misc/set_macos_version.py` (LC_BUILD_VERSION macOS 13.0), ldid `-S` twice, `codesign -f -s -`, ldid twice again. `_macws_private_bootstrap_service_name` is not exported (168 T symbols per slice).
+
+- arm64e `libmachook.dylib`: 1,479,232 B, CDHash `86f08ac4b4fa875ec61799ce7e991a0576b8b57b`, CandidateCDHash sha1 `2b0e9195c0f12b00f4d0b76c0c42a32e0692c8d0`, file sha1 `7825185d2df86448f5a52eafb823d1ff5d3df414`
+- arm64 `libmachook_arm64.dylib`: 1,486,528 B, CDHash `865811c9ba318d6a56c30c46ebc121428381af62`, CandidateCDHash sha1 `9f94dcbcc8b11b6b20c30a652cbbd6ec7f2c088a`, file sha1 `999fc72fcad5d64255e597c3f7c1f414c3c53dc2`
+
+### Deploy, smoke, one guarded Safari
+
+Deploy at 19:52:16 CST / 03:52:16 PST via nested `/var/jb/usr/bin/sudo -n sh /var/mobile/net15/deploy.sh`. Live net14 (inode 23352813, CDHash `c1b7b43906bad65e33ba3d832f97e509aafb0bd0`) was backed up as rollback tag **`pre-net15-20261110-195216`**. Fresh inodes: rootfs `libmachook.dylib` 23377884 and `libmachook_arm64.dylib` 23377885, also copied to `/var/jb/usr/macOS/lib/`. 40-character CDHashes and sha1 candidates were trusted; 64-character `CandidateCDHashFull sha256` values failed as usual.
+
+Smoke at 19:52:21 CST / 03:52:21 PST: `run_bash.sh` / `launchdchrootexec` inserted `/usr/local/lib/libmachook.dylib` (arch=arm64e) and printed `SMOKE_OK` with rc=0. IconServices 53067 / 53071 stayed `Ss`. `CORE_OK`. Rollback was not used.
+
+One guarded Safari (`/var/mobile/net15/safari.sh`, started 19:52:27 CST / 03:52:27 PST via nested sudo; paint/init/xpc/sandbox logs truncated first; open-url withheld unless launch-path returned `ok=yes`):
+
+- 19:52:31.950 CST / 03:52:31.950 PST: launch-path accepted custom-path pid **55509**.
+- 19:52:43.726 CST / 03:52:43.726 PST: `application-reopen result=window-ready previous-generation=0 current-generation=1` and `launch-app window-ready path=DisplayStream`. Probe line was `ok=yes … message=不支持的操作`; hostd's window-ready record is authoritative (`LAUNCH_WINDOW_OK`).
+- 19:52:46.748 CST / 03:52:46.748 PST: example.com `appkit-accepted`. 19:53:03.764 CST / 03:53:03.764 PST: baidu.com, same pid.
+- Safari RSS ~445 MB (455552 KB). About 20 WebContent helpers plus Networking stayed `Ss`, but every WebContent RSS stayed ~27 MB (27552–27760 KB). GPU was not requested. No `NSISIconImageRepGetCGImage` assertion.
+- Cleanup SIGTERM at 19:53:20.297 CST / 03:53:20.297 PST (`waitpid:signal-15`). No leftover Safari/WebContent (only iOS WebContent pid 703). `CORE_OK`. `comp_occ` 20699 → 20707, under the emergency gate. IconServices still `Ss`. Live dylib remained net15 (inode 23377884). The visible window was not lost, so net14 rollback was not used.
+
+### Screenshots
+
+`/workspace/net15-example.png` (856,009 bytes, 2732×2048, menu-bar clock 03:53): Safari is frontmost, the address bar shows `example.com`, tabs are "Start Page" and "E Untitled", and the content area is **blank white**. `/workspace/net15-baidu.png` (858,678 bytes): after the baidu open, the address bar shows `baidu.com`, a third tab "B Untitled" appeared, and the content area is still white. Same visual result as net13 / net14.
+
+### IPC result — the assumed inherited context is not there
+
+Safari still created the remapped services (22× `created activate=com.apple.macosbooter.WebKit.WebContent`, plus Networking and SandboxBroker). `xpc_add_bundle` still returns `access=-1 errno=62` (ELOOP); `add_bundle_done` still ran and helpers spawned. No `xpc_error`. Sandbox extensions for `com.apple.macosbooter.WebKit.*` were issued. Helpers are the right kind of process (`com.apple.WebKit.WebContent`, root, `pthread_main=1` at `xpc_main`).
+
+Every helper logged:
+
+`xpc_main WebKit inherited path service=com.apple.macosbooter.WebKit.WebContent flags=0x0 uid=0 euid=0 (no Mach-listener fallback)`
+
+(`XPC_FLAGS` is present and equal to `0x0`, not unset). **Zero** `xpc_main accepted connection=` lines. Stock `xpc_main` therefore never delivered a peer to the service handler. There were still no `xpc event begin/end`, no `InitializeWebKit2 call` / `runInitializationCode call` (install still `orig=0x0`, same net8d caveat), no drawing-area `setGeometryFlipped`, no WebContent `remoteContextWithOptions` or dropped-port log, and no `sandbox_check DENY`. Safari chrome still created CGS CAContexts and looked up CARenderServer (`port=0x3c0b`).
+
+So the Mach-listener fallback was the wrong shape, but switching to stock `xpc_main` cannot help until a real xpcproxy receive right exists after chroot+exec. With `XPC_FLAGS=0x0` there is nothing for stock `xpc_main` to consume, and Safari's already-created client connections have no in-process peer. That is why UI-process messages never show up inside WebContent. The `set_target_queue(main)` bounce and the shared-cache `InitializeWebKit2` hook were not reached. This is not a per-app env issue; the generic gap is how the Application-type launch context (or `XPC_FLAGS`) is lost across the setuid chroot proxy.
+
+### What was not done
+
+No second dylib variant. net15 stays deployed (window publish still works; the change is the WebKit `xpc_main` path plus path/flags logging). Rollback copies remain at `pre-net15-20261110-195216` (net14 CDHash `c1b7b43906bad65e33ba3d832f97e509aafb0bd0`); net10b (`cffee750f072127a4fb0cb648357f7abe9c0868e`) is still on the device as an older rollback. No SkyLight hooks, no extra Safari CAContext IMPs, no constructor `dispatch_after`, no remapper export, no reboot, no 停止 macOS. IconServices jobs were left loaded.
+
+### Paint / IPC conclusion
+
+Safari still publishes a capturable window and accepts example.com / baidu.com, but the content area stays white because WebContent never gets a peer XPC connection, so it never runs a drawing-area constructor or creates a CAContext. The earlier Mach-listener fallback could not attach to Safari's existing send right. net15 confirmed that after the proxy `execve`s stock WebContent, `XPC_SERVICE_NAME` is the expected `com.apple.macosbooter.WebKit.WebContent` but `XPC_FLAGS=0x0`, and stock `xpc_main` never accepts a connection. Next work should restore a real xpcproxy (or equivalent) receive right across the chroot+exec transition, not retry CAContext ports and not reintroduce a competing Mach listener on the same name.
