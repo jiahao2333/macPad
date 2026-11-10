@@ -17834,8 +17834,26 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                          "rv=0x%x",
                          src, rv);
                 macws_webkit_init_log(msg);
+                /* net34: 30 accepted peers logged "xpc event off main;
+                 * dispatch_async" after entering dispatch_main, but
+                 * run() / the stock handler never executed. These
+                 * Application-type helpers already load Foundation, so
+                 * the GCD main queue is drained by the main CFRunLoop,
+                 * not by dispatch_main() (which sigsuspends). Bounce
+                 * blocks therefore sat on main forever. Park the helper
+                 * main thread in CFRunLoopRun() so dispatch_async(main,
+                 * run) is actually drained. This is the helper's own
+                 * park after endpoint-send, not a wait on Safari's
+                 * launch thread, and not NSApp -run. Keep dispatch_main
+                 * as a fallback if the run loop is stopped. */
                 macws_webkit_init_log(
-                    "xpc_main WebKit unique peer entering dispatch_main");
+                    "xpc_main WebKit unique peer entering CFRunLoopRun "
+                    "(Foundation owns main queue; dispatch_main would "
+                    "not drain)");
+                CFRunLoopRun();
+                macws_webkit_init_log(
+                    "xpc_main WebKit unique peer CFRunLoopRun returned; "
+                    "entering dispatch_main");
                 dispatch_main();
             }
             macws_webkit_init_log(
