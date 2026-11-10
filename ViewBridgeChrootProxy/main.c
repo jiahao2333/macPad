@@ -1,11 +1,19 @@
 // Freestanding launch stub for macOS XPC services inside the chroot.
 //
 // xpcproxy gives the service process a one-shot launchd receive right in
-// XPC_FLAGS/XPC_*. Preserve that context through a raw chroot/exec transition;
-// do not introduce an intermediate posix_spawn or XPC client initialization.
-// For Application-type WebKit helpers, iOS xpcproxy may leave XPC_FLAGS=0x0
-// on this setuid first image; reconstitute the stock macOS value 8019 so
-// Ventura xpc_main can consume the inherited receive right after execve.
+// XPC_FLAGS/XPC_* and SERVICE_SLOT (mach_ports_register slot 2). Preserve
+// that context through a raw chroot/exec transition; do not introduce an
+// intermediate posix_spawn or XPC client initialization of the public
+// macosbooter name.
+// For Application-type WebKit helpers, iOS xpcproxy leaves XPC_FLAGS=0x0
+// and deposits no receive right when the bundle executable is setuid
+// (setugid XPC services are not allowed). The CFBundleExecutable is
+// therefore shipped mode 0755 so the host xpcproxy / xpc_add_bundle
+// handshake can stash the one-shot right. If this image is still
+// unprivileged after that handshake, exec the setuid sibling (*.priv)
+// before chroot — Mach ports are expected to survive that exec — then
+// reconstitute XPC_FLAGS=8019 if the incoming value is still zero so
+// Ventura xpc_main can consume the inherited right after execve.
 // The transition below calls no libSystem APIs, although the current build
 // still links libSystem (-lSystem in the Makefile and the deployed Mach-O).
 // Calling this executable dependency-free would therefore be inaccurate.
@@ -21,7 +29,11 @@
 #define MACWS_SYS_exit    1
 #define MACWS_SYS_fork    2
 #define MACWS_SYS_chdir  12
+#define MACWS_SYS_getuid  24
+#define MACWS_SYS_geteuid 25
 #define MACWS_SYS_getppid 39
+#define MACWS_SYS_getgid  47
+#define MACWS_SYS_getegid 43
 #define MACWS_SYS_execve 59
 #define MACWS_SYS_chroot 61
 #define MACWS_SYS_setuid 23
@@ -154,10 +166,80 @@ static void MacWSAppendString(char *buf, size_t cap, size_t *len, const char *s)
     while (*s && *len + 1 < cap) buf[(*len)++] = *s++;
 }
 
+static void MacWSAppendUnsigned(char *buf, size_t cap, size_t *len, unsigned long v) {
+    char tmp[24];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v && n < (int)sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (n && *len + 1 < cap) buf[(*len)++] = tmp[--n];
+}
+
+static void MacWSAppendHex(char *buf, size_t cap, size_t *len, unsigned long v) {
+    char tmp[20];
+    int n = 0;
+    MacWSAppendString(buf, cap, len, "0x");
+    if (v == 0) tmp[n++] = '0';
+    while (v && n < (int)sizeof(tmp)) {
+        unsigned d = (unsigned)(v & 0xf);
+        tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        v >>= 4;
+    }
+    while (n && *len + 1 < cap) buf[(*len)++] = tmp[--n];
+}
+
+static int MacWSEndsWith(const char *s, const char *suffix) {
+    if (!s || !suffix) return 0;
+    unsigned n = 0, m = 0;
+    while (s[n]) n++;
+    while (suffix[m]) m++;
+    if (m > n) return 0;
+    s += n - m;
+    while (m) {
+        if (*s != *suffix) return 0;
+        s++;
+        suffix++;
+        m--;
+    }
+    return 1;
+}
+
+static int MacWSPathHasSlash(const char *s) {
+    if (!s) return 0;
+    while (*s) {
+        if (*s == '/') return 1;
+        s++;
+    }
+    return 0;
+}
+
+// libsystem_kernel only: inspect inherited registered ports. Does not
+// unregister them and does not call libxpc.
+typedef unsigned int MacWSMachPort;
+typedef int MacWSKernReturn;
+extern MacWSMachPort mach_task_self_;
+extern MacWSKernReturn mach_ports_lookup(
+    MacWSMachPort task, MacWSMachPort **ports, unsigned int *count);
+extern MacWSKernReturn mach_port_type(
+    MacWSMachPort task, MacWSMachPort name, unsigned int *ptype);
+#define MACWS_MACH_PORT_TYPE_RECEIVE ((unsigned int)0x00020000)
+
+static void MacWSLogWebKitProxyLine(const char *line, size_t len) {
+    static const char path[] = "/var/mnt/rootfs/tmp/macws-webkit-proxy.log";
+    long fd = MacWSCheckedSyscall3(
+        MACWS_SYS_open, (long)path,
+        MACWS_O_WRONLY | MACWS_O_CREAT | MACWS_O_APPEND, MACWS_LOG_MODE);
+    if (fd < 0) return;
+    (void)MacWSSyscall3(MACWS_SYS_write, (const void *)fd, line,
+                        (const void *)len);
+    (void)MacWSSyscall1(MACWS_SYS_close, (const void *)fd);
+}
+
 // Host-visible path so the line lands in the chroot /tmp log tree.
 static void MacWSLogWebKitProxyFlags(const char *incoming, const char *outgoing,
                                      const char *program, const char *target) {
-    static const char path[] = "/var/mnt/rootfs/tmp/macws-webkit-proxy.log";
     char line[512];
     size_t len = 0;
     MacWSAppendString(line, sizeof(line), &len, "proxy XPC_FLAGS incoming=");
@@ -170,13 +252,82 @@ static void MacWSLogWebKitProxyFlags(const char *incoming, const char *outgoing,
     MacWSAppendString(line, sizeof(line), &len, " target=");
     MacWSAppendString(line, sizeof(line), &len, target);
     if (len + 1 < sizeof(line)) line[len++] = '\n';
-    long fd = MacWSCheckedSyscall3(
-        MACWS_SYS_open, (long)path,
-        MACWS_O_WRONLY | MACWS_O_CREAT | MACWS_O_APPEND, MACWS_LOG_MODE);
-    if (fd < 0) return;
-    (void)MacWSSyscall3(MACWS_SYS_write, (const void *)fd, line,
-                        (const void *)len);
-    (void)MacWSSyscall1(MACWS_SYS_close, (const void *)fd);
+    MacWSLogWebKitProxyLine(line, len);
+}
+
+static void MacWSLogWebKitProxyHandshake(const char *program, int alreadyPriv,
+                                         int willExecPriv) {
+    char line[768];
+    size_t len = 0;
+    long uid = MacWSSyscall0(MACWS_SYS_getuid);
+    long euid = MacWSSyscall0(MACWS_SYS_geteuid);
+    long gid = MacWSSyscall0(MACWS_SYS_getgid);
+    long egid = MacWSSyscall0(MACWS_SYS_getegid);
+    MacWSMachPort *ports = 0;
+    unsigned int count = 0;
+    MacWSKernReturn kr = mach_ports_lookup(mach_task_self_, &ports, &count);
+    unsigned recv = 0;
+    MacWSAppendString(line, sizeof(line), &len, "proxy handshake uid=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)uid);
+    MacWSAppendString(line, sizeof(line), &len, " euid=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)euid);
+    MacWSAppendString(line, sizeof(line), &len, " gid=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)gid);
+    MacWSAppendString(line, sizeof(line), &len, " egid=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)egid);
+    MacWSAppendString(line, sizeof(line), &len, " already_priv=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)(alreadyPriv ? 1 : 0));
+    MacWSAppendString(line, sizeof(line), &len, " will_exec_priv=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)(willExecPriv ? 1 : 0));
+    MacWSAppendString(line, sizeof(line), &len, " ports_lookup kr=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)(unsigned int)kr);
+    MacWSAppendString(line, sizeof(line), &len, " count=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)count);
+    if (kr == 0 && ports) {
+        unsigned i;
+        for (i = 0; i < count && i < 4; i++) {
+            unsigned int typ = 0;
+            MacWSAppendString(line, sizeof(line), &len, " [");
+            MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)i);
+            MacWSAppendString(line, sizeof(line), &len, "]=");
+            MacWSAppendHex(line, sizeof(line), &len, (unsigned long)ports[i]);
+            if (ports[i] &&
+                mach_port_type(mach_task_self_, ports[i], &typ) == 0) {
+                MacWSAppendString(line, sizeof(line), &len, " typ=");
+                MacWSAppendHex(line, sizeof(line), &len, (unsigned long)typ);
+                if (typ & MACWS_MACH_PORT_TYPE_RECEIVE) recv++;
+            }
+        }
+    }
+    MacWSAppendString(line, sizeof(line), &len, " recv_rights=");
+    MacWSAppendUnsigned(line, sizeof(line), &len, (unsigned long)recv);
+    MacWSAppendString(line, sizeof(line), &len, " program=");
+    MacWSAppendString(line, sizeof(line), &len, program);
+    if (len + 1 < sizeof(line)) line[len++] = '\n';
+    MacWSLogWebKitProxyLine(line, len);
+}
+
+// If xpcproxy started the non-setuid stub as an unprivileged user, exec
+// the 4755 sibling so chroot can proceed. argv[0] must be an absolute
+// path (xpcproxy provides one). Do not loop if we are already the sibling.
+static int MacWSWebKitExecPrivSibling(const char *program, char *argv[],
+                                      char *envp[]) {
+    static char privPath[1024];
+    size_t n = 0;
+    if (!program || !MacWSPathHasSlash(program) || MacWSEndsWith(program, ".priv"))
+        return 0;
+    while (program[n] && n + 6 < sizeof(privPath)) {
+        privPath[n] = program[n];
+        n++;
+    }
+    privPath[n++] = '.';
+    privPath[n++] = 'p';
+    privPath[n++] = 'r';
+    privPath[n++] = 'i';
+    privPath[n++] = 'v';
+    privPath[n] = 0;
+    (void)MacWSSyscall3(MACWS_SYS_execve, privPath, argv, envp);
+    return 1;
 }
 #endif
 
@@ -394,9 +545,22 @@ int main(int argc, char *argv[], char *envp[]) {
     const int replaceZeroFlags = isWebKit && MacWSFlagsAreZero(incomingFlags);
     const char *outgoingFlags = replaceZeroFlags ? "8019"
         : (incomingFlags && *incomingFlags ? incomingFlags : "(unset)");
-    if (isWebKit)
-        MacWSLogWebKitProxyFlags(incomingFlags, outgoingFlags,
-            argc > 0 && argv ? argv[0] : (const char *)0, target);
+        const char *program = argc > 0 && argv ? argv[0] : (const char *)0;
+        const int alreadyPriv = MacWSEndsWith(program, ".priv");
+        const long euid = MacWSSyscall0(MACWS_SYS_geteuid);
+        const int willExecPriv = isWebKit && euid != 0 && !alreadyPriv &&
+            MacWSPathHasSlash(program);
+        if (isWebKit) {
+            MacWSLogWebKitProxyFlags(incomingFlags, outgoingFlags,
+                program, target);
+            MacWSLogWebKitProxyHandshake(program, alreadyPriv, willExecPriv);
+        }
+        // Non-setuid CFBundleExecutable first; only elevate via *.priv when
+        // this image is still unprivileged. Do not bootstrap_check_in.
+        if (willExecPriv) {
+            if (MacWSWebKitExecPrivSibling(program, argv, envp))
+                MacWSExit(117);
+        }
 #endif
 
     size_t environmentCount = 0;

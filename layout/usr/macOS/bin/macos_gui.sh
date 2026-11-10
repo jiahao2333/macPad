@@ -1699,15 +1699,23 @@ restore_cold_boot_trust() {
         "$@" || return 1
     BASE_TRUST_READY=1
     log "Cold-boot trust closure ready (complete dependency closure; live membership verified)."
-    # Application-type WebKit/Safari proxies are setuid-root so host
-    # xpcproxy can chroot into the rootfs (DockHelper pattern).
-    # macws_admit_rootfs_binary.sh ends with chmod 755; put setuid back
-    # after every cold-boot trust restore.
+    # Application-type WebKit/Safari proxies: the bundle executable must
+    # stay non-setuid so iOS xpcproxy deposits the one-shot receive right
+    # (setugid XPC services are refused). The *.priv sibling is the
+    # setuid-root chroot helper used only when the stub is still
+    # unprivileged. macws_admit_rootfs_binary.sh ends with chmod 755;
+    # restore both modes after every cold-boot trust restore.
     for _macws_proxy in WebContentProxy WebNetworkingProxy WebGPUProxy SafariSandboxProxy; do
-        for _macws_bin in             "$ROOTFS/usr/local/libexec/macws-xpc/WebKit.framework/Versions/A/XPCServices/${_macws_proxy}.xpc/${_macws_proxy}"             "/var/jb/usr/macOS/Frameworks/WebKit.framework/Versions/A/XPCServices/${_macws_proxy}.xpc/${_macws_proxy}"; do
+        for _macws_bin in \
+            "$ROOTFS/usr/local/libexec/macws-xpc/WebKit.framework/Versions/A/XPCServices/${_macws_proxy}.xpc/${_macws_proxy}" \
+            "/var/jb/usr/macOS/Frameworks/WebKit.framework/Versions/A/XPCServices/${_macws_proxy}.xpc/${_macws_proxy}"; do
             if [ -f "$_macws_bin" ]; then
                 chown root:wheel "$_macws_bin" 2>/dev/null || true
-                chmod 4755 "$_macws_bin" || true
+                chmod 0755 "$_macws_bin" || true
+            fi
+            if [ -f "${_macws_bin}.priv" ]; then
+                chown root:wheel "${_macws_bin}.priv" 2>/dev/null || true
+                chmod 4755 "${_macws_bin}.priv" || true
             fi
         done
     done

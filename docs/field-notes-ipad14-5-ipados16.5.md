@@ -1074,3 +1074,42 @@ No second variant. net17 libmachook and net16 proxies stay deployed (window publ
 ### Paint / IPC conclusion
 
 Safari still publishes a capturable window and accepts example.com / baidu.com, but the content area stays white because WebContent never accepts a peer XPC connection, so it never runs InitializeWebProcess / CreateWebPage or creates a CAContext. net17 showed that even when stock `xpc_main` runs with `XPC_FLAGS=8019`, there is no inherited receive right to consume: `mach_ports_lookup` has only a send right in slot 0, empty service/environment slots, and no packed fd. Next work should get a real receive right into the helper task (fix the host-side xpcproxy / `xpc_add_bundle` handshake that should stash Safari's one-shot port, or an equivalent without checking in the public macosbooter name), not retry CAContext ports and not reintroduce a competing Mach listener.
+
+## 35. Non-setuid WebKit stub still has no SERVICE_SLOT receive right (2026-11-10 20:37–20:38 CST / 04:37–04:38 PST)
+
+### What was tried
+
+net17 showed that stock `xpc_main` can run with `XPC_FLAGS=8019` and still never accept a peer, because `mach_ports_lookup` has only a send right in slot 0 and `recv_rights=0`. iOS xpcproxy never deposited an Application-type receive right into the setuid first image. libxpc already refuses setugid XPC services (`running setugid(), which is not allowed`), and iOS xpcproxy itself contains `setuid(%d)` / `Already registered ports` / `No spawn attr blob`. The leading hypothesis for net18 was that shipping the bundle executable as setuid is what caused xpcproxy to skip the one-shot handshake.
+
+net18 keeps net17 libmachook and changes only the WebKit chroot proxies (shared `ViewBridgeChrootProxy/main.c` under `MACWS_WEBKIT_PROXY_EXPERIMENT`). The `CFBundleExecutable` is now mode 0755 so host xpcproxy can complete the Application-type handshake and stash the receive right in `SERVICE_SLOT`. A same-bytes sibling `*.priv` is installed mode 4755; if the stub is still unprivileged after that handshake, it `execve`s the sibling before chroot (Mach ports are expected to survive). The stub also inventories uid/euid and `mach_ports_lookup` to `/tmp/macws-webkit-proxy.log`. Incoming zero `XPC_FLAGS` is still reconstituted to `8019`. No public `macosbooter` check-in, no CAContext port-retry, no competing Mach listener, no libmachook change. `macos_gui.sh` cold-boot trust restore now puts 0755 back on the stub and 4755 on `*.priv`, instead of 4755 on the bundle executable.
+
+### Deploy
+
+Backup tag `pre-net18-20261110-203748` (20:37:48 CST / 04:37:48 PST) saved the live net16 setuid proxies from both trees into `/var/mobile/macws-rollback/proxies.pre-net18-20261110-203748/` (WebContent CDHash `5d3a9cec32167ad654d0796efaf141cbab6345a9`, sha1 `f5d11cd39fd652532a43d42378f9d4f3e5850598`). New thin arm64e proxies (same image for stub and sibling):
+
+- WebContentProxy 84,336 B, jb inode 44300 / rootfs 23451740, CDHash `f10b06cb9c2e329cf9d1600d7dd7a43d5daff5e4` (sha1 `65dca51e7dc42d1228f8a651392968dabd92e6d5`)
+- WebNetworkingProxy 84,352 B, CDHash `0a0d7af7bb4ec9cf7c55bc0d0a61b55595140060` (sha1 `1b0851823e9df2fa541a03a2a2555315d759e4e5`)
+- WebGPUProxy 84,320 B, CDHash `dd005061bba0aba11009599d8500d2ce3654516e` (sha1 `e6652e5e3ae74b88445dc704739732cfa863e246`)
+- SafariSandboxProxy 84,352 B, CDHash `d38fde6be54f36b0db8999c6fd72d839f16aec1f` (sha1 `2f4b5f1da5da8c6d13417062ebe97c234ba4b154`)
+
+Stub mode 0755, `*.priv` mode 4755, both trees. libmachook stayed on net17 (inode 23425648, CDHash `94fa9ceb9ac4f45f1ccb975690d72afe412f83d2`). Smoke at 20:37:58 CST / 04:37:58 PST: `SMOKE_OK` rc=0. IconServices 53067/53071 stayed loaded; iOS agent 1724 was left alone. No reboot, no 停止 macOS.
+
+### Safari run (one guarded attempt)
+
+20:38:05 CST / 04:38:05 PST onward, Safari pid 59506. `LAUNCH_WINDOW_OK`, example.com and baidu.com accepted. Safari RSS grew to ~522 MB (533760–534112 KB), the healthy visible-window class. After example: 26 WebContent helpers plus Networking stayed `Ss` at ~27 MB; after baidu they remained up. GPU was not requested. `comp_occ` 20596 → 20566 (no watchdog). Cleanup CORE_OK (WindowServer 51054, macwshostd 416, SpringBoard 391), WebKit LaunchDaemons unloaded, no leftover macOS Safari/WebContent. Screenshots: `/workspace/net18-example.png` and `/workspace/net18-baidu.png` (2732×2048, clock 04:38 PST), Safari in front, URLs example.com / baidu.com, Start Page + E/B Untitled, content still white. Because the window stayed capturable, net18 was **not** rolled back.
+
+### Field result
+
+In the stock child, `mach_ports_lookup` again succeeded on every helper (`kr=0`, `count=3`, 29 helpers): slot 0 held only a **send** right (`typ=0x10000` = `MACH_PORT_TYPE_SEND`, names such as `0x1403`), and slots 1 and 2 (`ENVIRONMENT_SLOT`, `SERVICE_SLOT`) were `MACH_PORT_NULL`. `recv_rights=0` on all 29 `ports_lookup` lines (58 `recv_rights=0` tokens including the later reapply lines). After the pre-`xpc_main` `setenv`, stock `xpc_main` logged `flags=8019`. **Zero** `xpc_main accepted connection=` lines, no `xpc event`, no `InitializeWebProcess` / `CreateWebPage`, no drawing-area, no WebContent `remoteContextWithOptions`. The five `remoteContextWithOptions` lines were Safari, openAndSavePanel, QuickLookUIService, and the two screencapture processes — not WebContent. `InitializeWebKit2` hook install still `orig=0x0` and was never called. Safari created 28 `com.apple.macosbooter.WebKit.WebContent` connections plus Networking and SandboxBroker, with no `xpc_error`; `add_bundle` still `errno=62` then `add_bundle_done` on the jb Frameworks path.
+
+The first-image proxy log (`/tmp/macws-webkit-proxy.log`) was empty after the run (truncated at start, never rewritten). The child's libmachook inventory is therefore the authoritative handshake result: making the bundle executable non-setuid did not cause iOS xpcproxy to deposit a `SERVICE_SLOT` receive right. Helpers still started, chrooted, and exec'd the stock image as root, so the 0755 stub was sufficient for the privilege/chroot path in this Safari session (the `*.priv` sibling was not required to keep helpers up). Flags were already known not to be the remaining blocker.
+
+So the setuid bit on the first image is not what strips the one-shot port. The remaining host-side gap is the `xpc_add_bundle` / xpcproxy spawn itself: the path Safari registers (`/var/jb/usr/macOS/Frameworks/...`) still fails `access()` inside the chroot with ELOOP (rootfs `/var/jb/usr` is an absolute symlink to `/var/jb/usr`), and iOS xpcproxy still starts the job without an Application-type receive right (`No spawn attr blob` is a plausible match). A `/var/mnt/rootfs/...` add_bundle path is readable in both namespaces but was previously shown to yield Connection interrupted and no helper, and was not retried this turn.
+
+### What was not done
+
+No second variant. net18 proxies stay deployed (window publish still works) with net17 libmachook. Rollback copies remain at `pre-net18-20261110-203748` (net16 proxies, WebContent `5d3a9cec…`, mode 4755, no `*.priv`), `pre-net17-20261110-202135` (net15 dylib `86f08ac4…`), and `pre-net16-20261110-201123`. No SkyLight hooks, no extra Safari CAContext IMPs, no constructor `dispatch_after`, no remapper export, no competing Mach listener, no CAContext port-retry, no reboot, no 停止 macOS. IconServices jobs were left loaded.
+
+### Paint / IPC conclusion
+
+Safari still publishes a capturable window and accepts example.com / baidu.com, but the content area stays white because WebContent never accepts a peer XPC connection, so it never runs InitializeWebProcess / CreateWebPage or creates a CAContext. net18 showed that shipping the WebKit proxy as a non-setuid `CFBundleExecutable` (with a 4755 `*.priv` sibling only for unprivileged chroot) is not enough: after `chroot+exec`, `mach_ports_lookup` still has only a send right in slot 0, empty service/environment slots, and `recv_rights=0`. Next work should fix the host-side `xpc_add_bundle` / xpcproxy handshake so the spawn actually includes Safari's one-shot receive right (for example by making the registered bundle readable inside the chroot without changing the host path that keeps helpers up), or an equivalent that does not check in the public macosbooter name, not retry CAContext ports and not reintroduce a competing Mach listener.
