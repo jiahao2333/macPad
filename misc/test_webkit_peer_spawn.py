@@ -70,23 +70,32 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertNotIn("bootstrap_check_in", chunk)
         self.assertNotIn("XPC_CONNECTION_MACH_SERVICE_LISTENER", chunk)
         self.assertIn("macws_xpc_connection_create_raw", chunk)
-        # Hand the anonymous peer to WebKit before endpoint-send, and
-        # drain main with dispatch_main — do not call NSApp on this stack.
-        self.assertIn("macws_webkit_xpc_main_connection(listener)", chunk)
-        self.assertIn("handed to xpc_main handler", chunk)
+        # Treat create(NULL) as an anonymous LISTENER: accept
+        # XPC_TYPE_CONNECTION, hand that incoming conn to WebKit, and
+        # drain main with dispatch_main — do not call NSApp, and do not
+        # hand the listener itself to the stock xpc_main handler.
+        self.assertIn("XPC_TYPE_CONNECTION", chunk)
+        self.assertIn("macws_webkit_xpc_main_connection(incoming)", chunk)
+        self.assertNotIn("macws_webkit_xpc_main_connection(listener)", chunk)
+        self.assertIn("listening for incoming", chunk)
         self.assertIn("entering dispatch_main", chunk)
         self.assertNotIn('sel_registerName("sharedApplication")', chunk)
         self.assertNotIn('sel_registerName("run")', chunk)
         self.assertLess(
-            chunk.index("macws_webkit_xpc_main_connection(listener)"),
+            chunk.index("XPC_TYPE_CONNECTION"),
+            chunk.index("xpc_endpoint_create"))
+        self.assertLess(
+            chunk.index("xpc_connection_resume(listener)"),
             chunk.index("xpc_endpoint_create"))
         self.assertLess(
             chunk.index("xpc_endpoint_create"),
             chunk.index("entering dispatch_main"))
         self.assertIn("macws_xpc_remember_app_conn(listener, peer)", chunk)
+        self.assertIn("macws_xpc_remember_app_conn(incoming, peer_for_accept)", chunk)
         self.assertLess(
-            chunk.index("macws_xpc_remember_app_conn(listener, peer)"),
-            chunk.index("macws_webkit_xpc_main_connection(listener)"))
+            chunk.index("macws_xpc_remember_app_conn(incoming, peer_for_accept)"),
+            chunk.index("macws_webkit_xpc_main_connection(incoming)"))
+        self.assertIn("wk-peer xpc-event", HOOKS)
 
     def test_rendezvous_is_fail_fast_and_not_bootstrap_lookup(self):
         start = HOOKS.index("#define MACWS_WK_RV_POP_MS 3000")

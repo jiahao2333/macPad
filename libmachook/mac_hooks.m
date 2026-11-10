@@ -15140,12 +15140,19 @@ void macws_xpc_wrap_app_event_handler(
                         typ = "error";
                     else if (xpc_get_type(event) == XPC_TYPE_DICTIONARY)
                         typ = "dictionary";
+                    else if (xpc_get_type(event) == XPC_TYPE_CONNECTION)
+                        typ = "connection";
                     char msg[192];
                     snprintf(msg, sizeof(msg),
                              "xpc event begin type=%s main=%d "
                              "(InitializeWebProcess/CreateWebPage ride this conn)",
                              typ, pthread_main_np());
                     macws_paint_log(msg);
+                    if (hsvc && !strncmp(hsvc, "com.macwsguide.wk.i.", 20))
+                        macws_xpc_app_logf(
+                            "pid=%d wk-peer xpc-event peer=%s conn=%p "
+                            "type=%s helper=1\n",
+                            getpid(), hsvc, connection, typ);
                 }
                 user(event);
                 if (macws_is_webcontent_process()) {
@@ -17526,21 +17533,24 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
         if (macws_wk_peer_name_valid(peer)) {
             // Anonymous peer via xpc_connection_create(NULL) + endpoint over
             // the inherited / looked-up rendezvous send right. Not a
-            // bootstrap name, not a Mach LISTENER, and not the public
+            // bootstrap name, and not a named Mach LISTENER / public
             // macosbooter check-in (create_mach_service LISTENER on the
             // unique name is not look-up-able in this chroot, net21).
             //
-            // net24: 30 wk-peer connected and 31 endpoint-send rc=0, but
-            // 0 accepted connections / InitializeWebProcess. Two causes:
-            // 1) This object is the Safari peer; messages arrive as
-            //    dictionaries on it, not as XPC_TYPE_CONNECTION accepts.
-            //    Hand it to the stock xpc_main handler before sending
-            //    the endpoint so the first InitializeWebProcess is not
-            //    dropped. 2) Helpers logged endpoint-send and never
-            //    reached "entering NSApp run" or dispatch_main —
-            //    +[NSApplication sharedApplication] on this stack can
-            //    dispatch_sync a main queue that is not yet running.
-            //    Drain the main queue with dispatch_main() instead.
+            // net26: Safari skipped set_instance, resumed, and
+            // send_message_with_reply on the create_from_endpoint conn,
+            // helpers had armed a handler and resumed, but 0 xpc event
+            // begin arrived. xpc_connection_create(NULL) is an
+            // anonymous LISTENER: the client attach shows up as
+            // XPC_TYPE_CONNECTION, and InitializeWebProcess dictionaries
+            // ride the accepted connection. net25/net26 handed the
+            // listener itself to WebKit's xpc_main handler (a
+            // dictionary callback) before endpoint-send, so accepts
+            // never reached a connection handler. Arm a CONNECTION
+            // accept handler, resume the listener, send the endpoint,
+            // drain with dispatch_main(), and hand only accepted
+            // connections to the stock handler. Do not call NSApp on
+            // this stack.
             mach_port_t rv = macws_wk_rendezvous_send(peer);
             xpc_connection_t listener = macws_xpc_connection_create_raw(
                 NULL, dispatch_get_main_queue());
@@ -17551,9 +17561,35 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
             macws_webkit_init_log(msg);
             if (listener) {
                 macws_xpc_remember_app_conn(listener, peer);
-                macws_webkit_xpc_main_connection(listener);
+                const char *peer_for_accept = peer;
+                xpc_connection_set_event_handler(listener, ^(xpc_object_t event) {
+                    if (event && xpc_get_type(event) == XPC_TYPE_CONNECTION) {
+                        xpc_connection_t incoming = (xpc_connection_t)event;
+                        char amsg[256];
+                        snprintf(amsg, sizeof(amsg),
+                                 "xpc_main WebKit unique peer incoming "
+                                 "connection=%p listener=%p",
+                                 incoming, listener);
+                        macws_webkit_init_log(amsg);
+                        macws_xpc_remember_app_conn(incoming, peer_for_accept);
+                        macws_webkit_xpc_main_connection(incoming);
+                    } else {
+                        const char *typ = "other";
+                        if (!event)
+                            typ = "null";
+                        else if (xpc_get_type(event) == XPC_TYPE_ERROR)
+                            typ = "error";
+                        char amsg[192];
+                        snprintf(amsg, sizeof(amsg),
+                                 "xpc_main WebKit unique peer listener "
+                                 "event type=%s", typ);
+                        macws_webkit_init_log(amsg);
+                    }
+                });
+                xpc_connection_resume(listener);
                 macws_webkit_init_log(
-                    "xpc_main WebKit unique peer handed to xpc_main handler");
+                    "xpc_main WebKit unique peer listening for incoming "
+                    "connection");
                 xpc_object_t endpoint = xpc_endpoint_create(listener);
                 int src = macws_wk_send_peer_endpoint(endpoint, rv);
                 if (endpoint) xpc_release(endpoint);
