@@ -706,3 +706,39 @@ Not reached. The session can no longer publish a new capturable AppKit window or
 
 A WindowServer or macOS-session restart (or a user-confirmed device reboot) is the likely way to recover window publish, after which net10b Safari should be rechecked before any new logging dylib. Do not reintroduce SkyLight MSHooks, extra Safari CAContext IMPs, or constructor main-queue `dispatch_after`.
 
+## 27. WindowServer restart came back; final composite is still empty (2026-11-10 18:20–18:25 CST)
+
+### Context
+
+The user approved restarting only WindowServer. The iPad was not rebooted, 停止 macOS was not used, and SpringBoard / runningboardd were not restarted. net10b stayed deployed (arm64e CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e`, sha1 `b027e89499f34b6bd3c74b55b66a9439f1b8e1d7`, size 1477120, rootfs inode 23302283). No new logging dylib.
+
+Health at 18:20:43 CST: up 7:23 from the 10:57 CST button reset. `CORE_OK`. WebKit LaunchDaemons unloaded. `comp_occ=16905` (under the emergency gate). GUI was `Ss`. WindowServer was pid 1575 (ppid 1, `Ss`, ~154 MB), macwshostd 416, SpringBoard 391, runningboardd 389.
+
+### Step 1 — WindowServer only
+
+The job has no `KeepAlive`; it is `UIKitApplication:com.macwsguide.windowserver` (`OnDemand=true`), started through `launchdchrootexec` into the SkyLight `WindowServer -virtualonly -daemon`. The project's normal replace path in `macos_gui.sh` is: retire the old pid, then `launchctl start` that label, and wait for a new pid.
+
+At 18:21:50 CST: SIGTERM of 1575 did not exit in 8 s, so that pid alone was SIGKILL'd. Then `launchctl start 'UIKitApplication:com.macwsguide.windowserver'` (rc=0). A new SkyLight WindowServer pid 51054 was `Ss` after 2 s (ppid 1, ~75 MB). SpringBoard 391, macwshostd 416, and runningboardd 389 were unchanged. `WS_RESTART_OK` at 18:22:01 CST. `comp_occ` 16967 → 15231, `free_mb` 15 → 227. Job list after: PID 51054, `LastExitStatus=9`, and `com.apple.macosbooter.CARenderServer` still in `MachServices`.
+
+`macos_gui.sh start` / `stop` / `rebuild-desktop-session` were not used (start/stop can involve SpringBoard/backboardd; rebuild would have killed the new WindowServer again).
+
+### Step 2 — chrome came back; capture and new windows did not
+
+Killing WindowServer dropped Finder, Dock, SystemUIServer, ControlCenter, and OSXvnc (expected). At 18:23:24 CST those five jobs were `launchctl load`'d from `/var/jb/usr/macOS/gui-launchd/com.macwsguide.{finder-desktop,dock,systemuiserver,controlcenter,osxvnc}.plist`. All five were live within 1 s. WindowServer 51054 / hostd 416 / SpringBoard 391 unchanged. By 18:23:46 CST all five were `Ss` (Finder ~72 MB, Dock ~27 MB, SystemUIServer ~38 MB, ControlCenter ~47 MB, OSXvnc ~26 MB).
+
+A desktop `screencapture -x /tmp/ws-restart-desktop.png` at 18:23:46 CST **timed out at 20 s**. Activity Monitor at 18:24:07 CST started (pid 51587, ~35 MB, `S`) but `activity-monitor 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`. It was SIGTERM/SIGKILL'd; none left. `/workspace/ws-restart-desktop.png` was not created. Safari was not started.
+
+`macwsinputd` 51354 and `macwsdisplayd` 51356 were already a new generation (etime ~2:45 at 18:25, i.e. they respawned around 18:22:18, just after the new WindowServer). They are not leftover 7-hour stubs. `macwsallocd` 435 is still the boot-age process.
+
+The new WindowServer's own memdiag (ticks 34–37 in `/var/jb/var/mobile/WindowServer.err`) shows a live process with **no final composite**: `owned_scanout=0`, `composite_stage_contexts=0`, `composite_pending=0`, `shadow_surfaces=0`, `disp_tracked=0`, `lease_live=0`, `iosurf=0/0`, `phys_footprint=29.1MB` / resident ~85 MB. That is why screencapture times out and the probe cannot see a capturable AppKit window even though Finder and Dock are `Ss`.
+
+`CORE_OK` still holds, LaunchDaemons unloaded, `comp_occ` later 8816, `free_mb` 241, uptime still from 10:57 CST.
+
+### What was not done
+
+No Safari run. No new libmachook. No device reboot. No 停止 macOS. No SpringBoard / runningboardd restart. `macos_gui.sh repair-desktop` (which can detect an unhealthy final compositor and request a session rebuild) and `rebuild-desktop-session` were not run.
+
+### Still open
+
+WindowServer alone is not enough to restore a capturable session in this state. The remaining wedge is an empty final composite / scanout on the new generation, despite new input/displayd and relaunched Aqua chrome. The project's next in-session recovery, if approved, is `macos_gui.sh repair-desktop` and, if that reports an unhealthy compositor, the controlled `rebuild-desktop-session` path — not a full device reboot and not 停止 macOS. Re-check desktop capture and Activity Monitor before any Safari or logging dylib.
+
