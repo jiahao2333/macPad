@@ -742,3 +742,23 @@ No Safari run. No new libmachook. No device reboot. No 停止 macOS. No SpringBo
 
 WindowServer alone is not enough to restore a capturable session in this state. The remaining wedge is an empty final composite / scanout on the new generation, despite new input/displayd and relaunched Aqua chrome. The project's next in-session recovery, if approved, is `macos_gui.sh repair-desktop` and, if that reports an unhealthy compositor, the controlled `rebuild-desktop-session` path — not a full device reboot and not 停止 macOS. Re-check desktop capture and Activity Monitor before any Safari or logging dylib.
 
+## 28. iPad already unlocked; capturable windows still wedged (2026-11-10 18:27–18:31 CST)
+
+### Context
+
+The user asked whether uncapturable windows were caused by a locked device/session, and approved unlocking first. No `repair-desktop` / `rebuild-desktop-session`, no device reboot, no 停止 macOS, no new dylib. net10b stayed deployed (arm64e CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e`). The existing `vnckeepalive.py` process (already running) was left in place. Passcode and VNC secrets were not printed or committed.
+
+Health at 18:27:58 CST: up 7:30 from the 10:57 CST button reset. `CORE_OK`. WebKit LaunchDaemons unloaded. `comp_occ=8794`. WindowServer 51054, Finder/Dock/SystemUIServer/ControlCenter/OSXvnc all `Ss`. `trollvncserver` on the device was live (pid 7354).
+
+### Lock state
+
+A TrollVNC framebuffer shot at 18:29:43 CST (2732×2048) showed the macPad host UI and iPad home dock, not an iOS lock screen. The session was **already unlocked**. The swipe-up + HID passcode path was therefore not used (typing a passcode into the visible host UI would have been the wrong target). macOS login/screensaver could not be confirmed via OSXvnc (`localhost:5900`); the iOS-side display was clearly not locked.
+
+### Capture / new-window recheck
+
+Desktop `screencapture` at 18:30:09 CST timed out at 20 s. `/workspace/ws-unlock-desktop.png` was not created. Activity Monitor at 18:30:30 CST started (pid 51738, ~35 MB, `S`) but `activity-monitor 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`. It was cleaned up; no leftovers. `CORE_OK`, LaunchDaemons unloaded, WindowServer 51054 still `Ss`, `comp_occ=8793`. Safari was not started.
+
+### Conclusion
+
+The uncapturable-window / empty final-composite problem is **not** explained by an iOS lock screen. The diagnosis in §27 still stands. Desktop repair / session rebuild remains a later option if approved; it was not run this turn.
+
