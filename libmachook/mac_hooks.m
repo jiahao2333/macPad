@@ -15153,6 +15153,56 @@ static int macws_xpc_app_conn_is_unique_incoming(xpc_connection_t conn) {
     return name && !strncmp(name, "com.macwsguide.wk.i.", 20);
 }
 
+/* Main-thread drain for unique helpers. dispatch_main does not run
+ * dispatch_async(main) once Foundation has attached (net34), and
+ * CFRunLoopRun neither drained those blocks nor kept the Safari
+ * window (net35). This park is a cond-wait loop on the helper main
+ * thread — no CFRunLoop, no NSApp — and runs blocks scheduled by
+ * the incoming wrap so InitializeWebKit2 still sees isMainThread. */
+#define MACWS_WK_MAIN_DRAIN_MAX 64
+static dispatch_block_t g_macws_wk_main_drain_q[MACWS_WK_MAIN_DRAIN_MAX];
+static int g_macws_wk_main_drain_n = 0;
+static pthread_mutex_t g_macws_wk_main_drain_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_macws_wk_main_drain_cv = PTHREAD_COND_INITIALIZER;
+
+static void macws_wk_schedule_on_helper_main(dispatch_block_t block) {
+    if (!block) return;
+    dispatch_block_t copy = Block_copy(block);
+    if (!copy) return;
+    pthread_mutex_lock(&g_macws_wk_main_drain_mu);
+    if (g_macws_wk_main_drain_n < MACWS_WK_MAIN_DRAIN_MAX) {
+        g_macws_wk_main_drain_q[g_macws_wk_main_drain_n++] = copy;
+        pthread_cond_signal(&g_macws_wk_main_drain_cv);
+        pthread_mutex_unlock(&g_macws_wk_main_drain_mu);
+        return;
+    }
+    pthread_mutex_unlock(&g_macws_wk_main_drain_mu);
+    Block_release(copy);
+    macws_webkit_init_log(
+        "xpc_main WebKit unique peer helper-main-drain overflow");
+}
+
+static void macws_wk_helper_main_drain(void) {
+    for (;;) {
+        pthread_mutex_lock(&g_macws_wk_main_drain_mu);
+        while (g_macws_wk_main_drain_n <= 0)
+            pthread_cond_wait(&g_macws_wk_main_drain_cv,
+                              &g_macws_wk_main_drain_mu);
+        dispatch_block_t local[MACWS_WK_MAIN_DRAIN_MAX];
+        int n = g_macws_wk_main_drain_n;
+        for (int i = 0; i < n; i++)
+            local[i] = g_macws_wk_main_drain_q[i];
+        g_macws_wk_main_drain_n = 0;
+        pthread_mutex_unlock(&g_macws_wk_main_drain_mu);
+        for (int i = 0; i < n; i++) {
+            macws_webkit_init_log(
+                "xpc_main WebKit unique peer helper-main-drain invoke");
+            local[i]();
+            Block_release(local[i]);
+        }
+    }
+}
+
 static void macws_xpc_log_and_add_bundle(const char *path, const char *tag) {
     int acc = (path && path[0]) ? access(path, F_OK) : -1;
     int err = (acc == 0) ? 0 : errno;
@@ -15253,9 +15303,18 @@ void macws_xpc_wrap_app_event_handler(
                 run();
                 return;
             }
-            /* Unique incoming conns can be accepted on a background
-             * queue before dispatch_main is draining; dispatch_sync
-             * would deadlock. Async parks the work on the main queue. */
+            /* Unique incoming events arrive on the live serial queue.
+             * Do not dispatch_async onto GCD main (net34: never
+             * drained under dispatch_main) and do not CFRunLoopRun
+             * (net35: still undrained, lost the window). Schedule
+             * run() onto the helper-main-drain started after
+             * endpoint-send. Other helpers keep the GCD bounce. */
+            if (macws_xpc_app_conn_is_unique_incoming(connection)) {
+                macws_webkit_init_log(
+                    "xpc event off main; schedule helper-main-drain");
+                macws_wk_schedule_on_helper_main(run);
+                return;
+            }
             macws_webkit_init_log("xpc event off main; dispatch_async");
             dispatch_async(dispatch_get_main_queue(), run);
         });
@@ -17834,26 +17893,21 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                          "rv=0x%x",
                          src, rv);
                 macws_webkit_init_log(msg);
-                /* net34: 30 accepted peers logged "xpc event off main;
-                 * dispatch_async" after entering dispatch_main, but
-                 * run() / the stock handler never executed. These
-                 * Application-type helpers already load Foundation, so
-                 * the GCD main queue is drained by the main CFRunLoop,
-                 * not by dispatch_main() (which sigsuspends). Bounce
-                 * blocks therefore sat on main forever. Park the helper
-                 * main thread in CFRunLoopRun() so dispatch_async(main,
-                 * run) is actually drained. This is the helper's own
-                 * park after endpoint-send, not a wait on Safari's
-                 * launch thread, and not NSApp -run. Keep dispatch_main
-                 * as a fallback if the run loop is stopped. */
+                /* net34/net35: dispatch_async(main, run) is not
+                 * drained by dispatch_main, and CFRunLoopRun neither
+                 * drained it nor kept the Safari window. Park the
+                 * helper main thread in a cond-wait drain that runs
+                 * blocks scheduled from the incoming wrap. No
+                 * CFRunLoop, no NSApp. dispatch_main stays as
+                 * fallback if the drain ever returns. */
                 macws_webkit_init_log(
-                    "xpc_main WebKit unique peer entering CFRunLoopRun "
-                    "(Foundation owns main queue; dispatch_main would "
-                    "not drain)");
-                CFRunLoopRun();
+                    "xpc_main WebKit unique peer entering helper-main-drain "
+                    "(not CFRunLoopRun; dispatch_main would not drain "
+                    "GCD main)");
+                macws_wk_helper_main_drain();
                 macws_webkit_init_log(
-                    "xpc_main WebKit unique peer CFRunLoopRun returned; "
-                    "entering dispatch_main");
+                    "xpc_main WebKit unique peer helper-main-drain "
+                    "returned; entering dispatch_main");
                 dispatch_main();
             }
             macws_webkit_init_log(

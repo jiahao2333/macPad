@@ -72,18 +72,22 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("macws_xpc_connection_create_raw", chunk)
         # Treat create(NULL) as an anonymous LISTENER: accept
         # XPC_TYPE_CONNECTION, hand that incoming conn to WebKit, and
-        # drain main with CFRunLoopRun (Foundation owns the main
-        # queue; dispatch_main would not drain dispatch_async). Do not
-        # call NSApp, and do not hand the listener itself to the stock
-        # xpc_main handler. dispatch_main remains as a fallback.
+        # park main in helper-main-drain so incoming wrap run() blocks
+        # actually execute (dispatch_main does not drain GCD main;
+        # CFRunLoopRun lost the window). Do not call NSApp or
+        # CFRunLoopRun, and do not hand the listener itself to the
+        # stock xpc_main handler. dispatch_main remains as a fallback.
         self.assertIn("XPC_TYPE_CONNECTION", chunk)
         self.assertIn("macws_webkit_xpc_main_connection(incoming)", chunk)
         self.assertNotIn("macws_webkit_xpc_main_connection(listener)", chunk)
         self.assertIn("listening for incoming", chunk)
-        self.assertIn("entering CFRunLoopRun", chunk)
-        self.assertIn("CFRunLoopRun()", chunk)
+        self.assertIn("entering helper-main-drain", chunk)
+        self.assertIn("macws_wk_helper_main_drain()", chunk)
+        self.assertIn("macws_wk_schedule_on_helper_main", HOOKS)
+        self.assertIn("schedule helper-main-drain", HOOKS)
         self.assertIn("entering dispatch_main", chunk)
         self.assertIn("dispatch_main()", chunk)
+        self.assertNotIn("CFRunLoopRun()", chunk)
         self.assertNotIn('sel_registerName("sharedApplication")', chunk)
         self.assertNotIn('sel_registerName("run")', chunk)
         self.assertLess(
@@ -94,14 +98,9 @@ class WebKitPeerSpawnContract(unittest.TestCase):
             chunk.index("xpc_endpoint_create"))
         self.assertLess(
             chunk.index("xpc_endpoint_create"),
-            chunk.index("entering CFRunLoopRun"))
-        # Park is CFRunLoopRun(), with dispatch_main() only as fallback
-        # after the run loop returns (ignore earlier comments).
+            chunk.index("entering helper-main-drain"))
         self.assertLess(
-            chunk.index("entering CFRunLoopRun"),
-            chunk.index("CFRunLoopRun returned"))
-        self.assertLess(
-            chunk.rindex("CFRunLoopRun();"),
+            chunk.index("macws_wk_helper_main_drain();"),
             chunk.rindex("dispatch_main();"))
         self.assertIn("macws_xpc_remember_unique_listener(listener, peer)", chunk)
         self.assertNotIn("macws_xpc_remember_app_conn(listener, peer)", chunk)
