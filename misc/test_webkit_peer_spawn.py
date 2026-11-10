@@ -98,6 +98,14 @@ class WebKitPeerSpawnContract(unittest.TestCase):
         self.assertIn("xpc_endpoint_copy_listener_port_4sim", HOOKS)
         self.assertIn("xpc_endpoint_create_mach_port_4sim", HOOKS)
         self.assertIn("wk-peer recv-endpoint", HOOKS)
+        self.assertIn("kept_port=", HOOKS)
+        self.assertIn("p->ep_port = pport", HOOKS)
+        # net28 deallocated the 4sim send right after preferring
+        # the rebuilt endpoint; net29 must keep that right.
+        recv = HOOKS[HOOKS.index("net28 deallocated pport"):HOOKS.index("wk-peer ready child=")]
+        self.assertIn("p->ep_port = pport", recv)
+        self.assertIn("kept = 1", recv)
+        self.assertIn("pport = MACH_PORT_NULL", recv)
         self.assertLess(
             chunk.index("macws_xpc_remember_app_conn(incoming, peer_for_accept)"),
             chunk.index("macws_webkit_xpc_main_connection(incoming)"))

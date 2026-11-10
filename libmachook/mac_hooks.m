@@ -15542,6 +15542,9 @@ typedef struct {
     char peer[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1];
     dispatch_semaphore_t ready;
     xpc_object_t endpoint;
+    /* Send right the 4sim-rebuilt endpoint may still name. Do not
+     * deallocate while the endpoint / connection can be used. */
+    mach_port_t ep_port;
 } macws_wk_pending_t;
 
 static macws_wk_pending_t g_macws_wk_pending[MACWS_WK_PENDING_MAX];
@@ -15631,14 +15634,26 @@ static void macws_wk_arm_pending_receive(macws_wk_pending_t *p) {
             macws_wk_ep_from_port_fn from_port = macws_wk_ep_from_port();
             if (from_port && MACH_PORT_VALID(pport))
                 rebuilt = from_port(pport);
+            /* net28 deallocated pport after preferring the rebuilt
+             * endpoint. xpc_endpoint_create_mach_port_4sim may wrap
+             * that right without consuming it, leaving a dead name;
+             * Safari then vanished before create_from_endpoint. Keep
+             * the send right for the life of the endpoint. Only
+             * drop a port we did not hand to 4sim. */
+            int kept = 0;
+            if (rebuilt) {
+                ep = rebuilt;
+                p->ep_port = pport;
+                pport = MACH_PORT_NULL;
+                kept = 1;
+            } else if (ep) {
+                xpc_retain(ep);
+            }
             macws_xpc_app_logf(
                 "pid=%d wk-peer recv-endpoint typ=%s port=0x%x port_typ=0x%x "
-                "rebuilt=%p\n",
-                getpid(), eptyp, (unsigned)pport, ptyp, rebuilt);
-            if (rebuilt)
-                ep = rebuilt;
-            else if (ep)
-                xpc_retain(ep);
+                "rebuilt=%p kept_port=%d\n",
+                getpid(), eptyp, (unsigned)(kept ? p->ep_port : pport),
+                ptyp, rebuilt, kept);
             if (MACH_PORT_VALID(pport))
                 (void)mach_port_deallocate(mach_task_self(), pport);
             if (ep) {
@@ -15912,6 +15927,8 @@ static xpc_connection_t macws_xpc_spawn_webkit_peer(
             endpoint = slot->endpoint;
             slot->endpoint = NULL;
             slot->taken = 1;
+            /* Leave slot->ep_port allocated. create_from_endpoint and
+             * the resulting connection may still name that send right. */
             macws_wk_leaf_mark_waited_locked(leaf, 0);
         }
     });
