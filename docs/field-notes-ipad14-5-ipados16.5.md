@@ -519,3 +519,30 @@ Screenshots of the net8d attempt (Favorites start page, URL bar `https://example
 
 The crash reason and the system-level hook site are solid; pages are not rendering yet. Either `MSHookFunction` of the ptrauth-signed cache offset is a bad trampoline (so the first call to `InitializeWebKit2` dies before `hooked_InitializeWebKit2` can log a bounce — other shared-cache hooks in this file pass an unsigned `header+offset`), or the helpers now die on a later init path without writing a report. Next: try the unsigned QuartzCore-style address, and/or make the proxy / XPC path deliver the first Application-type event on the main NSRunLoop so stock `InitializeWebKit2` is already on main.
 
+## 22. XPC main-queue delivery keeps Safari helpers up (2026-11-10 16:34–16:36 CST / 00:34–00:36 PT)
+
+### Why the net8d hook never logged a bounce
+
+net8d installed `InitializeWebKit2` at UUID+126596 but `hooked_InitializeWebKit2` never ran. Two checks in this build:
+
+1. **`MSHookFunction` needs the unsigned `header+offset`**, matching the QuartzCore / OSXvnc shared-cache offset hooks in `mac_hooks.m`. A `ptrauth_sign_unauthenticated` pointer can make Ellekit/Substrate treat PAC bits as part of the VA. This build passes the unsigned address.
+2. Even with the unsigned address, **the hook still does not intercept**. Install logs `hooked InitializeWebKit2 via offset-unsigned sym=0x1bddf0e84 orig=0x0` and `hooked runInitializationCode raw=0x1be00df28 orig=0x0` (PACIBSP prologues matched at both crash-derived offsets). There were **zero** `InitializeWebKit2 call` / `runInitializationCode call` / `xpc event off main` lines, so neither hooked function nor the off-main XPC wrapper body ran. `orig=0x0` means `MSHookFunction` did not produce a trampoline for these shared-cache text addresses; the real functions stay unhooked.
+
+The instruction at `WebContentServiceInitializer+196` (offset 125852) is `0xd10103a0` (`sub`), then `0x94088239` (`BL` at 125856) to `0x1be011484`, which is **neither** `InitializeWebKit2` (`0x1bddf0e84`) nor `runInitializationCode` (`0x1be00df28`). So 125852 is not the BL that enters init; the IPS `symbolLocation` is a return-address or nearby instruction, not a direct BL at that exact offset. The crash stack still names `InitializeWebKit2` / `runInitializationCode` at those function starts; the hook sites themselves are the right functions, but shared-cache hooking of them is not reliable here.
+
+### System-level alternative (this is what changed the run)
+
+In `macws_xpc_wrap_app_event_handler`, for WebContent / Networking / GPU / SandboxBroker only: `xpc_connection_set_target_queue(connection, dispatch_get_main_queue())`, and if a handler still runs off-main, `dispatch_sync` to the main queue. That is the Application-type policy Apple's xpcproxy would have applied before our setuid chroot proxy `execve`'d the stock image. No "xpc event off main" log means either the target-queue change already delivered events on main, or the helper's `set_event_handler` path did not go through this wrap (the stay-up result below argues the former).
+
+### Guarded Safari (one attempt)
+
+Deploy net9, no macOS restart. arm64e CDHash `3d692dc0936f4ade31f6d10023f33986f01651ff` (sha1 `a37c1ca904c6501e4efcf7dd43aae91f11d56b26`), arm64 `bf746a243a0f47b8ba4e95aff247cf06a33ab8cf`. Fresh inodes 44191 / 23173352. Rollback `*.pre-net9-20261110-163407`.
+
+Safari pid 34430 launched (~329 MB) and received both weblocs. **Helpers stayed up for the whole window** (unlike net7/net8d respawn loops): one Networking (pid 34450, `Ss`, ~28 MB, etime 28 s after example / 45 s after baidu) plus a dozen WebContent processes (`Ss`, ~28 MB, etimes 15–45 s). **Zero** `Connection interrupted` / `Connection invalid`. TSV-hits: WebContent ×12 then ×14, Networking ×1, SandboxBroker ×1, jb Frameworks path, `access=-1 errno=62` as expected. **No GPU process** appeared. No new WebKit `.ips` (last remain the 15:35 CST net7 reports). Hook log: 16 helper pids installed both hooks, never a call. Mid-capture `free_mb` 26–48, `comp_occ` 9950 → 12518 (not a watchdog spike). After cleanup `CORE_OK`, no leftover macOS Safari/helpers, LaunchDaemons unloaded, uptime still from the 10:57 CST button reset.
+
+Screenshots (menu clock 12:35 PT): `/workspace/net9-example.png`, `/workspace/net9-baidu.png`, `field-artifacts/net9-*.png`. This is the first run that **left the Favorites start page**. The URL bar shows `example.com` / `baidu.com` with a loading indicator; baidu grew a "B" favicon tab. The content area stayed **blank white** — navigation and networking started, compositing/paint did not finish. Logs: `field-artifacts/net9-safari.out`, `field-artifacts/net9-webkit-init.log`.
+
+### Still open
+
+Function-offset `MSHookFunction` on this WebKit shared-cache text is not a reliable intercept (`orig=0`). The XPC main-queue path is the working system-level fix for the isMainThread assert and keeps helpers up. Next is why the page stays blank with a loading bar while WebContent/Networking are `Ss` — the missing GPU process is the leading lead.
+

@@ -5643,13 +5643,41 @@ static bool macws_is_webkit_helper_process(void) {
 }
 
 static void hooked_InitializeWebKit2(void) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "InitializeWebKit2 call orig=%p",
+             (void *)(uintptr_t)orig_InitializeWebKit2);
+    macws_webkit_init_log(msg);
     if (pthread_main_np()) {
         orig_InitializeWebKit2();
+        macws_webkit_init_log("InitializeWebKit2 orig returned");
         return;
     }
     macws_webkit_init_log("InitializeWebKit2 off main; dispatch_sync");
     dispatch_sync(dispatch_get_main_queue(), ^{
         orig_InitializeWebKit2();
+        macws_webkit_init_log("InitializeWebKit2 orig returned on main");
+    });
+}
+
+// The RELEASE_ASSERT lives in runInitializationCode, called via
+// std::call_once from InitializeWebKit2. Hook it too in case the
+// InitializeWebKit2 site is a thunk, PACIA auth, or is inlined at a
+// different address than the crash-derived function start.
+static void (*orig_runInitializationCode)(void *);
+static void hooked_runInitializationCode(void *context) {
+    char msg[192];
+    snprintf(msg, sizeof(msg), "runInitializationCode call orig=%p ctx=%p",
+             (void *)(uintptr_t)orig_runInitializationCode, context);
+    macws_webkit_init_log(msg);
+    if (pthread_main_np()) {
+        orig_runInitializationCode(context);
+        macws_webkit_init_log("runInitializationCode orig returned");
+        return;
+    }
+    macws_webkit_init_log("runInitializationCode off main; dispatch_sync");
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        orig_runInitializationCode(context);
+        macws_webkit_init_log("runInitializationCode orig returned on main");
     });
 }
 
@@ -5657,7 +5685,12 @@ static void hooked_InitializeWebKit2(void) {
 // InitializeWebKit2 is not in the shared-cache export trie (MSFindSymbol and
 // dlsym both miss), but IPS imageOffset 126680 symbolLocation 84 pins the
 // start at +126596 in UUID 72317905-49DA-3A07-A8C1-D93B91F653CB.
-enum { kMacWSInitializeWebKit2Offset = 126596 };
+enum {
+    kMacWSInitializeWebKit2Offset = 126596,
+    kMacWSRunInitializationCodeOffset = 2342696,
+    kMacWSWebContentServiceInitializerOffset = 125656,
+    kMacWSWebContentServiceInitializerCall = 125852,
+};
 static const uint8_t kMacWSWebKitUUID[16] = {
     0x72, 0x31, 0x79, 0x05, 0x49, 0xda, 0x3a, 0x07,
     0xa8, 0xc1, 0xd9, 0x3b, 0x91, 0xf6, 0x53, 0xcb,
@@ -5682,21 +5715,61 @@ static bool macws_header_uuid_equals(const struct mach_header *header,
     return false;
 }
 
-static void *macws_resolve_initializewebkit2_by_offset(const struct mach_header *header) {
+// Shared-cache offset hooks elsewhere in this file (QuartzCore
+// enable_frame_info_tag_list, OSXvnc rfbGetFB) pass an unsigned
+// header+offset to MSHookFunction. A ptrauth-signed pointer can make
+// Ellekit/Substrate hook the wrong address (PAC bits in the VA) so the
+// real InitializeWebKit2 keeps running unhooked — which matches net8d:
+// install logged, but hooked_InitializeWebKit2 never ran.
+static void *macws_resolve_webkit_text_offset(const struct mach_header *header,
+                                              uint32_t offset,
+                                              const char *label) {
     if (!header || !macws_header_uuid_equals(header, kMacWSWebKitUUID))
         return NULL;
     const uint32_t *words =
-        (const uint32_t *)((const uint8_t *)header + kMacWSInitializeWebKit2Offset);
-    // arm64e C++ functions in this image start with PACIBSP.
+        (const uint32_t *)((const uint8_t *)header + offset);
     if (words[0] != 0xd503237f) {
-        char msg[96];
+        char msg[128];
         snprintf(msg, sizeof(msg),
-                 "InitializeWebKit2 prologue mismatch 0x%08x", words[0]);
+                 "%s prologue mismatch 0x%08x", label ? label : "?", words[0]);
         macws_webkit_init_log(msg);
         return NULL;
     }
-    return ptrauth_sign_unauthenticated((void *)(uintptr_t)words,
-                                        ptrauth_key_function_pointer, 0);
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "%s raw=%p words=%08x %08x %08x %08x",
+             label ? label : "?", (const void *)words,
+             words[0], words[1], words[2], words[3]);
+    macws_webkit_init_log(msg);
+    return (void *)(uintptr_t)words;
+}
+
+static void macws_log_webkit_service_initializer_callsite(
+        const struct mach_header *header) {
+    if (!header || !macws_header_uuid_equals(header, kMacWSWebKitUUID))
+        return;
+    const uint8_t *base = (const uint8_t *)header;
+    const uint32_t *w =
+        (const uint32_t *)(base + kMacWSWebContentServiceInitializerCall);
+    uint32_t insn = w[0];
+    char msg[220];
+    if ((insn & 0xFC000000u) == 0x94000000u) {
+        int32_t imm26 = (int32_t)(insn & 0x03FFFFFFu);
+        if (imm26 & 0x02000000)
+            imm26 |= ~0x03FFFFFF;
+        const uint8_t *target = (const uint8_t *)w + ((intptr_t)imm26 << 2);
+        snprintf(msg, sizeof(msg),
+                 "WebContentServiceInitializer+196 BL %p init2=%p runInit=%p %s",
+                 (const void *)target,
+                 (const void *)(base + kMacWSInitializeWebKit2Offset),
+                 (const void *)(base + kMacWSRunInitializationCodeOffset),
+                 target == base + kMacWSInitializeWebKit2Offset ? "MATCH" : "MISMATCH");
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "WebContentServiceInitializer+196 insn=0x%08x 0x%08x 0x%08x 0x%08x",
+                 w[0], w[1], w[2], w[3]);
+    }
+    macws_webkit_init_log(msg);
 }
 
 static void macws_install_webkit_init_mainthread(const struct mach_header *header) {
@@ -5705,6 +5778,7 @@ static void macws_install_webkit_init_mainthread(const struct mach_header *heade
     if (atomic_exchange_explicit(&g_macws_webkit_init_hooked, true,
                                  memory_order_acq_rel))
         return;
+    macws_log_webkit_service_initializer_callsite(header);
     void *sym = NULL;
     if (header) {
         sym = MSFindSymbol((MSImageRef)header,
@@ -5719,8 +5793,9 @@ static void macws_install_webkit_init_mainthread(const struct mach_header *heade
         sym = dlsym(RTLD_DEFAULT, "__ZN6WebKit16InitializeWebKit2Ev");
     const char *how = "symbol";
     if (!sym && header) {
-        sym = macws_resolve_initializewebkit2_by_offset(header);
-        how = "offset";
+        sym = macws_resolve_webkit_text_offset(
+            header, kMacWSInitializeWebKit2Offset, "InitializeWebKit2");
+        how = "offset-unsigned";
     }
     if (!sym) {
         atomic_store_explicit(&g_macws_webkit_init_hooked, false,
@@ -5729,9 +5804,24 @@ static void macws_install_webkit_init_mainthread(const struct mach_header *heade
     }
     MSHookFunction(sym, (void *)hooked_InitializeWebKit2,
                    (void **)&orig_InitializeWebKit2);
-    char msg[80];
-    snprintf(msg, sizeof(msg), "hooked InitializeWebKit2 via %s", how);
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "hooked InitializeWebKit2 via %s sym=%p orig=%p",
+             how, sym, (void *)(uintptr_t)orig_InitializeWebKit2);
     macws_webkit_init_log(msg);
+
+    void *run = macws_resolve_webkit_text_offset(
+        header, kMacWSRunInitializationCodeOffset, "runInitializationCode");
+    if (run) {
+        MSHookFunction(run, (void *)hooked_runInitializationCode,
+                       (void **)&orig_runInitializationCode);
+        snprintf(msg, sizeof(msg),
+                 "hooked runInitializationCode raw=%p orig=%p",
+                 run, (void *)(uintptr_t)orig_runInitializationCode);
+        macws_webkit_init_log(msg);
+    } else {
+        macws_webkit_init_log("runInitializationCode hook skipped");
+    }
 }
 
 __attribute__((constructor))
@@ -14634,6 +14724,27 @@ void macws_xpc_wrap_app_event_handler(
         xpc_connection_t connection, xpc_handler_t handler,
         void (*orig)(xpc_connection_t, xpc_handler_t)) {
     if (!orig) return;
+    // Helper-side: Apple's xpcproxy would deliver Application-type
+    // events on the main NSRunLoop. After our setuid chroot proxy
+    // execve's the stock image, the first event can arrive on a
+    // libdispatch queue. Force the connection target queue and bounce
+    // any off-main handler onto the main queue so InitializeWebKit2's
+    // isMainThread assertion holds.
+    if (macws_is_webkit_helper_process() && handler) {
+        xpc_connection_set_target_queue(connection, dispatch_get_main_queue());
+        xpc_handler_t user = handler;
+        orig(connection, ^(xpc_object_t event) {
+            if (pthread_main_np()) {
+                user(event);
+                return;
+            }
+            macws_webkit_init_log("xpc event off main; dispatch_sync");
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                user(event);
+            });
+        });
+        return;
+    }
     const char *svc = macws_xpc_lookup_app_conn_name(connection);
     if (!svc || !handler) {
         orig(connection, handler);
