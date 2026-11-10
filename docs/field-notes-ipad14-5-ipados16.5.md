@@ -1840,3 +1840,51 @@ No clearly window-safe alternative is identified on this turn (including “run 
 ### Paint / IPC conclusion
 
 No new Safari run. The diagnosed reason `user(event)` does not return is the stock bootstrap path’s `WorkQueue::main().dispatchSync` → `WebContentServiceInitializer` / `WTF::initializeMainThread` / `InitializeWebKit2` requiring a live process-main CFRunLoop. net36 deadlocked on the `dispatch_sync_f(main)` wait; net37 inlined that wait and then hung inside the initializer after binding or waiting on the wrong (or unpumped) main `RunLoop`. `0 InitializeWebKit2 call` cannot be read as “IW2 never entered” because the offset hook still has `orig=0x0`. No window-safe fix was deployed. Device remains on net34; content-area paint and WebContent CAContext remain unreached from this unique-peer path.
+
+## 56. Application-type bring-up probe: SERVICE_SLOT becomes a dead name after chroot+exec; stock xpc_main then SIGTRAPs (2026-11-11 01:19–01:24 CST / 2026-11-10 09:19–09:24 PT)
+
+Standalone, generic (not Safari-only) probe of the system-level first-image path. No Safari launch, no new libmachook, no change to the live net34 WebKit install, no reboot, no 停止 macOS. IconServices 1724 / 53067 / 53071 stayed loaded. `com.macwsguide.webkit.*` LaunchDaemons stayed unloaded. No public `macosbooter.WebKit.*` check-in and no competing Mach listener on that name. Device remained on net34: libmachook arm64e `d774151c50fb3e893c1d93f3d7df0063e200bc7b` / arm64 `6724bb1f417ae8fd618689b9ff0c4fc9184465ce`, pre- and post-flight identical. Rollback tag `pre-net37-20261111-001219` was not used.
+
+Sources (no binaries on the PR): `misc/appsvc_probe/` (`probe_proxy.c`, `probe_appsvc.c`, `probe_client.c`, `Info.plist` with `ServiceType=Application` and `RunLoopType=_NSApplicationMain`, `build.sh`, `run_probe.sh`). Throwaway on-device paths only: `/var/mobile/appsvc-probe/` and `/var/mnt/rootfs/tmp/macws-appsvc-probe.xpc/` (byte-copied after signing on the mobile vnode; no `ldid` on the rootfs vnode).
+
+### What the first image did
+
+The iOS-host proxy (`probe_proxy`, arm64e) allocated a RECEIVE right, `mach_port_insert_right` MAKE_SEND, `mach_ports_register` into `SERVICE_SLOT` (slot 2) while preserving `NAME_SERVER` / `ENVIRONMENT`, `bootstrap_register` under `com.macwsguide.probe.appsvc.<pid>` (not `macosbooter.WebKit.*`), then `chroot(/var/mnt/rootfs)` + `execve` of the macOS test service with `XPC_FLAGS=8019`. Before exec, `mach_ports_lookup` was:
+
+`count=3 [0]=SEND typ=0x10000 [1]=0 [2]=RECV typ=0x30000 recv_rights=1`
+
+(`register` kr=0). That is the layout the proxy comments in `ViewBridgeChrootProxy/main.c` expect to survive a same-task `chroot`+`execve`.
+
+### A macOS image cannot start after this chroot without the live libmachook
+
+The first three exec attempts never reached the test service `main`:
+
+- iOS-built, `set_macos_version`-patched arm64e service: `Trace/BPT trap: 5` (wait 133), after `malloc: nano zone abandoned due to inability to reserve vm space`.
+- Genuine macOS 13 arm64e (Xcode 26 SDK, `-target arm64e-apple-macos13`): same SIGTRAP.
+- Genuine macOS 13 arm64 (the arch used by `launchservicesd` / other in-chroot custom executables): same SIGTRAP, still no constructor log.
+
+A control on the same iOS-side `chroot /var/mnt/rootfs` path showed this is not specific to the probe binary: **stock Ventura `/bin/echo` and `/bin/sleep` also SIGTRAP (133)**. `MallocNanoZone=0` plus `GIGACAGE_ENABLED=0` / `HOME` / `TMPDIR` / `MACWS_CHROOT_HOST_ROOT` removed the nano-zone warning but still trapped. Inserting the *already deployed* net34 `/usr/local/lib/libmachook.dylib` made stock `/bin/echo` print and exit 0. That matches the production proxy, which always sets `DYLD_INSERT_LIBRARIES=/usr/local/lib/libmachook.dylib` (and `MallocNanoZone=0`) in `ViewBridgeChrootProxy/main.c`. The on-disk dylib was not replaced. `macws_is_webkit_helper_process()` keys only on WebContent / Networking / GPU / SandboxBroker paths, so this probe's `xpc_main` still falls through to `macws_xpc_main_raw` (stock).
+
+### After exec (01:24:03.981 CST / 09:24:03.981 PT, proxy pid 86277)
+
+With libmachook inserted, the arm64 test service constructor and `main` ran (same pid 86277). Authoritative after-exec inventory:
+
+```
+after-exec ports_lookup kr=0 count=3 [0]=0x807 typ=0x10000 [1]=0x0 typ=0x0 [2]=0xffffffff typ=0x100000 recv_rights=0 slot2_recv=0 flags=0x0 service=com.macwsguide.probe.appsvc
+SERVICE_SLOT_SURVIVED=no
+```
+
+- **SERVICE_SLOT did not survive as a receive right.** Slot 2 is a **dead name** (`0xffffffff`, `typ=0x100000` = `MACH_PORT_TYPE_DEAD_NAME`), not an empty slot and not `typ=0x30000 RECV`. Slot 0 was refreshed `0x707` → `0x807` (SEND), the same post-exec NAME_SERVER pattern as the net16–net19 WebKit handshake (`recv_rights=0`).
+- **`XPC_FLAGS` did not survive as `8019`.** The exec environment set `XPC_FLAGS=8019` (no `0x` prefix). By `main`, `getenv` was the string `0x0`. That rewrite matches the existing comment on `macws_webkit_reapply_packed_xpc_flags` in `libmachook/mac_hooks.m`: after the proxy `execve`, classic environ may be overwritten by **libxpc unpacking xpcproxy's packed launch context** (binprefs / registered ports). A homemade `mach_port_allocate` RECEIVE in slot 2 is not that packed context; unpack is the leading explanation for both the flags overwrite and the receive right dying into a dead name before `main`.
+- Before `xpc_main`: `pthread_main=1`, `cf_main_mode=(null)` (main CFRunLoop not running yet), `_dispatch_get_main_queue_port_4CF=0xb03` (**GCD_MAIN_CF_PORT=valid**), `_dispatch_main_queue_callback_4CF` non-NULL. The GCD-main CF port exists at process start; the runloop was not yet pumping.
+- `dlsym xpc_main` succeeded and stock `xpc_main` was entered (`macws_xpc_main` falls through to `macws_xpc_main_raw` for this argv). There was no `stock xpc_main returned`, no `accepted`, no sampler tick, no `dispatch_sync_f`, and no reply. Within ~1 s the process died **`wait_rc=133` / `proxy_signal=5` (SIGTRAP)**. The iOS client then got `bootstrap_look_up kr=1102` (unknown service; the name dies with the process) and `Connection invalid`.
+
+This is the failure the probe was designed to report clearly: the Application-type receive right does not survive this `chroot`+`execve` as a live `SERVICE_SLOT` RECV, and stock `xpc_main` does not park and accept — it traps, consistent with `XPC_EXIT_REASON_UNMANAGED` / libxpc aborting when the packed launch context and receive right are missing. `dispatch_sync_f(main)` was never reached, so the CF-pump question remains unanswered on a successful accept (not a deadlock observation).
+
+### Implication for a later Safari hookup
+
+A raw `mach_port_allocate` + `mach_ports_register(SERVICE_SLOT)` + `XPC_FLAGS=8019` first image is **not** a substitute for Apple xpcproxy's Application-type bring-up. The right is present immediately before `chroot`+`execve` and is a dead name with `flags=0x0` by the time the stock image reaches `main`. That is the same `recv_rights=0` outcome as net16–net19, now seen on a non-WebKit test service with a known-good pre-exec RECV. Re-applying `XPC_FLAGS=8019` after exec (the existing WebKit fallback hook) cannot resurrect a destroyed receive right.
+
+A later Safari hookup should not assume this placement is sufficient. Next work needs a real packed Application-type launch context (or another way to have stock `xpc_main` consume a live receive on the process main thread with a running main CFRunLoop) that still does not check in `macosbooter.WebKit.*`. This turn did not start a guarded Safari run, did not deploy a libmachook or proxy variant, and left net34 untouched.
+
+Final throwaway CDHashes (not part of the WebKit install): probe_proxy arm64e `9b07655d587ca15bf2dd7f30e5d90f252389da45`; macws-appsvc-probe arm64 `ec6b676f569930306540f786d82238e9180f5520` (sha1 candidate `75001742915089225d070a45be51a963f6985e6f`).
