@@ -670,3 +670,39 @@ Not reached. InitializeWebProcess / CreateWebPage were not observed, the drawing
 
 Next logging build has to stay out of Safari's window-publish path until a net10b-style window + helper launch is reproduced. Options: keep new hooks strictly out of the Safari process (install-time and method IMPs), or first confirm that net10b Safari still publishes a window after the net11b/net11c incidents. Do not reintroduce SkyLight MSHooks or constructor main-queue `dispatch_after`.
 
+## 26. net10b Safari recheck: session no longer publishes AppKit windows (2026-11-10 18:11–18:16 CST)
+
+### Context
+
+Health at 18:11:29 CST: up 7:14 from the 10:57 CST button reset (no second reboot). `CORE_OK`. WebKit LaunchDaemons unloaded. `comp_occ=16408` (under the emergency gate). GUI already `Ss`. No leftover Safari. Deployed dylib confirmed net10b arm64e CDHash `cffee750f072127a4fb0cb648357f7abe9c0868e` (sha1 `b027e89499f34b6bd3c74b55b66a9439f1b8e1d7`), size 1477120, rootfs inode 23302283. Stale hung expect sessions were left alone. No new dylib was deployed this turn.
+
+The previous two logging builds (net11c, net11d) had left Safari running at ~51 MB with no capturable window. The open question was whether that hang was the 296254e logging delta or leftover session state after the net11b `CGSMainConnectionID` SIGBUS and those hangs.
+
+### Guarded Safari on net10b (one attempt, 18:11:44–18:14 CST)
+
+Same driver as earlier runs, artifact names `net10b-recheck-*`. Safari pid 48615 stayed up (~51 MB, `S`) for the whole window — the same size as the hung net11c/net11d processes, not the ~360 MB of the successful 16:57 CST net10b run. `macws_control_probe launch-path` reported `custom-path 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`. Both webloc opens failed with `目标应用没有确认 AppKit 文稿事件`. Zero WebContent / Networking / GPU helpers. XPC log empty. The paint log used the net10b installer format (`CAContext hooks ctx=… host=…` only, no `wc=` / `safari=` flags): Safari, bash, and screencapture installed hooks; there was no `remoteContextWithOptions` and no `setContextId`. Both captures timed out. After cleanup `CORE_OK`, LaunchDaemons unloaded, no leftover macOS Safari/helpers, `comp_occ` 16408 → 16406, uptime still from 10:57 CST.
+
+`/workspace/net10b-recheck-example.png` and `/workspace/net10b-recheck-baidu.png` were not created.
+
+### Leftover-session diagnosis (no new dylib, no second Safari)
+
+After cleanup:
+
+- Boot-time chrome is still healthy: WindowServer 1575 `Ss` (~154 MB, up 7 h), Finder 1742 `Ss` (~114 MB), Dock / SystemUIServer / ControlCenter / OSXvnc all `Ss` with normal RSS. `macws_control_probe` reports `windowserver=yes busy=no`. So WindowServer and already-published windows are not dead.
+- A desktop `screencapture -x /tmp/net10b-recheck-desktop.png` at 18:15:15 CST **timed out at 20 s**. Capture of the existing desktop is itself wedged, not only Safari's missing window.
+- A single non-Safari probe of Activity Monitor (`/System/Applications/Utilities/Activity Monitor.app`) at 18:15:36 CST reproduced the same failure: pid 50563 started (~35 MB, `S`) but `activity-monitor 已启动，但 30 秒内没有发布可捕获的 AppKit 窗口`. It was SIGTERM/SIGKILL'd; none left. No new `.ips`.
+
+New AppKit processes start but stay small and never publish a capturable window. That is session-wide, not Safari-specific, and it is why net11c/net11d were not a sufficient test of the logging dylib. The likely wedge is WindowServer / CGS window-publish and screencapture after net11b hooked `CGSMainConnectionID` in Safari and then SIGBUS'd mid-window-publish (17:55 CST), followed by hung Safari attempts. Existing windows from before that event remain; new ones and new captures do not.
+
+### What was not done
+
+No new libmachook was deployed. Step 2 WebContent-only logging was not started. WindowServer / macOS were not restarted (no full device reboot without confirmation). `CORE_OK` still holds; the 10:57 CST uptime is unchanged.
+
+### Paint-path conclusion
+
+Not reached. The session can no longer publish a new capturable AppKit window or complete `screencapture`, so InitializeWebProcess / CreateWebPage / drawing-area / WebContent CAContext / compositing port could not be observed. The 16:57 CST net10b diagnosis (WebContent never hosts a remote layer; content stayed white after leaving Favorites) is not re-verified in this session.
+
+### Still open
+
+A WindowServer or macOS-session restart (or a user-confirmed device reboot) is the likely way to recover window publish, after which net10b Safari should be rechecked before any new logging dylib. Do not reintroduce SkyLight MSHooks, extra Safari CAContext IMPs, or constructor main-queue `dispatch_after`.
+
