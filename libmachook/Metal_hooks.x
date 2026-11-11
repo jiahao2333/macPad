@@ -25060,6 +25060,8 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
 // Also trace xpc_connection_create (the XPC service / bundle-name style)
 
 // From mac_hooks.m — Application-type XPC (WebKit/TSV) with seatbelt-friendly names.
+extern int macws_xpc_overlay_activate(const char *name);
+extern int macws_xpc_overlay_supersedes_tsv(const char *name);
 extern xpc_connection_t macws_xpc_create_application_service(
     const char *name, dispatch_queue_t targetq,
     xpc_connection_t (*create_fn)(const char *, dispatch_queue_t));
@@ -25068,12 +25070,6 @@ extern void macws_xpc_wrap_app_event_handler(
     void (*orig)(xpc_connection_t, xpc_handler_t));
 extern void macws_xpc_app_logf(const char *fmt, ...);
 extern const char *macws_xpc_lookup_app_conn_name(xpc_connection_t conn);
-extern int macws_is_webkit_helper_process_ex(void);
-extern int macws_wk_unique_incoming_run_active(void);
-extern int macws_wk_try_run_main_block_inline(dispatch_queue_t queue,
-    dispatch_block_t block);
-extern int macws_wk_try_run_main_fn_inline(dispatch_queue_t queue, void *ctx,
-    void (*fn)(void *));
 static void (*orig_xpc_connection_set_event_handler)(
     xpc_connection_t, xpc_handler_t);
 static void hooked_xpc_connection_set_event_handler(
@@ -25166,6 +25162,12 @@ xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t
                  !strcmp(name, "com.apple.ProgressReporting"))) {
         return orig_xpc_connection_create(name, queue);
     }
+    // Generic Application-type XPC via a launchd-managed overlay bundle
+    // (field notes §59). Only names without an explicit chroot remap.
+    if (name && (macws_private_chroot_service_name(name) == name ||
+                 macws_xpc_overlay_supersedes_tsv(name)) &&
+        macws_xpc_overlay_activate(name))
+        return orig_xpc_connection_create(name, queue);
     // Shared-cache callers never hit DYLD_INTERPOSE macws_xpc_connection_create_early.
     // Activate Application-type proxies here (stock name for sandbox checks).
     {
@@ -25241,105 +25243,6 @@ static int hooked_sandbox_check(pid_t pid, const char *operation, int type, ...)
     va_end(ap);
     return orig_sandbox_check(pid, operation, type, arg);
 }
-// Unique-incoming run() happens on a live background serial queue
-// while helper main stays in dispatch_main (window-safe). The stock
-// callback (net36) hung waiting for GCD main / isMainThread. While
-// that run is active, execute main-queue blocks inline and report
-// the thread as main. Gated by a TLS flag; Safari is never active.
-static void (*orig_dispatch_sync)(dispatch_queue_t, dispatch_block_t);
-static void hooked_dispatch_sync(dispatch_queue_t queue,
-        dispatch_block_t block) {
-    if (macws_wk_try_run_main_block_inline(queue, block))
-        return;
-    if (orig_dispatch_sync)
-        orig_dispatch_sync(queue, block);
-}
-
-static void (*orig_dispatch_async)(dispatch_queue_t, dispatch_block_t);
-static void hooked_dispatch_async(dispatch_queue_t queue,
-        dispatch_block_t block) {
-    if (macws_wk_try_run_main_block_inline(queue, block))
-        return;
-    if (orig_dispatch_async)
-        orig_dispatch_async(queue, block);
-}
-
-static void (*orig_dispatch_sync_f)(dispatch_queue_t, void *,
-        void (*)(void *));
-static void hooked_dispatch_sync_f(dispatch_queue_t queue, void *ctx,
-        void (*fn)(void *)) {
-    if (macws_wk_try_run_main_fn_inline(queue, ctx, fn))
-        return;
-    if (orig_dispatch_sync_f)
-        orig_dispatch_sync_f(queue, ctx, fn);
-}
-
-static void (*orig_dispatch_async_f)(dispatch_queue_t, void *,
-        void (*)(void *));
-static void hooked_dispatch_async_f(dispatch_queue_t queue, void *ctx,
-        void (*fn)(void *)) {
-    if (macws_wk_try_run_main_fn_inline(queue, ctx, fn))
-        return;
-    if (orig_dispatch_async_f)
-        orig_dispatch_async_f(queue, ctx, fn);
-}
-
-static int (*orig_pthread_main_np)(void);
-static int hooked_pthread_main_np(void) {
-    if (macws_wk_unique_incoming_run_active())
-        return 1;
-    return orig_pthread_main_np ? orig_pthread_main_np() : 0;
-}
-
-static BOOL (*orig_NSThread_isMainThread)(id, SEL);
-static BOOL hooked_NSThread_isMainThread(id self, SEL sel) {
-    if (macws_wk_unique_incoming_run_active())
-        return YES;
-    return orig_NSThread_isMainThread
-        ? orig_NSThread_isMainThread(self, sel) : NO;
-}
-
-static void macws_install_unique_incoming_main_hooks(void) {
-    /* Never hook dispatch / pthread_main_np in Safari: trampoline
-     * install and a global dispatch intercept can threaten the
-     * launch window. Unique incoming run is helper-only. */
-    if (!macws_is_webkit_helper_process_ex())
-        return;
-    MSImageRef disp = MSGetImageByName("/usr/lib/system/libdispatch.dylib");
-    void *ds = disp ? MSFindSymbol(disp, "_dispatch_sync") : NULL;
-    if (!ds) ds = dlsym(RTLD_DEFAULT, "dispatch_sync");
-    if (ds)
-        MSHookFunction(ds, (void *)hooked_dispatch_sync,
-                       (void *)&orig_dispatch_sync);
-    void *da = disp ? MSFindSymbol(disp, "_dispatch_async") : NULL;
-    if (!da) da = dlsym(RTLD_DEFAULT, "dispatch_async");
-    if (da)
-        MSHookFunction(da, (void *)hooked_dispatch_async,
-                       (void *)&orig_dispatch_async);
-    void *dsf = disp ? MSFindSymbol(disp, "_dispatch_sync_f") : NULL;
-    if (!dsf) dsf = dlsym(RTLD_DEFAULT, "dispatch_sync_f");
-    if (dsf)
-        MSHookFunction(dsf, (void *)hooked_dispatch_sync_f,
-                       (void *)&orig_dispatch_sync_f);
-    void *daf = disp ? MSFindSymbol(disp, "_dispatch_async_f") : NULL;
-    if (!daf) daf = dlsym(RTLD_DEFAULT, "dispatch_async_f");
-    if (daf)
-        MSHookFunction(daf, (void *)hooked_dispatch_async_f,
-                       (void *)&orig_dispatch_async_f);
-    MSImageRef pth = MSGetImageByName("/usr/lib/system/libsystem_pthread.dylib");
-    void *pnm = pth ? MSFindSymbol(pth, "_pthread_main_np") : NULL;
-    if (!pnm) pnm = dlsym(RTLD_DEFAULT, "pthread_main_np");
-    if (pnm)
-        MSHookFunction(pnm, (void *)hooked_pthread_main_np,
-                       (void *)&orig_pthread_main_np);
-    Class nsthread = objc_getMetaClass("NSThread");
-    SEL imt = sel_registerName("isMainThread");
-    if (nsthread && class_getClassMethod(nsthread, imt))
-        MSHookMessageEx(nsthread, imt,
-                        (IMP)hooked_NSThread_isMainThread,
-                        (IMP *)&orig_NSThread_isMainThread);
-}
-
 static void macws_install_sandbox_mach_lookup_hooks(void) {
     MSImageRef sand = MSGetImageByName("/usr/lib/system/libsystem_sandbox.dylib");
     if (!sand)
@@ -25390,7 +25293,6 @@ static void macws_install_private_xpc_name_hooks(void) {
                        (void *)hooked_xpc_connection_send_message_with_reply,
                        (void *)&orig_xpc_connection_send_message_with_reply);
     macws_install_sandbox_mach_lookup_hooks();
-    macws_install_unique_incoming_main_hooks();
 }
 
 extern int xpc_connection_enable_sim2host_4sim();

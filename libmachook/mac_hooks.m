@@ -36,6 +36,8 @@ extern char **environ;
 #import <sys/un.h>
 #import <poll.h>
 #import <pwd.h>
+#include <dirent.h>
+#include <mach-o/dyld.h>
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 #import "macws_process_ancestry.h"
@@ -5678,12 +5680,6 @@ static bool macws_exe_contains(const char *needle) {
     return false;
 }
 
-__attribute__((visibility("hidden")))
-int macws_is_webkit_helper_process_ex(void) {
-    return macws_is_webkit_helper_process() ? 1 : 0;
-}
-
-
 // Narrower than macws_is_webkit_helper_process: only the WebContent XPC.
 static bool macws_is_webcontent_process(void) {
     return macws_exe_contains("com.apple.WebKit.WebContent");
@@ -5694,18 +5690,12 @@ static bool macws_is_safari_process(void) {
     return macws_exe_contains("/Safari.app/Contents/MacOS/Safari");
 }
 
-/* Set while the unique-incoming wrap runs user() on the live
- * incoming-serial queue so hooks can inline GCD-main bounces and
- * satisfy isMainThread without parking the helper main thread. */
-__attribute__((visibility("hidden")))
-int macws_wk_unique_incoming_run_active(void);
-
 static void hooked_InitializeWebKit2(void) {
     char msg[160];
     snprintf(msg, sizeof(msg), "InitializeWebKit2 call orig=%p",
              (void *)(uintptr_t)orig_InitializeWebKit2);
     macws_webkit_init_log(msg);
-    if (pthread_main_np() || macws_wk_unique_incoming_run_active()) {
+    if (pthread_main_np()) {
         orig_InitializeWebKit2();
         macws_webkit_init_log("InitializeWebKit2 orig returned");
         return;
@@ -5727,7 +5717,7 @@ static void hooked_runInitializationCode(void *context) {
     snprintf(msg, sizeof(msg), "runInitializationCode call orig=%p ctx=%p",
              (void *)(uintptr_t)orig_runInitializationCode, context);
     macws_webkit_init_log(msg);
-    if (pthread_main_np() || macws_wk_unique_incoming_run_active()) {
+    if (pthread_main_np()) {
         orig_runInitializationCode(context);
         macws_webkit_init_log("runInitializationCode orig returned");
         return;
@@ -15165,57 +15155,6 @@ static int macws_xpc_app_conn_is_unique_incoming(xpc_connection_t conn) {
     return name && !strncmp(name, "com.macwsguide.wk.i.", 20);
 }
 
-/* net36: running user() on the helper main thread via a cond-wait
- * drain hung inside the stock callback (0 event end, 0 IW2) and
- * lost the Safari window. Keep dispatch_main on main (net34 window
- * safety). Run the stock handler on the live incoming-serial queue
- * and, while that run is active, inline GCD-main dispatch_sync/
- * dispatch_async and treat the thread as main so InitializeWebKit2's
- * isMainThread assert can pass without parking main. */
-static _Thread_local int g_macws_wk_incoming_run;
-
-__attribute__((visibility("hidden")))
-int macws_wk_unique_incoming_run_active(void) {
-    return g_macws_wk_incoming_run > 0;
-}
-
-__attribute__((visibility("hidden")))
-void macws_wk_unique_incoming_run_begin(void) {
-    g_macws_wk_incoming_run++;
-}
-
-__attribute__((visibility("hidden")))
-void macws_wk_unique_incoming_run_end(void) {
-    if (g_macws_wk_incoming_run > 0)
-        g_macws_wk_incoming_run--;
-}
-
-__attribute__((visibility("hidden")))
-int macws_wk_try_run_main_block_inline(dispatch_queue_t queue,
-        dispatch_block_t block) {
-    if (!block || !macws_wk_unique_incoming_run_active())
-        return 0;
-    if (queue != dispatch_get_main_queue())
-        return 0;
-    macws_webkit_init_log(
-        "xpc_main WebKit unique peer main-queue-inline");
-    block();
-    return 1;
-}
-
-__attribute__((visibility("hidden")))
-int macws_wk_try_run_main_fn_inline(dispatch_queue_t queue, void *ctx,
-        void (*fn)(void *)) {
-    if (!fn || !macws_wk_unique_incoming_run_active())
-        return 0;
-    if (queue != dispatch_get_main_queue())
-        return 0;
-    macws_webkit_init_log(
-        "xpc_main WebKit unique peer main-queue-inline-fn");
-    fn(ctx);
-    return 1;
-}
-
 static void macws_xpc_log_and_add_bundle(const char *path, const char *tag) {
     int acc = (path && path[0]) ? access(path, F_OK) : -1;
     int err = (acc == 0) ? 0 : errno;
@@ -15316,20 +15255,9 @@ void macws_xpc_wrap_app_event_handler(
                 run();
                 return;
             }
-            /* Unique incoming events arrive on the live serial queue.
-             * net34 bounced them to GCD main (never drained). net35
-             * CFRunLoopRun and net36 helper-main-drain both lost the
-             * Safari window; net36 ran user() on main and hung inside
-             * the stock callback (likely a nested GCD-main bounce).
-             * Run user() here and inline main-queue work. */
-            if (macws_xpc_app_conn_is_unique_incoming(connection)) {
-                macws_webkit_init_log(
-                    "xpc event off main; run on incoming-serial");
-                macws_wk_unique_incoming_run_begin();
-                run();
-                macws_wk_unique_incoming_run_end();
-                return;
-            }
+            /* Unique incoming conns can be accepted on a background
+             * queue before dispatch_main is draining; dispatch_sync
+             * would deadlock. Async parks the work on the main queue. */
             macws_webkit_init_log("xpc event off main; dispatch_async");
             dispatch_async(dispatch_get_main_queue(), run);
         });
@@ -16158,6 +16086,259 @@ static const char *macws_wk_activate_for_public_name(const char *name) {
     if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
         return SAFARI_SANDBOX_BROKER_SERVICE_NEW;
     return NULL;
+}
+
+// ---------------------------------------------------------------------
+// Generic Application-type XPC activation through launchd-managed overlay
+// bundles (field notes §58/§59).
+//
+// Ventura xpc_main obtains its XPCService dictionary (launchd routine 718)
+// and its listener RECEIVE (bootstrap_check_in3) from iOS launchd by pid,
+// after exec. A receive right placed in SERVICE_SLOT cannot survive any exec
+// (xnu cloneproc → fresh IPC space), so the only working shape is the stock
+// one: a job in this client's process domain (xpc_add_bundle(path, 2)) whose
+// iOS first image (MacWSXPCProxy, 0755 + setuid .priv sibling) only crosses
+// into the chroot and execs the stock macOS executable with XPC_* unchanged.
+//
+// For a requested service name, look for <bundle>/XPCServices/<name>.xpc (or
+// an XPCServices entry whose identifier matches) in the main bundle and every
+// loaded framework/bundle. The host-side generator
+// (/var/jb/usr/macOS/bin/macws_xpc_overlay_gen.py) mirrors such bundles into
+//   host  /var/jb/usr/macOS/libexec/macws-xpc-overlay/<key>/<leaf>.xpc
+//   index /usr/local/var/macws-xpc-overlay/<key>   (chroot; content = id)
+// where <key> = FNV-1a-64 of the bundle's chroot realpath. The chroot cannot
+// see jbroot, so the index is the only existence check available here.
+// Register the overlay once, then fall through to the caller's stock create
+// with the ORIGINAL name: no macosbooter.* name, no LaunchDaemon, no listener.
+#define MACWS_XPC_OVERLAY_HOST_ROOT "/var/jb/usr/macOS/libexec/macws-xpc-overlay"
+#define MACWS_XPC_OVERLAY_INDEX "/usr/local/var/macws-xpc-overlay"
+#define MACWS_XPC_OVERLAY_DISABLE "/usr/local/etc/macws-xpc-overlay.disable"
+#define MACWS_XPC_OVERLAY_REQUESTS "/usr/local/var/macws-xpc-overlay-requests"
+
+static uint64_t macws_xpc_overlay_fnv1a64(const char *s) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (; s && *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Read the index marker for a bundle realpath. Returns 1 and fills id when
+// the overlay exists.
+static int macws_xpc_overlay_index_read(const char *bundleReal, char *key,
+                                        size_t keysz, char *ident,
+                                        size_t identsz) {
+    snprintf(key, keysz, "%016llx",
+             (unsigned long long)macws_xpc_overlay_fnv1a64(bundleReal));
+    char marker[PATH_MAX];
+    snprintf(marker, sizeof(marker), "%s/%s", MACWS_XPC_OVERLAY_INDEX, key);
+    int fd = open(marker, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, ident, identsz ? identsz - 1 : 0);
+    close(fd);
+    if (n < 0) n = 0;
+    ident[n] = 0;
+    char *nl = strchr(ident, '\n');
+    if (nl) *nl = 0;
+    char *tab = strchr(ident, '\t');
+    if (tab) *tab = 0;
+    return 1;
+}
+
+static void macws_xpc_overlay_request(const char *bundleReal) {
+    // Ask the host generator (next run) to mirror a bundle we found but
+    // could not activate. Append-only, best effort, never blocks.
+    int fd = open(MACWS_XPC_OVERLAY_REQUESTS,
+                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    if (fd < 0) return;
+    char line[PATH_MAX + 2];
+    int len = snprintf(line, sizeof(line), "%s\n", bundleReal);
+    if (len > 0) (void)write(fd, line, (size_t)len);
+    close(fd);
+}
+
+// Resolve <base>/XPCServices for one loaded image path. Frameworks:
+// dirname(image). Apps/bundles: the enclosing ".../Contents".
+static int macws_xpc_overlay_services_dir(const char *image, char *out,
+                                          size_t outsz) {
+    if (!image || image[0] != '/') return 0;
+    const char *contents = strstr(image, ".app/Contents/");
+    if (!contents) contents = strstr(image, ".bundle/Contents/");
+    if (!contents) contents = strstr(image, ".appex/Contents/");
+    if (!contents) contents = strstr(image, ".xpc/Contents/");
+    if (contents) {
+        const char *c = strstr(contents, "/Contents/");
+        size_t n = (size_t)(c - image) + strlen("/Contents");
+        if (n + strlen("/XPCServices") + 1 > outsz) return 0;
+        memcpy(out, image, n);
+        out[n] = 0;
+        strlcat(out, "/XPCServices", outsz);
+        return 1;
+    }
+    if (!strstr(image, ".framework/")) return 0;
+    const char *slash = strrchr(image, '/');
+    if (!slash) return 0;
+    size_t n = (size_t)(slash - image);
+    if (n + strlen("/XPCServices") + 1 > outsz) return 0;
+    memcpy(out, image, n);
+    out[n] = 0;
+    strlcat(out, "/XPCServices", outsz);
+    return 1;
+}
+
+typedef struct {
+    char name[160];
+    int state; // 1 = registered overlay, -1 = no overlay
+} MacWSXpcOverlayCacheEntry;
+#define MACWS_XPC_OVERLAY_CACHE_MAX 64
+static MacWSXpcOverlayCacheEntry g_macws_xpc_overlay_cache[MACWS_XPC_OVERLAY_CACHE_MAX];
+static int g_macws_xpc_overlay_cache_n = 0;
+static pthread_mutex_t g_macws_xpc_overlay_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int macws_xpc_overlay_try_dir(const char *servicesDir,
+                                     const char *name, char *hostPath,
+                                     size_t hostsz, char *real,
+                                     size_t realsz) {
+    char ident[192];
+    char key[32];
+    char candidate[PATH_MAX];
+    struct stat st;
+    // Fast path: <name>.xpc.
+    snprintf(candidate, sizeof(candidate), "%s/%s.xpc", servicesDir, name);
+    if (stat(candidate, &st) == 0 && S_ISDIR(st.st_mode) &&
+        realpath(candidate, real)) {
+        if (macws_xpc_overlay_index_read(real, key, sizeof(key), ident,
+                                         sizeof(ident))) {
+            const char *leaf = strrchr(real, '/');
+            snprintf(hostPath, hostsz, "%s/%s%s", MACWS_XPC_OVERLAY_HOST_ROOT,
+                     key, leaf ? leaf : "/x.xpc");
+            return 1;
+        }
+        macws_xpc_overlay_request(real);
+        return -1;
+    }
+    // Slow path: an XPCServices entry whose identifier (from the index) is
+    // the requested name.
+    DIR *d = opendir(servicesDir);
+    if (!d) return 0;
+    int result = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t len = strlen(e->d_name);
+        if (len < 5 || strcmp(e->d_name + len - 4, ".xpc")) continue;
+        snprintf(candidate, sizeof(candidate), "%s/%s", servicesDir,
+                 e->d_name);
+        if (!realpath(candidate, real)) continue;
+        if (!macws_xpc_overlay_index_read(real, key, sizeof(key), ident,
+                                          sizeof(ident)))
+            continue;
+        if (strcmp(ident, name)) continue;
+        const char *leaf = strrchr(real, '/');
+        snprintf(hostPath, hostsz, "%s/%s%s", MACWS_XPC_OVERLAY_HOST_ROOT,
+                 key, leaf ? leaf : "/x.xpc");
+        result = 1;
+        break;
+    }
+    closedir(d);
+    (void)realsz;
+    return result;
+}
+
+__attribute__((visibility("hidden")))
+int macws_xpc_overlay_supersedes_tsv(const char *name) {
+    return name && macws_xpc_app_services_lookup(name) != NULL;
+}
+
+// Returns 1 when an overlay bundle for `name` is registered in this
+// process's launchd domain (now or earlier); the caller then performs the
+// stock xpc_connection_create(name) unchanged.
+__attribute__((visibility("hidden")))
+int macws_xpc_overlay_activate(const char *name) {
+    if (!name || !name[0] || strlen(name) >= 160) return 0;
+    if (!strncmp(name, "com.apple.macosbooter.", 22) ||
+        !strncmp(name, "com.macwsguide.wk.", 18))
+        return 0;
+    pthread_mutex_lock(&g_macws_xpc_overlay_mu);
+    for (int i = 0; i < g_macws_xpc_overlay_cache_n; i++) {
+        if (!strcmp(g_macws_xpc_overlay_cache[i].name, name)) {
+            int st = g_macws_xpc_overlay_cache[i].state;
+            pthread_mutex_unlock(&g_macws_xpc_overlay_mu);
+            return st > 0;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_xpc_overlay_mu);
+
+    if (access(MACWS_XPC_OVERLAY_DISABLE, F_OK) == 0) return 0;
+    // Services with a dedicated MacWS proxy/listener keep that route.
+    static const char *const dedicated[] = {
+        "com.apple.dock.helper", "com.apple.FileCoordination",
+        "com.apple.ProgressReporting", "com.apple.quicklook.satellite",
+        "com.apple.geod", "com.apple.carboncore.csnameddata",
+        "com.apple.ViewBridgeAuxiliary", "com.apple.extensionkitservice",
+        "com.apple.hiservices-xpcservice", "com.apple.authd",
+    };
+    for (size_t i = 0; i < sizeof(dedicated) / sizeof(dedicated[0]); i++)
+        if (!strcmp(name, dedicated[i])) return 0;
+    // Names with an explicit chroot remap (private Mach listeners such as
+    // cfprefsd/lsd/iconservices) keep their established route. Rows of the
+    // Application-type TSV (WebKit) are superseded by the overlay route.
+    if (!macws_xpc_app_services_lookup(name) &&
+        macws_private_bootstrap_service_name(name) != name)
+        return 0;
+
+    char hostPath[PATH_MAX];
+    char real[PATH_MAX];
+    char servicesDir[PATH_MAX];
+    char seen[24][PATH_MAX / 4];
+    int nseen = 0;
+    int found = 0;
+    uint32_t count = _dyld_image_count();
+    // Image 0 is the main executable: its bundle wins over frameworks.
+    for (uint32_t i = 0; i < count && found == 0; i++) {
+        const char *image = _dyld_get_image_name(i);
+        if (!macws_xpc_overlay_services_dir(image, servicesDir,
+                                            sizeof(servicesDir)))
+            continue;
+        int dup = 0;
+        for (int k = 0; k < nseen; k++)
+            if (!strncmp(seen[k], servicesDir, sizeof(seen[k]) - 1)) dup = 1;
+        if (dup) continue;
+        if (nseen < 24)
+            snprintf(seen[nseen++], sizeof(seen[0]), "%s", servicesDir);
+        struct stat st;
+        if (stat(servicesDir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        int r = macws_xpc_overlay_try_dir(servicesDir, name, hostPath,
+                                          sizeof(hostPath), real,
+                                          sizeof(real));
+        if (r != 0) found = r;
+    }
+
+    pthread_mutex_lock(&g_macws_xpc_overlay_mu);
+    int already = 0;
+    for (int i = 0; i < g_macws_xpc_overlay_cache_n; i++)
+        if (!strcmp(g_macws_xpc_overlay_cache[i].name, name)) already = 1;
+    if (!already && g_macws_xpc_overlay_cache_n < MACWS_XPC_OVERLAY_CACHE_MAX) {
+        MacWSXpcOverlayCacheEntry *e =
+            &g_macws_xpc_overlay_cache[g_macws_xpc_overlay_cache_n++];
+        snprintf(e->name, sizeof(e->name), "%s", name);
+        e->state = found > 0 ? 1 : -1;
+    }
+    pthread_mutex_unlock(&g_macws_xpc_overlay_mu);
+    if (already) return found > 0;
+
+    if (found > 0) {
+        macws_xpc_app_logf(
+            "pid=%d overlay add_bundle name=%s bundle=%s host=%s\n",
+            getpid(), name, real, hostPath);
+        xpc_add_bundle(hostPath, 2);
+        return 1;
+    }
+    if (found < 0)
+        macws_xpc_app_logf(
+            "pid=%d overlay missing name=%s bundle=%s (requested)\n",
+            getpid(), name, real);
+    return 0;
 }
 
 xpc_connection_t macws_xpc_create_application_service(
@@ -17476,6 +17657,10 @@ xpc_connection_t macws_xpc_connection_create_early(
         return macws_xpc_connection_create_mach_service_raw(
             GEOD_XPC_SERVICE_NEW, targetq, 0);
     }
+    // Generic Application-type XPC: launchd-managed overlay bundle in this
+    // process's domain, then the stock create under the ORIGINAL name.
+    if (macws_xpc_overlay_activate(name))
+        return xpc_connection_create(name, targetq);
     // Application-type XPC (WebKit/Safari + TSV): activate via xpc_add_bundle
     // under the stock name when possible so App Sandbox mach-lookup sees the
     // original id. Shared-cache callers also take this path via Metal_hooks.
@@ -17908,11 +18093,6 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                          "rv=0x%x",
                          src, rv);
                 macws_webkit_init_log(msg);
-                /* Restore net34's dispatch_main park for window
-                 * safety. Do not CFRunLoopRun, NSApp -run, or the
-                 * net36 cond-wait drain. Incoming dictionaries run
-                 * on the live serial queue with main-queue work
-                 * inlined. */
                 macws_webkit_init_log(
                     "xpc_main WebKit unique peer entering dispatch_main");
                 dispatch_main();

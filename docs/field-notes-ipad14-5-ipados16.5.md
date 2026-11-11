@@ -1989,3 +1989,108 @@ The working path is the stock one: a **launchd pid-domain XPCService job** whose
 4. Keep `RunLoopType` from the stock plist (WebKit's main-thread `dispatchSync` needs a live main CFRunLoop; NSRunLoop proven here).
 
 Residual risk / unknowns: jetsam limit of these jobs (probe got 6 MB; WebContent needs a real limit/priority), `_MultipleInstances` instance routing (WebContent), whether Ventura WebKit expects launchd to pre-populate framework XPCServices (macOS) vs explicit add, process-scoped teardown on host exit, and AppKit `_NSApplicationMain` RunLoopType (not tested).
+
+## 59. Generic overlay route implemented (net38): client-pid `xpc_add_bundle` + generic chroot proxy; standalone probe `ok=1` as root and as mobile (2026-11-11 14:16–14:22 CST / 2026-11-10 22:16–22:22 PT)
+
+The fix plan from §58 is implemented. Safari was not launched, and no WebKit overlays were generated, so the next Safari launch still takes the old TSV path.
+
+### What changed
+
+- **libmachook** started from `181bf88` (net34, the code live on the device). The net35–net37 libmachook code from §52–§54, which had been rolled back on the device, was reverted in the repo.
+- **libmachook overlay route.** Both client-side `xpc_connection_create` paths call the new hidden helper `macws_xpc_overlay_activate(name)`: the DYLD_INTERPOSE one (`macws_xpc_connection_create_early`) and the shared-cache one (`hooked_xpc_connection_create`). No new exported symbols; T stays at 168 per slice.
+  - The helper looks for the name as an `XPCServices/*.xpc` bundle under every loaded image: an app, bundle, appex or xpc `Contents/XPCServices`, or a framework's `XPCServices`.
+  - It looks the bundle up in an in-chroot index, `/usr/local/var/macws-xpc-overlay/<fnv1a64(realpath)>`.
+  - On a hit, it calls `xpc_add_bundle(/var/jb/usr/macOS/libexec/macws-xpc-overlay/<key>/<leaf>.xpc, 2)` once per name and falls through to the stock call.
+  - On a miss, it appends the realpath to `/usr/local/var/macws-xpc-overlay-requests`.
+- **Names the helper leaves alone.** These keep their existing routes:
+  - `com.apple.macosbooter.*` and `com.macwsguide.wk.*`;
+  - a denylist of names with dedicated proxies (dock.helper, FileCoordination, ProgressReporting, quicklook.satellite, geod, csnameddata, ViewBridgeAuxiliary, extensionkitservice, hiservices-xpcservice, authd);
+  - names that `macws_private_bootstrap_service_name` / `macws_private_chroot_service_name` remap, unless an overlay index row exists (overlay supersedes TSV).
+- **Kill switch:** `/usr/local/etc/macws-xpc-overlay.disable` inside the chroot.
+- **`ViewBridgeChrootProxy/main.c`:**
+  - The SERVICE_SLOT/8019 rewriting is removed (`replaceZeroFlags`, `normalizeUniqueFlags`, the XPC_FLAGS skip and append). `XPC_*` is passed through byte for byte.
+  - Overlay mode: when argv0 is `…/macws-xpc-overlay/<key>/<leaf>.xpc/MacWSXPCProxy[.priv]`, the target comes from the sibling `MacWSTarget` symlink. Checks: root-owned, not group/other-writable directory; root-owned link; absolute; no `/../`; must contain `/XPCServices/` and `.xpc/`. Anything else exits 120.
+  - The chroot exec and the setuid `.priv` hop are kept.
+  - **Bug found and fixed during verification:** the `.priv` hop used the raw `SYS_execve` trap.
+    - Under Dopamine that bypasses the exec hook that applies setuid credentials, so the `.priv` image ran with euid=501. Because argv0 was unchanged, it hopped again in a tight exec loop (state `R`, the proxy log grew by about 12 MB in 15 s, and the client timed out).
+    - The WebKit proxies had the same latent bug. It never showed in §20–§54 because Safari's helpers always started as root (`will_exec_priv=0`).
+    - Fix: the hop now calls libSystem `execve` and sets `argv[0]` to the `.priv` path, so the second image has `already_priv=1` and never hops again.
+- **`XPCOverlayChrootProxy/`** (new): a Theos tool `MacWSXPCProxy` built from the same `main.c` with `MACWS_WEBKIT_PROXY_EXPERIMENT=1`. Installed as `/var/jb/usr/macOS/libexec/MacWSXPCProxy` (0755) and `MacWSXPCProxy.priv` (4755, same bytes).
+- **`layout/usr/macOS/bin/macws_xpc_overlay_gen.py`** (new, host-side, root). For each macOS `.xpc` it writes:
+  - `<overlay>/<key>/<leaf>.xpc/`, containing:
+    - the stock `Info.plist` with `CFBundleExecutable=MacWSXPCProxy`; platform/SDK keys are stripped and `RunLoopType` is kept;
+    - hardlinks of the proxy and `.priv` (xpcproxy realpaths the executable, so symlinks would lose the overlay path);
+    - `MacWSTarget` and `MacWSSource` symlinks;
+  - plus the in-chroot index row.
+
+  Modes: `--all`, `--requests`, explicit paths, `--remove-all`.
+
+### Device (iPad 14.5 / iPadOS 16.5, Dopamine)
+
+Rollback tag `pre-net38-20261111-141636` (14:16:36 CST). `/var/mobile/macws-rollback/*.pre-net38-20261111-141636` holds:
+
+| file | net34 CDHash |
+|---|---|
+| libmachook arm64e | `d774151c50fb3e893c1d93f3d7df0063e200bc7b` |
+| libmachook arm64 | `6724bb1f417ae8fd618689b9ff0c4fc9184465ce` |
+| WebContentProxy (+ the other three WebKit proxies, both trees) | `124857f954b1d5174741de2e71bb1b078cda15ec` |
+
+Everything was signed on `/var/mobile/net38` vnodes (`ldid -S -M`, two passes), added to the trustcache, then byte-copied (`rm` + `cp`) to jb and to a fresh rootfs vnode.
+
+| file | live CDHash |
+|---|---|
+| libmachook.dylib arm64e (jb + rootfs) | `de85f68711d7b2b2dfb36fd02ada9ae4f7db90eb` |
+| libmachook_arm64.dylib (jb + rootfs) | `546efd8069f249551861f7a956acdf4dbf71a0f5` |
+| MacWSXPCProxy / .priv (net38b, execve fix) | `125451486bdee2858e5845a6ef3ec344dd37d202` |
+| WebContentProxy (net38b) | `f7b48627f622919c45b2d4a9564fcf5c37fb61c2` |
+| WebNetworkingProxy (net38b) | `ea0ef909d359bf8060dd83fe3120ffbb8f08ffab` |
+| WebGPUProxy (net38b) | `221308214353d5ff6a04e6e20137a0ae81d26a2b` |
+| SafariSandboxProxy (net38b) | `b790a8d00b6ff23ca2b9d89cb1d8d7287004097d` |
+
+Superseded in-turn hashes: net38a MacWSXPCProxy was `f3a28c4a…` and WebContentProxy `05fe3051…`, built with the raw-trap hop.
+
+### Verification (standalone probe, real proxy + real interposer)
+
+Probe setup:
+- App `/tmp/MacWSOverlayProbe.app` (in the chroot) embeds `XPCServices/com.macwsguide.probe.overlay.xpc` (stock `xpc_main`, `RunLoopType=NSRunLoop`).
+- The client is a **macOS binary inside the chroot** with live libmachook. It calls plain `xpc_connection_create("com.macwsguide.probe.overlay")` and has no probe-specific registration code.
+- The overlay was produced by the generator.
+
+| run (CST) | client | proxy path | result |
+|---|---|---|---|
+| 14:16:55 | root | MacWSXPCProxy (net38a), euid 0, no hop | `overlay add_bundle` logged; launchd `pid/<client>/com.macwsguide.probe.overlay` spawned `MacWSXPCProxy`; chroot+exec; `xpc_main accepted`; `DISPATCH_SYNC_F_MAIN=returned` (`pthread_main=1`); REPLY `process-finished-launching`; client **ok=1** |
+| 14:17:08 / 14:18:02 | mobile (501) | net38a, raw-trap `.priv` hop | **fail**: euid stayed 501 and the hop exec-looped; client timeout `ok=0`. Root-caused as above; no other state changed |
+| 14:20:45 | **mobile (501)** | net38b: stub (uid 501) → libSystem execve `.priv` (euid 0, `already_priv=1`) → chroot → macOS service (ruid 501, euid 0) | accept, `dispatch_sync_f` returned, REPLY `process-finished-launching`, client **ok=1** |
+| 14:21:43 | root | net38b | **ok=1** |
+| 14:22:02 | root, kill switch present | — | no `add_bundle`, connection invalid immediately, `ok=0` (expected; shows the interposer is the only thing that registers the job) |
+
+In every run, `XPC_FLAGS` was 0x0 in and out and slot 2 was empty after exec. At client exit, launchd SIGTERMs, then SIGKILLs the pid-scoped service ("teardown of process-scoped services after host exited").
+
+### Postflight (14:22:22 CST)
+
+- `SMOKE_OK` and `RUN_BASH_CANARY_OK`.
+- IconServices 1724 / 53067 (uid 240) / 53071 loaded; `WEBKIT_LDS_UNLOADED`.
+- WindowServer 51054, macwshostd 416 and SpringBoard 391 unchanged.
+- Pages free 10724, compressor 23266.
+- Probe overlay, index row, in-chroot probe app and probe processes removed. The overlay and index dirs exist but are empty. No requests file.
+
+### Rollback
+
+`sh /var/mobile/net38/rollback.sh pre-net38-20261111-141636` restores:
+- net34 libmachook (jb, then a fresh rootfs copy);
+- the net34 WebKit proxies (both trees);
+- and removes the overlay tree, index, requests, kill switch, `MacWSXPCProxy[.priv]` and the generator.
+
+If `ldid -h` on a rootfs dylib is SIGKILLed afterwards, recopy the signed jb file onto a fresh rootfs vnode. Do not re-sign on rootfs and do not reboot.
+
+### Residual risks / open
+
+- **No WebKit overlays generated yet.** Running `macws_xpc_overlay_gen.py` on WebKit's `XPCServices`, or with `--all`, switches the next Safari launch to this path. That is the Safari hookup step, deliberately not taken.
+- **Privilege.** Services launched by a non-root client run as ruid 501 / euid 0 (same as the existing WebKit `.priv` design).
+- **Logging.** `/tmp/macws-xpc-app.log` is root 0644, so a mobile client's `overlay add_bundle` line is not logged; the overlay activation is still proven by the launchd job.
+- **Sandboxed clients** may be unable to read the index. Non-root clients cannot generate overlays: the requests file plus a generator rerun stand in, and there is no watcher yet.
+- **Untested here:**
+  - stock `_AdditionalProperties` / RunningBoard keys;
+  - jetsam limit (§58 probe saw 6 MB; WebContent needs more);
+  - `_MultipleInstances` routing;
+  - shared-cache NSXPC callers.

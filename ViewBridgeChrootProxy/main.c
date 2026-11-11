@@ -1,19 +1,24 @@
 // Freestanding launch stub for macOS XPC services inside the chroot.
 //
-// xpcproxy gives the service process a one-shot launchd receive right in
-// XPC_FLAGS/XPC_* and SERVICE_SLOT (mach_ports_register slot 2). Preserve
-// that context through a raw chroot/exec transition; do not introduce an
-// intermediate posix_spawn or XPC client initialization of the public
-// macosbooter name.
-// For Application-type WebKit helpers, iOS xpcproxy leaves XPC_FLAGS=0x0
-// and deposits no receive right when the bundle executable is setuid
-// (setugid XPC services are not allowed). The CFBundleExecutable is
-// therefore shipped mode 0755 so the host xpcproxy / xpc_add_bundle
-// handshake can stash the one-shot right. If this image is still
-// unprivileged after that handshake, exec the setuid sibling (*.priv)
-// before chroot — Mach ports are expected to survive that exec — then
-// reconstitute XPC_FLAGS=8019 if the incoming value is still zero so
-// Ventura xpc_main can consume the inherited right after execve.
+// launchd/xpcproxy start this iOS first image for an XPCService job; it only
+// crosses into the chroot and execs the stock macOS executable in the same
+// task (same pid). Pass every launchd-provided XPC_* entry through unchanged.
+//
+// Field notes §58: no receive right survives exec on this kernel (cloneproc
+// gives the new image a fresh IPC space), so nothing is "carried" in
+// SERVICE_SLOT and XPC_FLAGS must not be reconstituted (libxpc rewrites it
+// to flags & 0x82 anyway). Ventura xpc_main gets its XPCService dictionary
+// (launchd routine 718) and listener RECEIVE (bootstrap_check_in3) from iOS
+// launchd *by pid* after exec, which works whenever the job is launchd-
+// managed in the client's process domain (xpc_add_bundle(path, 2)).
+//
+// xpcproxy refuses a setuid CFBundleExecutable, so the bundle executable is
+// shipped 0755; when it starts unprivileged it execs its setuid "*.priv"
+// sibling (same pid) before chroot.
+//
+// Generic overlay mode (§59): for .../macws-xpc-overlay/<key>/<leaf>.xpc/
+// MacWSXPCProxy the macOS target is read from the root-owned MacWSTarget
+// symlink next to it, so one proxy serves every Application-type bundle.
 // The transition below calls no libSystem APIs, although the current build
 // still links libSystem (-lSystem in the Makefile and the deployed Mach-O).
 // Calling this executable dependency-free would therefore be inaccurate.
@@ -140,19 +145,6 @@ static const char *MacWSEnvironmentValue(char *envp[], const char *key) {
 }
 
 #if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
-static int MacWSFlagsAreZero(const char *value) {
-    // Treat unset, empty, and 0 / 0x0 / 0x00 as "no managed receive right".
-    if (!value || !*value) return 1;
-    if (value[0] == '0' && (value[1] == 'x' || value[1] == 'X'))
-        value += 2;
-    if (!*value) return 1;
-    while (*value) {
-        if (*value != '0') return 0;
-        value++;
-    }
-    return 1;
-}
-
 #define MACWS_SYS_open  5
 #define MACWS_SYS_write 4
 #define MACWS_SYS_close 6
@@ -314,6 +306,9 @@ static void MacWSLogWebKitProxyHandshake(const char *program, int alreadyPriv,
 // If xpcproxy started the non-setuid stub as an unprivileged user, exec
 // the 4755 sibling so chroot can proceed. argv[0] must be an absolute
 // path (xpcproxy provides one). Do not loop if we are already the sibling.
+extern int MacWSLibSystemExecve(const char *path, char *const argv[],
+                                char *const envp[]) __asm__("_execve");
+
 static int MacWSWebKitExecPrivSibling(const char *program, char *argv[],
                                       char *envp[]) {
     static char privPath[1024];
@@ -330,8 +325,77 @@ static int MacWSWebKitExecPrivSibling(const char *program, char *argv[],
     privPath[n++] = 'i';
     privPath[n++] = 'v';
     privPath[n] = 0;
-    (void)MacWSSyscall3(MACWS_SYS_execve, privPath, argv, envp);
+    // §59: go through libSystem's execve (not the raw trap) so the
+    // jailbreak's exec hook sees the setuid sibling and applies its
+    // credentials; a raw SYS_execve left euid=mobile and looped. argv[0]
+    // becomes the *.priv path so the second image never hops again.
+    if (argv && argv[0]) argv[0] = privPath;
+    (void)MacWSLibSystemExecve(privPath, argv, envp);
     return 1;
+}
+#endif
+
+#if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
+#define MACWS_SYS_readlink 58
+#define MACWS_SYS_lstat64 340
+#define MACWS_OVERLAY_MARKER "/usr/macOS/libexec/macws-xpc-overlay/"
+
+// Darwin arm64 struct stat64: st_mode u16 @4, st_uid u32 @16.
+static int MacWSLstatOwnerMode(const char *path, unsigned *uid,
+                               unsigned *mode) {
+    unsigned char st[160];
+    for (unsigned i = 0; i < sizeof(st); i++) st[i] = 0;
+    if (MacWSCheckedSyscall3(MACWS_SYS_lstat64, (long)path, (long)st, 0) != 0)
+        return 0;
+    *mode = (unsigned)st[4] | ((unsigned)st[5] << 8);
+    *uid = (unsigned)st[16] | ((unsigned)st[17] << 8) |
+           ((unsigned)st[18] << 16) | ((unsigned)st[19] << 24);
+    return 1;
+}
+
+static int MacWSIsOverlayProgram(const char *program) {
+    return program && MacWSStringContains(program, MACWS_OVERLAY_MARKER) &&
+        (MacWSEndsWith(program, ".xpc/MacWSXPCProxy") ||
+         MacWSEndsWith(program, ".xpc/MacWSXPCProxy.priv"));
+}
+
+// <overlay>/<key>/<leaf>.xpc/MacWSTarget -> stock macOS executable (chroot
+// path). Only a root-owned, non-group/other-writable overlay directory and a
+// root-owned link are honoured; the target must be an absolute XPCServices
+// executable without "..".
+static const char *MacWSOverlayTarget(const char *program) {
+    static char dir[1024];
+    static char link[1100];
+    static char target[1024];
+    if (!MacWSIsOverlayProgram(program)) return (const char *)0;
+    unsigned n = 0, slash = 0;
+    while (program[n] && n + 1 < sizeof(dir)) {
+        dir[n] = program[n];
+        if (program[n] == '/') slash = n;
+        n++;
+    }
+    if (!slash) return (const char *)0;
+    dir[slash] = 0;
+    unsigned uid = 1, mode = 0;
+    if (!MacWSLstatOwnerMode(dir, &uid, &mode)) return (const char *)0;
+    if (uid != 0 || (mode & 0170000) != 0040000 || (mode & 0022))
+        return (const char *)0;
+    unsigned l = 0;
+    for (unsigned i = 0; dir[i] && l + 1 < sizeof(link); i++) link[l++] = dir[i];
+    static const char leaf[] = "/MacWSTarget";
+    for (unsigned i = 0; leaf[i] && l + 1 < sizeof(link); i++) link[l++] = leaf[i];
+    link[l] = 0;
+    if (!MacWSLstatOwnerMode(link, &uid, &mode)) return (const char *)0;
+    if (uid != 0 || (mode & 0170000) != 0120000) return (const char *)0;
+    long got = MacWSCheckedSyscall3(MACWS_SYS_readlink, (long)link,
+                                    (long)target, (long)(sizeof(target) - 1));
+    if (got <= 0 || got >= (long)sizeof(target)) return (const char *)0;
+    target[got] = 0;
+    if (target[0] != '/' || MacWSStringContains(target, "/../") ||
+        !MacWSStringContains(target, "/XPCServices/") ||
+        !MacWSStringContains(target, ".xpc/"))
+        return (const char *)0;
+    return target;
 }
 #endif
 
@@ -366,6 +430,12 @@ static int MacWSIsSecuritydTarget(const char *target) {
 
 static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
 #if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
+    if (MacWSIsOverlayProgram(program)) {
+        const char *overlay = MacWSOverlayTarget(program);
+        // Never fall through to a fixed target for an overlay image.
+        if (!overlay) MacWSExit(120);
+        return overlay;
+    }
     for (unsigned i = 0; i < sizeof(MacWSWebKitServices) / sizeof(MacWSWebKitServices[0]); ++i)
         if (MacWSStringContains(program, MacWSWebKitServices[i].proxy))
             return MacWSWebKitServices[i].target;
@@ -539,42 +609,28 @@ int main(int argc, char *argv[], char *envp[]) {
     targetArguments[argumentCount] = (char *)0;
 
 #if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
-    // Stock macOS Application-type WebKit helpers (WebContent, Networking,
-    // GPU, Safari.SandboxBroker) are launched with XPC_FLAGS=8019. iOS
-    // xpcproxy leaves 0x0 on this setuid iPhoneOS-platform first image, so
-    // stock Ventura xpc_main sees no managed receive right after exec.
-    // Mach ports survive raw chroot+execve; reconstituting the Application-
-    // type flags lets stock xpc_main consume the inherited one-shot right.
-    // Do not bootstrap_check_in the public macosbooter name.
+    // XPC_* is passed through unchanged (field notes §58/§59). Only the
+    // credential hop and the WebKit Gigacage default remain here.
     int isWebKit = 0;
     for (unsigned i = 0; i < sizeof(MacWSWebKitServices) / sizeof(MacWSWebKitServices[0]); ++i) {
         if (target && MacWSStringContains(target, MacWSWebKitServices[i].target))
             isWebKit = 1;
     }
+    const int isOverlay = MacWSIsOverlayProgram(
+        argc > 0 && argv ? argv[0] : (const char *)0);
     const char *incomingFlags = MacWSEnvironmentValue(envp, "XPC_FLAGS");
     const char *peerEnv = MacWSEnvironmentValue(envp, "MACWS_WK_PEER");
-    // Unique-peer children have no inherited SERVICE_SLOT receive
-    // (handshake: recv_rights=0). Do not reconstitute XPC_FLAGS=8019
-    // on the stock-image execve: the unsandboxed in-chroot probe
-    // delivered CONNECTION + dictionaries without Application-type
-    // managed flags.
     const int isUniquePeer = peerEnv &&
         MacWSStringContains(peerEnv, "com.macwsguide.wk.i.");
-    static char webkitFlags[] = "XPC_FLAGS=8019";
-    static char uniqueFlags[] = "XPC_FLAGS=0";
-    const int replaceZeroFlags = isWebKit && !isUniquePeer &&
-        MacWSFlagsAreZero(incomingFlags);
-    const int normalizeUniqueFlags = isWebKit && isUniquePeer;
-    const char *outgoingFlags = normalizeUniqueFlags ? "0"
-        : (replaceZeroFlags ? "8019"
-           : (incomingFlags && *incomingFlags ? incomingFlags : "(unset)"));
+    const char *passFlags =
+        incomingFlags && *incomingFlags ? incomingFlags : "(unset)";
         const char *program = argc > 0 && argv ? argv[0] : (const char *)0;
         const int alreadyPriv = MacWSEndsWith(program, ".priv");
         const long euid = MacWSSyscall0(MACWS_SYS_geteuid);
-        const int willExecPriv = isWebKit && euid != 0 && !alreadyPriv &&
-            MacWSPathHasSlash(program);
-        if (isWebKit) {
-            MacWSLogWebKitProxyFlags(incomingFlags, outgoingFlags,
+        const int willExecPriv = (isWebKit || isOverlay) && euid != 0 &&
+            !alreadyPriv && MacWSPathHasSlash(program);
+        if (isWebKit || isOverlay) {
+            MacWSLogWebKitProxyFlags(incomingFlags, passFlags,
                 program, target, isUniquePeer);
             MacWSLogWebKitProxyHandshake(program, alreadyPriv, willExecPriv);
         }
@@ -589,19 +645,13 @@ int main(int argc, char *argv[], char *envp[]) {
     size_t environmentCount = 0;
     for (char **entry = envp; entry && *entry; entry++) {
         // Replace only values that must describe the macOS process.  Preserve
-        // XPC_FLAGS and every launchd-provided entry byte-for-byte, except a
-        // zero Application-type WebKit XPC_FLAGS which is reconstituted below.
+        // XPC_FLAGS and every launchd-provided entry byte-for-byte.
         if (MacWSHasEnvironmentKey(*entry, "DYLD_INSERT_LIBRARIES") ||
             MacWSHasEnvironmentKey(*entry, "HOME") ||
             MacWSHasEnvironmentKey(*entry, "TMPDIR") ||
             MacWSHasEnvironmentKey(*entry, "MallocNanoZone") ||
             MacWSHasEnvironmentKey(*entry, MACWS_CHROOT_ROOT_KEY))
             continue;
-#if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
-        if ((replaceZeroFlags || normalizeUniqueFlags) &&
-            MacWSHasEnvironmentKey(*entry, "XPC_FLAGS"))
-            continue;
-#endif
         // Five canonical values plus NULL remain. Reject an oversized launch
         // context instead of silently discarding trailing one-shot XPC data.
         if (environmentCount + 6 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
@@ -627,13 +677,6 @@ int main(int argc, char *argv[], char *envp[]) {
         if (isWebKit) {
             if (environmentCount + 1 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
             targetEnvironment[environmentCount++] = gigacageOff;
-        }
-        if (replaceZeroFlags) {
-            if (environmentCount + 1 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
-            targetEnvironment[environmentCount++] = webkitFlags;
-        } else if (normalizeUniqueFlags) {
-            if (environmentCount + 1 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
-            targetEnvironment[environmentCount++] = uniqueFlags;
         }
     }
 #endif
