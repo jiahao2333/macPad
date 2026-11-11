@@ -1934,3 +1934,58 @@ Re-applying 8019 and SETEXEC of a proper posix_spawnattr therefore cannot resurr
 The missing system-level object is the launchd-issued spawnattr blob (≥ 0x104 bytes) plus the `ports` array that xpcproxy applies with SETEXEC — the same handshake iOS xpcproxy logs as **`No spawn attr blob`** on the WebKit first image (net17–net19). Until that blob is actually present (or the early destroy of a same-task RECEIVE is prevented *before* `__libxpc_initializer`), placing a RECEIVE in `SERVICE_SLOT` and setting `XPC_FLAGS=8019` in the exec environment will keep showing a dead name and `flags=0x0` at `main`. This turn did not invent a fake 0x104-byte blob (unsafe, version-specific, and too late once the right is already dead) and did not register a throwaway LaunchDaemon to ask launchd for a real one. No Safari hookup, no libmachook or proxy deploy. Device remains on net34.
 
 Throwaway CDHashes (not part of the WebKit install): probe_proxy arm64e `ef4ac526de45efec711db200481420605efbe1fd`; macws-appsvc-prexpc arm64 `12f93b980395fd23d5da46b9a7a1ed6815c15837` (sha1 `e9b6f6a1b53688a434312ede6ea96b8a9204fc56`); macws-appsvc-probe arm64 `269746af25865ca98cff6d8c56189ceee97d39ac` (sha1 `ce0e0391054a526b18b3d64aee80d01dfc4fb096`).
+
+## 58. Root cause: exec always destroys a same-task RECEIVE; the SERVICE_SLOT/8019 premise is false. Launchd-managed bundle job + chroot shim + stock xpc_main works end to end (2026-11-11 12:39–12:56 CST / 2026-11-10 20:39–20:56 PT)
+
+Throwaway probes only (`misc/appsvc_probe`, §58 section of its README). No Safari, no WebKit LaunchDaemon, no libmachook change, no `macosbooter.*` name. Device stayed on net34 (`libmachook` arm64e `d774151c50fb3e893c1d93f3d7df0063e200bc7b` / arm64 `6724bb1f417ae8fd618689b9ff0c4fc9184465ce` before and after), IconServices loaded, WebKit LDs unloaded.
+
+### Exp1: who kills the RECEIVE? (`probe_execkill`, 12:39:19–12:39:42 CST)
+
+Slot-2 RECEIVE `0x1c07 typ=0x30000` plus a probe name; a watcher holds a send right with a DEAD_NAME notification armed.
+
+| mode | right alive before exec | DEAD_NAME after exec | new image state when it died |
+|---|---|---|---|
+| no chroot, `SETEXEC\|START_SUSPENDED` of `/var/jb/usr/bin/true` | yes | +7 ms | `suspend_count=1` (no user instruction ran); `registered[2]=DEAD`, `[0]` send |
+| `chroot` then SETEXEC suspended of macOS `/bin/echo` | yes, still RECV +1.2 s after chroot | +12 ms | suspended |
+| no chroot, plain `execve`, `XPC_FLAGS=0x8099` | yes | +3 ms | died before new `main` (+44 ms); in `main`: slot2 `0xffffffff`, `XPC_FLAGS=0x80` |
+
+The right dies while the new task is still suspended, i.e. inside the kernel exec. xnu-8796 explains why: both `execve` and `posix_spawn(SETEXEC)` go through `cloneproc(CLONEPROC_FLAGS_FOR_EXEC)` → new task → `ipc_task_init` → **fresh IPC space**; registered ports are copied as **send** rights only (`ipc_port_copy_send_any`), then the old task is terminated, destroying its receive rights. Ruled out: chroot, libmachook, `__libxpc_initializer`, macOS-vs-iOS image, 8019 vs 0. (`__libxpc_initializer` also rewrites `XPC_FLAGS` to `"0x%llx"` of `flags & 0x82`, so `8019`→`0x0`, `0x8099`→`0x80`; it reads registered slot 0 only when bit 2 is set and never reads slot 2.) No SERVICE_SLOT RECEIVE can survive any exec on this kernel; §56/§57's "dead before main" was this, not libxpc.
+
+### Exp2: why stock xpc_main SIGTRAPs in the old chain (12:40:03 CST)
+
+Added a crash handler that prints PC symbol and every image's `__DATA,__crash_info`:
+
+```
+CRASH signal=5 pc=0x19ce99d34 sym=_xpc_copy_xpcservice_dictionary.cold.2 image=/usr/lib/system/libxpc.dylib
+CRASH_INFO ... message=Configuration error: Couldn't retrieve XPCService dictionary from service bundle.
+```
+
+Ventura `__fetch_xpcservice_info` asks launchd (routine 718, `{type:6, self:true}`) for the caller pid's identifier + XPCService dict. An unmanaged pid has none → brk. Unrelated to SERVICE_SLOT. The listener RECEIVE itself comes later from `bootstrap_check_in3` (routine 206) keyed by pid, and `__xpc_interface_routine` requires the reply from pid 1, so no userspace broker can stand in.
+
+### Exp3: launchd-managed Application bundle + chroot shim (proof)
+
+Bundle `com.macwsguide.probe.appsvcb` (`XPC!`, `ServiceType=Application`), `CFBundleExecutable` = iOS `probe_shim`. Client calls `xpc_add_bundle(path, 2)` → pid-domain job; iOS launchd + iOS xpcproxy spawn the shim; the shim `chroot`s and `execve`s the macOS stock-`xpc_main` service with `XPC_*` untouched and live libmachook inserted. The pid survives chroot+exec, so the macOS image's routine 718/206 are answered for the managed job.
+
+Bundle location matters: under `/var/mobile/...` xpcproxy failed `posix_spawn` EPERM (exit 78 EX_CONFIG, launchd.log); under jbroot (`/var/jb/tmp/macws-probe-b/...`) it spawns.
+
+| run (CST) | client | RunLoopType | shim | result |
+|---|---|---|---|---|
+| 12:50:51 | iOS, root | dispatch_main | root | accept, bootstrap event, `dispatch_sync_f(main)` returned (inline, `pthread_main=0`), reply `process-finished-launching`, client `ok=1` |
+| 12:52:31 | **macOS in chroot**, root (bundle mirrored in chroot) | dispatch_main | root | same, client `ok=1` |
+| 12:53:11 | macOS in chroot | dispatch_main | root, shim forces `XPC_FLAGS=8019` | same (8019 harmless: rewritten to `0x0`) |
+| 12:53:58 | macOS in chroot | **NSRunLoop** | root, 8019 | main CFRunLoop live (`kCFRunLoopDefaultMode`), `dispatch_sync_f ran pthread_main=1`, returned, `ok=1` |
+| 12:55:56 | **iOS, mobile** | NSRunLoop | **mobile → setuid `.priv` hop (same pid) → chroot** | same, `ok=1` |
+| 12:56:34 | macOS in chroot, **no in-chroot mirror** | NSRunLoop | root | same, `ok=1` (path is resolved by host launchd only) |
+
+Every run: after exec, slot 2 is empty and `XPC_FLAGS=0x0`, yet stock `xpc_main` accepts. launchd.log: `Successfully spawned macws-appsvcb[pid] because ipc (mach)`; a benign `sent an invalid request`; at client exit, `SIGTERM` → `SIGKILL` "during teardown of process-scoped services after host exited" (probe service never exits on SIGTERM).
+
+### Fix direction (generic, not per-app)
+
+The working path is the stock one: a **launchd pid-domain XPCService job** whose iOS first image only crosses into the chroot. Concretely:
+
+1. Remove the SERVICE_SLOT / `XPC_FLAGS=8019` reconstitution from `ViewBridgeChrootProxy` (`replaceZeroFlags`/`webkitFlags`/comments). Pass launchd's `XPC_*` through unchanged; check-in is by pid.
+2. Launch Application-type macOS XPC services as bundle jobs in the **client's** pid domain (`xpc_add_bundle(host_path, 2)`), not as `com.macwsguide.webkit.*` LaunchDaemons publishing `macosbooter.*` names (those get no XPCService dict → this SIGTRAP or a non-stock listener). Generic hook point: the existing libmachook `xpc_connection_create` interposer (client side) — for a name that resolves to an `XPCServices/*.xpc` bundle of the main bundle or a loaded framework, register a jbroot **overlay bundle** once, then fall through to stock create.
+3. Overlay bundle (generated, under jbroot): copy of the macOS `Info.plist` with `CFBundleExecutable` replaced by the generic chroot proxy (non-setuid, with `*.priv` setuid sibling, as today); the proxy derives the macOS target executable from its own overlay path (no env needed; launchd passes none).
+4. Keep `RunLoopType` from the stock plist (WebKit's main-thread `dispatchSync` needs a live main CFRunLoop; NSRunLoop proven here).
+
+Residual risk / unknowns: jetsam limit of these jobs (probe got 6 MB; WebContent needs a real limit/priority), `_MultipleInstances` instance routing (WebContent), whether Ventura WebKit expects launchd to pre-populate framework XPCServices (macOS) vs explicit add, process-scoped teardown on host exit, and AppKit `_NSApplicationMain` RunLoopType (not tested).

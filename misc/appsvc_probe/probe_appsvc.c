@@ -19,6 +19,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#include <sys/ucontext.h>
 
 #ifndef MACH_PORT_TYPE_RECEIVE
 #define MACH_PORT_TYPE_RECEIVE 0x00020000
@@ -174,6 +177,52 @@ static void handle_peer(xpc_connection_t peer) {
     xpc_connection_resume(peer);
 }
 
+
+/* §58: on SIGTRAP/SIGABRT/SIGILL, print the faulting PC and every loaded
+ * image's __DATA,__crash_info message (libxpc stores its configuration-error
+ * text in gCRAnnotations.message right before `brk #1`). */
+static void crash_handler(int sig, siginfo_t *si, void *ucv) {
+    (void)si;
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint64_t pc = 0;
+    if (uc && uc->uc_mcontext)
+        pc = (uint64_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+    Dl_info di;
+    memset(&di, 0, sizeof(di));
+    dladdr((void *)pc, &di);
+    logf_svc("CRASH signal=%d pc=0x%llx sym=%s image=%s", sig,
+             (unsigned long long)pc, di.dli_sname ? di.dli_sname : "?",
+             di.dli_fname ? di.dli_fname : "?");
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header_64 *h =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        unsigned long sz = 0;
+        uint8_t *p = h ? getsectiondata(h, "__DATA", "__crash_info", &sz) : NULL;
+        if (!p || sz < 16) continue;
+        uint64_t *a = (uint64_t *)p;
+        if (a[1])
+            logf_svc("CRASH_INFO image=%s message=%s", _dyld_get_image_name(i),
+                     (const char *)a[1]);
+        if (sz >= 40 && a[4])
+            logf_svc("CRASH_INFO image=%s message2=%s", _dyld_get_image_name(i),
+                     (const char *)a[4]);
+    }
+    _exit(128 + sig);
+}
+
+static void install_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+
 static void alarm_die(int sig) {
     (void)sig;
     logf_svc("WATCHDOG timeout accepted=%d sync_ran=%d sync_returned=%d",
@@ -185,6 +234,7 @@ int main(int argc, const char **argv) {
     logf_svc("start uid=%d euid=%d argv0=%s",
              (int)getuid(), (int)geteuid(),
              (argv && argv[0]) ? argv[0] : "(null)");
+    install_crash_handler();
     log_ports_and_flags("after-exec");
     log_gcd_cf_state("before-xpc_main");
 
