@@ -2165,3 +2165,91 @@ in both the DYLD_INTERPOSE early path and Metal's shared-cache `hooked_xpc_conne
 * Roll back libmachook: `sh /var/mobile/net39/rollback.sh pre-net39-20261111-171135` (→ net38). Overlays only:
   `sh /var/mobile/net39/rmoverlays.sh`. Full net38: `sh /var/mobile/net38/rollback.sh pre-net38-20261111-141636`.
 * Probe overlays/app removed (`run_probe59.sh cleanup`); IconServices 1724 / 53067 (uid 240) / 53071 untouched.
+
+## 61. Safari paints: example.com and baidu render over the overlay route (net39e–i + macOS trustd/securityd) (2026-11-11 17:56–18:22 CST)
+
+Result: run r93 (18:14–18:15 CST) loaded both pages. **https://example.com** showed its body text and the "Learn more" link,
+and **https://www.baidu.com** rendered in full: nav bar, logo, search box, 热搜 list and footer. Both loaded over HTTPS with the padlock,
+in two separate tabs. Screenshots: `/Users/chenjiahao/net39-shots/r93-{example,baidu}{,-small}.png` (not committed).
+Three crash causes and one trust-stack gap were fixed in order:
+
+### 1. Diagnostics (net39e)
+* `macws_install_overlay_helper_diag()` is called from the libmachook constructor right after `macws_install_crash_diag()`.
+  It applies to processes with `XPC_SERVICE_NAME` = `com.macwsguide.xpc.*` (WebKit helpers):
+  * dup2s fd 1/2 to `/tmp/macws-xpchelper/<leaf>.<pid>.log` (rootfs `/tmp` inside the chroot);
+  * installs SEGV/BUS/ILL/TRAP/ABRT handlers through the new `macws_crash_diag_install_signals()`, which prints registers and a dladdr backtrace.
+* In Safari it writes `Safari.<pid>.log` and keeps only WebKit-family images.
+* MSHooks `_os_log_impl/_error/_fault/_debug`, decodes the buffer (`[summary][count]` then `[desc][len][data]`;
+  type = desc>>4, 0 = scalar, 2 = string pointer) and emits `oslog … fmt | args`, capped at 20000 lines.
+* Kill switch: `/usr/local/etc/macws-xpchelper-diag.disable`. No new exports (T=168 per slice).
+
+### 2. WebContent SIGTRAP = dispatch_sync onto main from main (r78 → fixed in net39f)
+* Backtrace: `_dispatch_sync_f_slow` trap inside the `XPCServiceEventHandler` block. WebKit handles the bootstrap
+  message on the connection's own queue and then `dispatch_sync`s (async_and_wait) `*ServiceInitializer` onto the main queue.
+  libmachook's `macws_webkit_xpc_main_connection` had re-targeted the accepted peer connection to main and wrapped its
+  handler, so the handler was already on main → the sync onto main deadlocked and libdispatch trapped.
+* Fix: for overlay helpers, `macws_webkit_xpc_main_connection` just calls the user handler: no `set_target_queue(main)`,
+  no wrap. Rule: in a stock `xpc_main` helper, never move the internal listener or peers onto the main queue.
+
+### 3. Networking BUS_ADRALN at NetworkServiceInitializer+0 (r80 → fixed in net39g)
+* Every Networking died with a misaligned access at the first instruction of `NetworkServiceInitializer`. The offset
+  MSHooks for `InitializeWebKit2`/`runInitializationCode` failed to resolve in the macOS WebKit build (`orig=0x0`), but
+  ElleKit had already made the 16K shared-cache text page writable and rewritten it, corrupting neighbouring code.
+* Fix: `macws_install_webkit_init_mainthread` returns early in overlay helpers ("skip InitializeWebKit2/runInitializationCode
+  offset hooks"). Lesson: never offset-hook shared-cache text you cannot verify, and never apply a 16-byte patch to a tiny function.
+
+### 4. The "Safari kills Networking" signal 9 was cleanup, not the cause
+* Safari's os_log showed `NetworkProcessProxy::didClose (Network Process crash)` with `PID=0`: the process never finished
+  launching. The helpers were really crashing (sections 2, 3 and 5). launchd's `signal service: caller = Safari … value = 0x9`
+  is WebKit tearing down an already-dying helper before relaunching it, not a handshake timeout.
+
+### 5. Sandbox CRASH in `AuxiliaryProcess::initializeSandbox` (r82 → net39h failed → net39i)
+* Log: "Could not apply cached/compiled sandbox: Operation not supported". macOS `sandbox_apply` returns ENOTSUP on the
+  iOS kernel, and `enableSandboxStyleFileQuarantine` returns -2.
+* net39h MSHooked `sandbox_apply`. That function is tiny, so the 16-byte trampoline clobbered the next function → random-pc
+  crashes. Reverted.
+* net39i MSHooks the large `_ZN6WebKit16AuxiliaryProcess17initializeSandboxERKNS_40AuxiliaryProcessInitializationParametersERNS_31SandboxInitializationParametersE`
+  (dlsym, with an MSFindSymbol fallback in the WebKit image) to a no-op. Log: `SANDBOX-COMPAT AuxiliaryProcess::initializeSandbox -> skipped`.
+  It is installed in helpers before the diag kill-switch check. This matches the existing chroot policy (`sandbox_init*` are no-ops).
+  The quarantine step is skipped with it.
+
+### 6. "This Connection Is Not Private" = macOS trustd not running (r86 → fixed before r93)
+* r86: no crashes, and WebContent painted the WebKit error page, but every TLS load failed. Networking log: "Failed to talk to trustd after 4 attempts",
+  -1202 / -9807. launchd: `failed lookup com.apple.macosbooter.trustd … No such process`.
+* `com.macwsguide.trustd` / `com.macwsguide.securityd` (HIServicesProxy + `MACWS_XPC_TARGET`) were not loaded.
+  `launchctl load` as mobile put them in user/501 and they died with OS_REASON_EXEC, so they were unloaded again.
+* Fix: `jbctl trustcache add` the rootfs CDHashes. trustd `e593548e60684e31bfaee776361dfbad04e38ee0` and securityd
+  `80cc821021c57f97870d823ad347834d711a7b0f`, then `launchctl bootstrap system /var/jb/usr/macOS/LaunchDaemons/com.macwsguide.{trustd,securityd}.plist`.
+  They now run as pids 18824 and 18827.
+* **Reboot-volatile:** both the trustcache entries and the bootstrap are lost on reboot, and neither is wired into `macos_gui.sh` yet. That is a follow-up.
+
+### 7. First-run sheet
+* `defaults write` failed. Wrote `WBSOnboardingStatesDefaultsKeyV0.2` directly into
+  `/var/mnt/rootfs/var/root/Library/Preferences/com.apple.Safari.plist`. Backup:
+  `/var/mobile/macws-rollback/com.apple.Safari.plist.pre-net39e-20261111-175654`. The sheet was still up in r78 and gone from r86 on.
+
+### Run summary
+| run | lib | result |
+|---|---|---|
+| r78 | net39e | WebContent SIGTRAP (§61.2) |
+| r80 | net39f | Networking BUS_ADRALN (§61.3) |
+| r82 | net39g | initializeSandbox CRASH (§61.5) |
+| r84 | net39h | random-pc crashes from the sandbox_apply trampoline; reverted |
+| r86 | net39i | no crashes; error page painted; TLS -9807 (§61.6) |
+| r93 | net39i + trustd/securityd | **both pages painted**; LAUNCH_WINDOW_OK, CAPTURE_OK×2, CORE_OK; 20 accepted conns; 1 GPU, 1 Networking, 18 WebContent logs; no `_sigtramp`/CRASH, no trust errors |
+
+* Memory: free fell to ~29–80 MB during r86/r93 (compressor 30672→32154) and recovered (1489 MB after r93; 52% free at 18:22 CST).
+  No watchdog abort, no jetsam of core processes, no reboot (uptime 1 d 7 h).
+* Open items:
+  * 18 WebContent processes for 2 tabs (Start Page and prewarm churn; `canTerminateAuxiliaryProcess` false) needs a look.
+  * The example.com `<h1>` "Example Domain" heading is missing from the screenshot (bold/system font?).
+  * Wire trustd/securityd into `macos_gui.sh`.
+
+### Hashes / rollback
+* LIVE libmachook net39i: arm64e `5511ed9a6d39bdf153590f331cd67955b096db3c`, arm64 `b09c891e03cd7ae7cd7bd6e0b19ba40b99ac2736`
+  (T=168 per slice).
+* Backup tags: `pre-net39-20261111-181012` (net39h), `-180613` (net39g), `-180310` (net39f), `-180014` (net39e), `-175735` (net39d).
+* Roll back to net38: `sh /var/mobile/net39/rollback.sh pre-net39-20261111-171135`. Overlays only: `rmoverlays.sh`.
+* MacWSXPCProxy unchanged (`125451486bdee2858e5845a6ef3ec344dd37d202`).
+* Unchanged: `com.macwsguide.webkit.*` LaunchDaemons unloaded, no public `macosbooter.WebKit.*` listeners,
+  no `XPC_FLAGS=8019` in helpers, IconServices 1724 / 53067 (uid 240) / 53071, GIGACAGE_ENABLED=0.

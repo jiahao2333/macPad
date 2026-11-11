@@ -5820,9 +5820,26 @@ static void macws_log_webkit_service_initializer_callsite(
     macws_webkit_init_log(msg);
 }
 
+static bool macws_is_overlay_xpc_helper(void);
+
 static void macws_install_webkit_init_mainthread(const struct mach_header *header) {
     if (!macws_is_webkit_helper_process())
         return;
+    // §61: overlay helpers run the stock xpcproxy contract, so the
+    // bootstrap already reaches InitializeWebKit2 on the real main thread.
+    // The offset hook here never got a trampoline (orig=0x0) but still
+    // rewrote the shared-cache text page that also holds
+    // NetworkServiceInitializer / WebContentServiceInitializer: the first
+    // call into that page faulted (BUS_ADRALN at
+    // NetworkServiceInitializer+0, every Networking in net39f).
+    if (macws_is_overlay_xpc_helper()) {
+        if (!atomic_exchange_explicit(&g_macws_webkit_init_hooked, true,
+                                      memory_order_acq_rel))
+            macws_webkit_init_log(
+                "overlay helper: skip InitializeWebKit2/runInitializationCode "
+                "offset hooks");
+        return;
+    }
     if (atomic_exchange_explicit(&g_macws_webkit_init_hooked, true,
                                  memory_order_acq_rel))
         return;
@@ -8109,6 +8126,200 @@ static void macws_crash_diag_handler(int signo, siginfo_t *info, void *uctx_) {
     if (len > MACWS_CRASH_BUF_LEN) len = MACWS_CRASH_BUF_LEN;
     (void)write(STDERR_FILENO, macws_crash_buf, len);
     _exit(128 + signo);
+}
+
+// §61 overlay-helper diagnostics. launchd discards stderr of the stock
+// macOS WebKit helpers started through MacWSXPCProxy, and WebKit's own
+// reasons (RELEASE_LOG / RELEASE_LOG_FAULT) only go to os_log. For
+// overlay helpers (XPC_SERVICE_NAME com.macwsguide.xpc.*) send fd 1/2 to
+// /tmp/macws-xpchelper/<leaf>.<pid>.log, install the crash handler, and
+// mirror os_log calls (format + scalar/string args, no ObjC description)
+// to that file. Safari mirrors only WebKit-family dsos into
+// /tmp/macws-xpchelper/Safari.<pid>.log. No exports; internal only.
+static int g_macws_wklog_fd = -1;
+static int g_macws_wklog_safari = 0;
+static _Atomic unsigned g_macws_wklog_lines;
+static __thread int g_macws_wklog_busy;
+
+static int macws_wklog_dso_wanted(void *dso) {
+    if (!g_macws_wklog_safari) return 1;
+    Dl_info di;
+    if (!dso || !dladdr(dso, &di) || !di.dli_fname) return 0;
+    const char *f = di.dli_fname;
+    return strstr(f, "/WebKit.framework/") || strstr(f, "/WebCore.framework/") ||
+           strstr(f, "/WebKitLegacy.framework/") || strstr(f, "/JavaScriptCore.framework/");
+}
+
+static void macws_wklog_emit(void *dso, unsigned type, const char *fmt,
+                             const uint8_t *buf, uint32_t size) {
+    if (g_macws_wklog_fd < 0 || g_macws_wklog_busy) return;
+    if (atomic_fetch_add_explicit(&g_macws_wklog_lines, 1,
+                                  memory_order_relaxed) > 20000) return;
+    g_macws_wklog_busy = 1;
+    if (!macws_wklog_dso_wanted(dso)) { g_macws_wklog_busy = 0; return; }
+    char out[1600];
+    size_t o = 0;
+#define WKPUT(...) do { if (o < sizeof(out) - 1) { int k_ = snprintf(out + o, sizeof(out) - o, __VA_ARGS__); \
+        if (k_ > 0) { o += (size_t)k_; if (o > sizeof(out) - 2) o = sizeof(out) - 2; } } } while (0)
+    struct timeval tv; gettimeofday(&tv, NULL);
+    WKPUT("%ld.%03d oslog t=0x%x main=%d tid=%llu ", (long)tv.tv_sec,
+          (int)(tv.tv_usec / 1000), type, pthread_main_np(),
+          (unsigned long long)pthread_mach_thread_np(pthread_self()));
+    WKPUT("%.700s", fmt ? fmt : "(null)");
+    if (buf && size >= 2) {
+        uint32_t i = 2;
+        unsigned n = buf[1];
+        WKPUT(" |");
+        for (unsigned a = 0; a < n && i + 2 <= size; a++) {
+            uint8_t d = buf[i], len = buf[i + 1];
+            i += 2;
+            if (i + len > size) break;
+            unsigned t = d >> 4;
+            if (t == 0 && len <= 8) {
+                uint64_t v = 0;
+                memcpy(&v, buf + i, len);
+                int64_t sv = len == 1 ? (int8_t)v : len == 2 ? (int16_t)v :
+                             len == 4 ? (int32_t)v : (int64_t)v;
+                WKPUT(" %lld", (long long)sv);
+            } else if (t == 2 && len == 8) {
+                const char *str = NULL;
+                memcpy(&str, buf + i, 8);
+                WKPUT(" \"%.240s\"", str ? str : "(null)");
+            } else {
+                WKPUT(" <t%u/%u>", t, (unsigned)len);
+            }
+            i += len;
+        }
+    }
+    WKPUT("\n");
+#undef WKPUT
+    (void)write(g_macws_wklog_fd, out, o);
+    g_macws_wklog_busy = 0;
+}
+
+typedef void (*macws_oslog_fn)(void *, void *, unsigned, const char *,
+                               uint8_t *, uint32_t);
+#define MACWS_OSLOG_HOOK(NAME) \
+    static macws_oslog_fn orig_##NAME; \
+    static void hooked_##NAME(void *dso, void *log, unsigned type, \
+                              const char *fmt, uint8_t *buf, uint32_t size) { \
+        macws_wklog_emit(dso, type, fmt, buf, size); \
+        orig_##NAME(dso, log, type, fmt, buf, size); \
+    }
+MACWS_OSLOG_HOOK(_os_log_impl)
+MACWS_OSLOG_HOOK(_os_log_error_impl)
+MACWS_OSLOG_HOOK(_os_log_fault_impl)
+MACWS_OSLOG_HOOK(_os_log_debug_impl)
+
+// §61 macOS sandbox profiles cannot be applied by the iOS kernel
+// (`Could not apply cached/compiled sandbox: Operation not supported`), and
+// WebKit's AuxiliaryProcess::initializeSandbox then CRASH()es every
+// Networking/WebContent; after that it also needs macOS quarantine
+// (enableSandboxStyleFileQuarantine -> -2 -> exit(EX_NOPERM)).
+// sandbox_init / sandbox_init_with_parameters are already the chroot's
+// no-op compatibility boundary (sandbox_init_new). Apply the same boundary
+// one level up for overlay WebKit helpers only: AuxiliaryProcess::
+// initializeSandbox returns without applying a profile. (An inline hook on
+// libsandbox's sandbox_apply was tried first and is unsafe: the entry is
+// shorter than the 16-byte patch and clobbered the neighbouring function,
+// random-pc crashes at initializeSandbox+0x9c0 in net39h.)
+static void hooked_macws_wk_initialize_sandbox(void *self, const void *params,
+                                               void *sandboxParams) {
+    (void)self; (void)params; (void)sandboxParams;
+    static _Atomic unsigned logged;
+    if (atomic_fetch_add_explicit(&logged, 1, memory_order_relaxed) < 2) {
+        macws_webkit_init_log("SANDBOX-COMPAT AuxiliaryProcess::initializeSandbox "
+                              "-> skipped (macOS sandbox/quarantine unavailable "
+                              "on iOS host)");
+        fprintf(stderr, "#### SANDBOX-COMPAT AuxiliaryProcess::initializeSandbox skipped\n");
+    }
+}
+
+static void macws_install_overlay_helper_sandbox_compat(void) {
+    static const char *names[] = {
+        "_ZN6WebKit16AuxiliaryProcess17initializeSandboxERKNS_40AuxiliaryProcessInitializationParametersERNS_31SandboxInitializationParametersE",
+        "__ZN6WebKit16AuxiliaryProcess17initializeSandboxERKNS_40AuxiliaryProcessInitializationParametersERNS_31SandboxInitializationParametersE",
+    };
+    void *sym = NULL;
+    for (size_t i = 0; i < 2 && !sym; i++)
+        sym = dlsym(RTLD_DEFAULT, names[i]);
+    if (!sym) {
+        for (uint32_t i = 0, n = _dyld_image_count(); i < n && !sym; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (!nm || !strstr(nm, "/WebKit.framework/")) continue;
+            MSImageRef img = MSGetImageByName(nm);
+            if (img) sym = MSFindSymbol(img, names[1]);
+        }
+    }
+    void *unused = NULL;
+    if (sym)
+        MSHookFunction(sym, (void *)hooked_macws_wk_initialize_sandbox, &unused);
+    char m[200];
+    snprintf(m, sizeof(m),
+             "overlay helper initializeSandbox hook sym=%p tramp=%p", sym, unused);
+    macws_webkit_init_log(m);
+}
+
+static void macws_crash_diag_install_signals(void);
+
+static void macws_install_overlay_helper_diag(void) {
+    const char *svc = getenv("XPC_SERVICE_NAME");
+    const char *prog = getprogname();
+    int helper = svc && !strncmp(svc, "com.macwsguide.xpc.", 19) &&
+                 macws_is_webkit_helper_process();
+    int safari = prog && !strcmp(prog, "Safari");
+    if (!helper && !safari) return;
+    if (helper) macws_install_overlay_helper_sandbox_compat();
+    if (access("/usr/local/etc/macws-xpchelper-diag.disable", F_OK) == 0) return;
+    mkdir("/tmp/macws-xpchelper", 0755);
+    char path[256];
+    const char *leaf = helper ? svc + 19 : "Safari";
+    const char *dot = strrchr(leaf, '.');
+    if (helper && dot && dot[1]) leaf = dot + 1;
+    snprintf(path, sizeof(path), "/tmp/macws-xpchelper/%s.%d.log", leaf, getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    if (helper) {
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        g_macws_wklog_fd = STDERR_FILENO;
+        close(fd);
+        macws_crash_diag_install_signals();
+    } else {
+        g_macws_wklog_fd = fd;
+        g_macws_wklog_safari = 1;
+    }
+    char hdr[400];
+    int n = snprintf(hdr, sizeof(hdr),
+                     "#### macws diag pid=%d ppid=%d prog=%s svc=%s helper=%d\n",
+                     getpid(), getppid(), prog ? prog : "?", svc ? svc : "-", helper);
+    if (n > 0) (void)write(g_macws_wklog_fd, hdr, (size_t)n);
+    struct { const char *sym; void *rep; void **orig; } hooks[] = {
+        { "_os_log_impl", (void *)hooked__os_log_impl, (void **)&orig__os_log_impl },
+        { "_os_log_error_impl", (void *)hooked__os_log_error_impl, (void **)&orig__os_log_error_impl },
+        { "_os_log_fault_impl", (void *)hooked__os_log_fault_impl, (void **)&orig__os_log_fault_impl },
+        { "_os_log_debug_impl", (void *)hooked__os_log_debug_impl, (void **)&orig__os_log_debug_impl },
+    };
+    for (size_t k = 0; k < sizeof(hooks) / sizeof(hooks[0]); k++) {
+        void *sym = dlsym(RTLD_DEFAULT, hooks[k].sym);
+        if (sym) MSHookFunction(sym, hooks[k].rep, hooks[k].orig);
+        n = snprintf(hdr, sizeof(hdr), "#### oslog hook %s=%p orig=%p\n",
+                     hooks[k].sym, sym, *hooks[k].orig);
+        if (n > 0) (void)write(g_macws_wklog_fd, hdr, (size_t)n);
+    }
+}
+
+static void macws_crash_diag_install_signals(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = macws_crash_diag_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
 }
 
 static void macws_install_crash_diag(void) {
@@ -11908,6 +12119,7 @@ __attribute__((constructor)) void InitStuff() {
     // and executable replacement-code admission are established.
     MacWSInstallExtensionRuntimeCompatibility();
     macws_install_crash_diag();
+    macws_install_overlay_helper_diag();
     macws_install_osxvnc_hooks();
     // HID bypass is OPT-IN. Whole-IOKit-symbol hooking creates a tower of
     // MSHook'd functions; if any one of them is itself called recursively
@@ -15269,6 +15481,16 @@ void macws_xpc_wrap_app_event_handler(
         xpc_handler_t user = handler;
         orig(connection, ^(xpc_object_t event) {
             void (^run)(void) = ^{
+                if (event && xpc_get_type(event) == XPC_TYPE_ERROR &&
+                    macws_is_overlay_xpc_helper()) {
+                    const char *desc = xpc_dictionary_get_string(
+                        event, XPC_ERROR_KEY_DESCRIPTION);
+                    char em[200];
+                    snprintf(em, sizeof(em),
+                             "overlay helper accepted conn=%p xpc error=%s",
+                             connection, desc ? desc : "?");
+                    macws_webkit_init_log(em);
+                }
                 if (macws_is_webcontent_process()) {
                     const char *typ = "other";
                     if (!event)
@@ -17999,8 +18221,19 @@ static void macws_webkit_xpc_main_connection(xpc_connection_t conn) {
              conn, pthread_main_np(),
              unique_in ? "incoming-serial" : "main");
     macws_webkit_init_log(m);
-    if (conn && macws_is_overlay_xpc_helper())
-        macws_overlay_remember_accepted(conn);
+    if (conn && macws_is_overlay_xpc_helper()) {
+        // §61: launchd-managed overlay helper == stock macOS xpcproxy
+        // contract. WebKit's XPCServiceEventHandler runs the bootstrap on
+        // the connection's own queue and dispatch_sync()s the initializer
+        // onto the main queue; retargeting the peer to main (or bouncing
+        // its events onto main) made that dispatch_sync trap with
+        // "already owned by current thread" (SIGTRAP in every WebContent
+        // and Networking, net39e). Leave queue and handler untouched.
+        (void)macws_overlay_remember_accepted;
+        if (g_macws_webkit_xpc_main_user)
+            g_macws_webkit_xpc_main_user(conn);
+        return;
+    }
     if (conn) {
         /* Unique accepted peers stay on a live background serial
          * queue; the wrap bounces the stock handler onto main. */
