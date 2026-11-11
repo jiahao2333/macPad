@@ -34,6 +34,8 @@ INDEX = ROOTFS + "/usr/local/var/macws-xpc-overlay"
 REQUESTS = ROOTFS + "/usr/local/var/macws-xpc-overlay-requests"
 PROXY = "/var/jb/usr/macOS/libexec/MacWSXPCProxy"
 PROXY_PRIV = PROXY + ".priv"
+RESERVED_PREFIXES = ("com.apple.WebKit.",)
+ALIAS_PREFIX = "com.macwsguide.xpc."
 ROOTS = [
     "/System/Library/Frameworks",
     "/System/Library/PrivateFrameworks",
@@ -157,9 +159,33 @@ def generate(chroot_bundle, verbose=True):
     ensure_dir(odir)
     info["CFBundleExecutable"] = EXE
     info["MacWSOverlaySource"] = real
+    # §60: iOS launchd denies every pid-domain lookup of a com.apple.WebKit.*
+    # identifier ("denied lookup ... error = 159: Sandbox restriction"), even
+    # from an unsandboxed root client, because iOS WebKit owns that prefix.
+    # Register such bundles under a private alias; libmachook reads it from
+    # the index and connects to the alias instead.
+    alias = ""
+    for prefix in RESERVED_PREFIXES:
+        if ident.startswith(prefix):
+            alias = ALIAS_PREFIX + ident
+            break
+    if alias:
+        info["CFBundleIdentifier"] = alias
+        info["MacWSOverlayIdentifier"] = ident
     for k in ("CFBundleSupportedPlatforms", "LSMinimumSystemVersion",
               "DTPlatformName", "DTSDKName"):
         info.pop(k, None)
+    # §60: these XPCService keys mean something different to iOS launchd.
+    # The macOS client is not a RunningBoard-tracked iOS app, so a
+    # RunningBoard-managed helper has no owning assertion; _ProcessType
+    # selects an iOS jetsam/QoS class; _HighBitsASLR would apply to the
+    # proxy image, not the macOS target. The proven net18-net34 WebKit proxy
+    # bundles carried none of them. Keep RunLoopType, ServiceType,
+    # JoinExistingSession and _MultipleInstances verbatim.
+    xs = info.get("XPCService")
+    if isinstance(xs, dict):
+        for k in ("_AdditionalProperties", "_ProcessType", "_HighBitsASLR"):
+            xs.pop(k, None)
     tmp = odir + "/Info.plist.tmp"
     with open(tmp, "wb") as f:
         plistlib.dump(info, f, fmt=plistlib.FMT_XML)
@@ -176,11 +202,14 @@ def generate(chroot_bundle, verbose=True):
         os.lchown(p, 0, 0)
     ensure_dir(INDEX)
     with open(INDEX + "/" + key, "w") as f:
-        f.write("%s\t%s\n" % (ident, real))
+        if alias:
+            f.write("%s\t%s\t%s\n" % (ident, real, alias))
+        else:
+            f.write("%s\t%s\n" % (ident, real))
     os.chmod(INDEX + "/" + key, 0o644)
     if verbose:
         rlt = (info.get("XPCService") or {}).get("RunLoopType", "-")
-        print("OVERLAY %s %s id=%s runloop=%s" % (key, real, ident, rlt))
+        print("OVERLAY %s %s id=%s alias=%s runloop=%s" % (key, real, ident, alias or "-", rlt))
     return "ok"
 
 

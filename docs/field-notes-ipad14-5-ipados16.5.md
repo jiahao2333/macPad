@@ -2094,3 +2094,74 @@ If `ldid -h` on a rootfs dylib is SIGKILLed afterwards, recopy the signed jb fil
   - jetsam limit (§58 probe saw 6 MB; WebContent needs more);
   - `_MultipleInstances` routing;
   - shared-cache NSXPC callers.
+
+## 60. WebKit on the overlay route (net39): reserved `com.apple.WebKit.` prefix → private alias; helpers now accept, InitializeWebProcess/CreateWebPage dictionaries and CAContexts arrive; page area still unpainted (2026-11-11 17:05–17:39 CST)
+
+### Overlays generated (WebKit only, no `--all`)
+`macws_xpc_overlay_gen.py` run on exactly four bundles (device stage `/var/mobile/net39/gen.sh`). Bundles in
+`/var/jb/usr/macOS/libexec/macws-xpc-overlay/<key>/`, index rows in `/var/mnt/rootfs/usr/local/var/macws-xpc-overlay/<key>`:
+
+| key | service | launchd name |
+|---|---|---|
+| `1f63cdecd83dfb45` | com.apple.WebKit.WebContent | `com.macwsguide.xpc.com.apple.WebKit.WebContent` |
+| `4769e823a9522428` | com.apple.WebKit.Networking | `com.macwsguide.xpc.com.apple.WebKit.Networking` |
+| `81b3b853e4b7b82a` | com.apple.WebKit.GPU | `com.macwsguide.xpc.com.apple.WebKit.GPU` |
+| `a41f7ab36c07115d` | com.apple.Safari.SandboxBroker | (no alias) |
+
+Generator changes: strips `XPCService._AdditionalProperties` (RunningBoard Managed), `_ProcessType`, `_HighBitsASLR` (the proven
+net18–34 proxy plists never carried them); keeps RunLoopType/ServiceType/JoinExistingSession/`_MultipleInstances`. Names under
+`RESERVED_PREFIXES = ("com.apple.WebKit.",)` get `CFBundleIdentifier = com.macwsguide.xpc.<id>`, `MacWSOverlayIdentifier = <id>`, and
+a third index column with the alias. `com.macwsguide.webkit.*` LaunchDaemons stay unloaded; no listener on any public
+`macosbooter.WebKit.*` name. Delete only the overlays: `sh /var/mobile/net39/rmoverlays.sh` (removes the four keys in
+`overlay-keys.txt` from both dirs).
+
+### iOS launchd reserves `com.apple.WebKit.*` lookups
+Safari run 1 (17:08) used the overlays but launchd logged `denied lookup … error = 159: Sandbox restriction` for the WebContent and
+Networking instances → no window. Bisected with iOS probe clients (`misc/appsvc_probe/probe_sbclient.c`, `sbcheck.c`):
+* live Safari is **not** sandboxed (`sandbox_check(pid, NULL, 0) = 0`); a Mach sandbox extension (net39a) changed nothing;
+* signing the probe with Safari's live entitlements, app-sandbox, app-server, no-sandbox or no-container: no difference;
+* unsandboxed root client, with or without `_MultipleInstances` instance: `com.apple.WebKit.MacWSProbe` **denied**,
+  `com.apple.WebKit.WebContent` **denied**, `com.macwsguide.xpc.com.apple.WebKit.WebContent` **ok=1** (17:22).
+So the denial is a name-prefix policy of iOS launchd for pid-domain bundle services, not a property of the client. iOS libsandbox
+cannot compile SBPL ("profile compilation not supported on this platform") so it cannot be granted from the client side.
+
+Fix (net39b): libmachook returns the alias to the stock create — `macws_xpc_overlay_service_name(name)` (hidden, cached per index row)
+in both the DYLD_INTERPOSE early path and Metal's shared-cache `hooked_xpc_connection_create`. A probe whose real bundle id is
+`com.apple.WebKit.MacWSProbe.overlaymi` (aliased, `_MultipleInstances`, stock `xpc_main`) round-trips `bootstrap` →
+`process-finished-launching` ok=1 (17:33), i.e. "launchd name ≠ the executable's bundle id" is fine for libxpc.
+
+### Helper side: two blockers removed
+1. **net39c — no 8019 reconstitution.** Run 4 (net39b, 17:24) had window + overlay spawns but 0 accepts and a respawn storm
+   (≈53 WebContent creates) → watchdog abort on a compressor spike. `macws_webkit_reapply_packed_xpc_flags` no longer writes
+   `XPC_FLAGS=8019` (§58 already showed SERVICE_SLOT never survives exec); helpers now log `kept XPC_FLAGS=0x0`. Run 5 (17:27):
+   no storm, memory flat, still 0 accepts.
+2. **net39d — do not force xpc_main's own handlers onto main.** The helper-side `set_event_handler` wrap re-targeted *every*
+   connection in a WebKit helper to the main queue, including the listener/bootstrap connections stock `xpc_main` installs
+   internally; Application-type `xpc_main` does not drain the main queue before the first peer → deadlock. For
+   `XPC_SERVICE_NAME` prefixed `com.macwsguide.xpc.` only connections handed to `macws_webkit_xpc_main_connection` (recorded) get
+   the wrap; everything else goes straight to the original (`overlay helper set_event_handler passthrough`).
+
+### Safari run 6 (net39d, 17:36–17:37 CST)
+* `LAUNCH_WINDOW_OK`; example.com and baidu opened via open-documents; `CORE_OK`, no watchdog trip
+  (free 1524→1413 MB, compressor occupancy 30757→30742).
+* launchd: WebContent/Networking instances spawned under `pid/<Safari>/com.macwsguide.xpc.com.apple.WebKit.*.<UUID>`,
+  MacWSXPCProxy → stock helper.
+* helper log: 92 `xpc_main WebKit inherited path` (48 WebContent / 44 Networking), **90 `xpc_main accepted connection`**,
+  94 `xpc event begin type=dictionary main=1` (InitializeWebProcess / CreateWebPage path), WebContent
+  `CAContext remoteContextWithOptions` ×3 and Safari `CALayerHost setContextId:<non-zero>` (layer hosting wired).
+* still failing: page area grey in both screenshots (Safari "Browse with Safari" first-run sheet on top, URL bar shows the
+  right URL). launchd: Networking `signal service: caller = Safari … value = 0x9` ×6 and "crashed 1 times in a row" ×5;
+  WebContent `exited due to SIGTRAP` ×2 (self exc handler; no .ips written). WebKit relaunches → 92 helper launches in ~60 s,
+  without memory growth.
+* Next: capture the SIGTRAP reason (helper stderr goes to /dev/null under launchd: make MacWSXPCProxy redirect stderr to a
+  file and set `MACWS_AGX_CRASH_DIAG` through the overlay `XPCService.EnvironmentVariables`), and find why Safari kills
+  Networking (likely the process-launch / IPC handshake timeout after the accept). Dismiss the first-run sheet.
+
+### Hashes / rollback
+* LIVE libmachook net39d: arm64e `d9a0e535d90580343dacd7df2166f2430ecccf2e`, arm64 `cce5810f6b13012447c1993dc772404c1f86b456`
+  (T=168 per slice, no new exports). Previous: net39c `92f4d30d…`/`f164d8b6…` (tag `pre-net39-20261111-173553`),
+  net39b `07e7b5b1…`/`30b251ad…` (tag `pre-net39-20261111-172709`), net38 `de85f687…`/`546efd80…` (tag `pre-net39-20261111-171135`).
+* MacWSXPCProxy unchanged (net38b `125451486bdee2858e5845a6ef3ec344dd37d202`).
+* Roll back libmachook: `sh /var/mobile/net39/rollback.sh pre-net39-20261111-171135` (→ net38). Overlays only:
+  `sh /var/mobile/net39/rmoverlays.sh`. Full net38: `sh /var/mobile/net38/rollback.sh pre-net38-20261111-141636`.
+* Probe overlays/app removed (`run_probe59.sh cleanup`); IconServices 1724 / 53067 (uid 240) / 53071 untouched.

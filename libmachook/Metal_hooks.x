@@ -25062,6 +25062,7 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
 // From mac_hooks.m — Application-type XPC (WebKit/TSV) with seatbelt-friendly names.
 extern int macws_xpc_overlay_activate(const char *name);
 extern int macws_xpc_overlay_supersedes_tsv(const char *name);
+extern const char *macws_xpc_overlay_service_name(const char *name);
 extern xpc_connection_t macws_xpc_create_application_service(
     const char *name, dispatch_queue_t targetq,
     xpc_connection_t (*create_fn)(const char *, dispatch_queue_t));
@@ -25167,7 +25168,8 @@ xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t
     if (name && (macws_private_chroot_service_name(name) == name ||
                  macws_xpc_overlay_supersedes_tsv(name)) &&
         macws_xpc_overlay_activate(name))
-        return orig_xpc_connection_create(name, queue);
+        return orig_xpc_connection_create(
+            macws_xpc_overlay_service_name(name), queue);
     // Shared-cache callers never hit DYLD_INTERPOSE macws_xpc_connection_create_early.
     // Activate Application-type proxies here (stock name for sandbox checks).
     {

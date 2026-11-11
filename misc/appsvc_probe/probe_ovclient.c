@@ -13,6 +13,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
+#include <stdlib.h>
+#include <uuid/uuid.h>
+
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+extern void xpc_connection_set_oneshot_instance(xpc_connection_t, const uuid_t);
 
 static void L(const char *fmt, ...) {
     char buf[900];
@@ -30,6 +35,12 @@ int main(int argc, char **argv) {
     dispatch_queue_t q = dispatch_queue_create("probe.ovclient", NULL);
     xpc_connection_t c = xpc_connection_create(name, q);
     if (!c) { L("xpc_connection_create NULL"); return 3; }
+    L("sandboxed=%d", sandbox_check(getpid(), NULL, 0));
+    if (getenv("OVC_INSTANCE") || strstr(name, ".overlaymi")) {
+        uuid_t u; uuid_generate(u);
+        xpc_connection_set_oneshot_instance(c, u);
+        L("set_oneshot_instance done");
+    }
     xpc_connection_set_event_handler(c, ^(xpc_object_t ev) {
         const char *d = (xpc_get_type(ev) == XPC_TYPE_ERROR)
             ? xpc_dictionary_get_string(ev, XPC_ERROR_KEY_DESCRIPTION) : "non-error";

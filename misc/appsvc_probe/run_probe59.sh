@@ -12,6 +12,8 @@ ENT=$M/ent59.plist
 APP_CHROOT=/tmp/MacWSOverlayProbe.app
 APP_HOST=/var/mnt/rootfs/private/tmp/MacWSOverlayProbe.app
 SVC_REL=Contents/XPCServices/com.macwsguide.probe.overlay.xpc
+SVCMI_REL=Contents/XPCServices/com.macwsguide.probe.overlaymi.xpc
+SVCWK_REL=Contents/XPCServices/com.apple.WebKit.MacWSProbe.overlaymi.xpc
 LOG=/var/mnt/rootfs/private/tmp/macws-appsvc-probe.log
 GEN=/var/jb/usr/macOS/bin/macws_xpc_overlay_gen.py
 trust() {
@@ -24,17 +26,22 @@ case "$1" in
 install)
   [ -f $ENT ] || cp /var/mobile/appsvc-probe/s58/ent58.plist $ENT
   for f in $M/probe_crun $M/MacWSOverlayProbe.app/Contents/MacOS/MacWSOverlayProbe \
-           $M/MacWSOverlayProbe.app/$SVC_REL/Contents/MacOS/macws-appsvc-probe; do
+           $M/MacWSOverlayProbe.app/$SVC_REL/Contents/MacOS/macws-appsvc-probe \
+           $M/MacWSOverlayProbe.app/$SVCMI_REL/Contents/MacOS/macws-appsvc-probe \
+           $M/MacWSOverlayProbe.app/$SVCWK_REL/Contents/MacOS/macws-appsvc-probe $M/sbcheck; do
     ldid -S$ENT -M "$f"; chmod 755 "$f"
   done
   trust $M/probe_crun arm64e
   trust $M/MacWSOverlayProbe.app/Contents/MacOS/MacWSOverlayProbe arm64
   trust $M/MacWSOverlayProbe.app/$SVC_REL/Contents/MacOS/macws-appsvc-probe arm64
+  trust $M/MacWSOverlayProbe.app/$SVCMI_REL/Contents/MacOS/macws-appsvc-probe arm64
+  trust $M/MacWSOverlayProbe.app/$SVCWK_REL/Contents/MacOS/macws-appsvc-probe arm64
+  trust $M/sbcheck arm64e
   rm -rf $APP_HOST; mkdir -p $APP_HOST
   cp -R $M/MacWSOverlayProbe.app/. $APP_HOST/
   chown -R root:wheel $APP_HOST
   trust $APP_HOST/Contents/MacOS/MacWSOverlayProbe arm64
-  python3 $GEN $APP_CHROOT/$SVC_REL
+  python3 $GEN $APP_CHROOT/$SVC_REL $APP_CHROOT/$SVCMI_REL $APP_CHROOT/$SVCWK_REL
   K=$(ls -t /var/mnt/rootfs/usr/local/var/macws-xpc-overlay | head -1)
   echo "index $K: $(cat /var/mnt/rootfs/usr/local/var/macws-xpc-overlay/$K)"
   ls -la /var/jb/usr/macOS/libexec/macws-xpc-overlay/$K/*.xpc/ ;;
@@ -43,9 +50,9 @@ run)
   : > /var/mnt/rootfs/tmp/macws-webkit-proxy.log; chmod 666 /var/mnt/rootfs/tmp/macws-webkit-proxy.log
   echo "-- before: $(date '+%H:%M:%S') --"; procs
   if [ "$2" = "mobile" ]; then
-    $M/probe_crun -u501 $APP_CHROOT/Contents/MacOS/MacWSOverlayProbe > $M/ovclient.out 2>&1 &
+    $M/probe_crun -u501 $APP_CHROOT/Contents/MacOS/MacWSOverlayProbe ${3:-com.macwsguide.probe.overlay} > $M/ovclient.out 2>&1 &
   else
-    $M/probe_crun $APP_CHROOT/Contents/MacOS/MacWSOverlayProbe > $M/ovclient.out 2>&1 &
+    $M/probe_crun $APP_CHROOT/Contents/MacOS/MacWSOverlayProbe ${3:-com.macwsguide.probe.overlay} > $M/ovclient.out 2>&1 &
   fi
   C=$!; sleep 3
   echo "-- during: $(date '+%H:%M:%S') --"
@@ -55,15 +62,15 @@ run)
   echo "---- probe log ----"; awk '!seen[$0]++' $LOG
   echo "---- proxy log ----"; cat /var/mnt/rootfs/tmp/macws-webkit-proxy.log
   echo "---- xpc-app log (overlay) ----"; grep -a overlay /var/mnt/rootfs/tmp/macws-xpc-app.log | tail -5
-  echo "---- launchd.log ----"; grep -a "com.macwsguide.probe.overlay\|MacWSXPCProxy" /private/var/log/com.apple.xpc.launchd/launchd.log | tail -14 | cut -c1-260 ;;
+  echo "---- launchd.log ----"; grep -a "com.macwsguide.probe.overlay\|MacWSProbe\|MacWSXPCProxy\|denied lookup: name = com.macwsguide" /private/var/log/com.apple.xpc.launchd/launchd.log | tail -14 | cut -c1-260 ;;
 cleanup)
   for p in $(ps -axo pid,command | awk '/MacWSOverlayProbe|macws-appsvc-probe|MacWSXPCProxy/ && !/awk/ {print $1}'); do kill -9 $p 2>/dev/null; done
   for K in $(ls /var/mnt/rootfs/usr/local/var/macws-xpc-overlay 2>/dev/null); do
-    if grep -q "com.macwsguide.probe" /var/mnt/rootfs/usr/local/var/macws-xpc-overlay/$K; then
+    if grep -q "com.macwsguide.probe\|MacWSProbe" /var/mnt/rootfs/usr/local/var/macws-xpc-overlay/$K; then
       rm -rf /var/jb/usr/macOS/libexec/macws-xpc-overlay/$K /var/mnt/rootfs/usr/local/var/macws-xpc-overlay/$K
       echo "removed overlay $K"
     fi
   done
   rm -rf $APP_HOST $LOG; procs ;;
-*) echo "usage: $0 install|run [root|mobile]|cleanup" ;;
+*) echo "usage: $0 install|run [root|mobile] [service-name]|cleanup" ;;
 esac
