@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- System-wide Ventura trustd on private Mach name; iPadOS owns com.apple.trustd. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.macwsguide.trustd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.trustd</key><true/></dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XPC_SERVICE_NAME</key><string>com.macwsguide.trustd</string>
+        <key>MACWS_XPC_TARGET</key><string>/usr/libexec/trustd</string>
+        <key>HOME</key><string>/Users/root</string>
+        <key>TMPDIR</key><string>/tmp</string>
+    </dict>
+    <key>ProcessType</key><string>Adaptive</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>/var/jb/var/mobile/trustd-macos.log</string>
+    <key>StandardErrorPath</key><string>/var/jb/var/mobile/trustd-macos.log</string>
+</dict>
+</plist>

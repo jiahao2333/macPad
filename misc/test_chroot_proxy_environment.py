@@ -81,7 +81,26 @@ int main(void) {
         self.assertLess(main.index("MacWSBuildChrootRootEnvironment"),
                         main.index("MacWSSyscall1(MACWS_SYS_chroot"))
         self.assertIn("svc #0x80\\n\\tcneg x0, x0, cs", source)
-        self.assertIn("MacWSCheckedSyscall3)) MacWSExit(118)", source)
+        self.assertIn("MacWSCheckedSyscall3", source)
+        self.assertIn("MacWSAdoptInheritedChrootRootEnvironment", source)
+        self.assertIn("MacWSExit(118)", source)
+        self.assertLess(source.index("MacWSAdoptInheritedChrootRootEnvironment"),
+                        source.rindex("MacWSExit(118)"))
+
+
+    def test_webkit_zero_xpc_flags_reconstituted(self):
+        self.compile_and_run(ROOT / "misc/test_webkit_proxy_xpc_flags.c")
+
+    def test_webkit_non_setuid_priv_sibling(self):
+        source = (ROOT / "ViewBridgeChrootProxy/main.c").read_text()
+        self.assertIn("MacWSWebKitExecPrivSibling", source)
+        self.assertIn("willExecPriv", source)
+        self.assertIn("MacWSLogWebKitProxyHandshake", source)
+        self.assertIn("MacWSExit(117)", source)
+        main = source.split("int main(", 1)[1]
+        self.assertLess(main.index("MacWSWebKitExecPrivSibling"),
+                        main.index("MacWSSyscall1(MACWS_SYS_chroot"))
+        self.compile_and_run(ROOT / "misc/test_webkit_proxy_priv_path.c")
 
 
 if __name__ == "__main__":

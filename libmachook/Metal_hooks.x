@@ -1,3 +1,4 @@
+#include <stdarg.h>
 @import CydiaSubstrate;
 @import Darwin;
 @import Foundation;
@@ -2851,6 +2852,48 @@ static CFDictionaryRef macws_cgsession_public_compat(void) {
             ? macws_cgsession_public_orig() : NULL);
 }
 
+static void *macws_cgsession_follow_branch_thunk(void *fn) {
+    if (!fn) return NULL;
+    void *current = fn;
+    for (int hop = 0; hop < 4; hop++) {
+        uint32_t *insn = (uint32_t *)ptrauth_strip(
+            current, ptrauth_key_function_pointer);
+        if ((insn[0] & 0xfc000000u) != 0x14000000u) break;
+        int64_t imm = (int64_t)((int32_t)(insn[0] << 6) >> 6) * 4;
+        void *target = (void *)((uintptr_t)insn + imm);
+        Dl_info a = {0}, b = {0};
+        // Only follow a thunk that stays inside its own image.
+        if (!dladdr(insn, &a) || !dladdr(target, &b) ||
+            a.dli_fbase != b.dli_fbase) break;
+        current = ptrauth_sign_unauthenticated(
+            target, ptrauth_key_function_pointer, 0);
+    }
+    return current;
+}
+
+static void macws_cgsession_hook_dump(const char *phase, void *fn,
+                                      void *orig) {
+    if (!getenv("MACWS_CGSESSION_HOOK_DIAG")) return;
+    uint32_t *insn = (uint32_t *)ptrauth_strip(fn, ptrauth_key_function_pointer);
+    Dl_info info = {0};
+    dladdr(insn, &info);
+    dprintf(2, "#### CGSESSION-HOOK %s fn=%p (%s+0x%lx) insn=%08x %08x %08x %08x orig=%p compat=%p\n",
+            phase, insn, info.dli_sname ? info.dli_sname : "?",
+            (unsigned long)((uintptr_t)insn - (uintptr_t)info.dli_saddr),
+            insn[0], insn[1], insn[2], insn[3], orig,
+            ptrauth_strip((void *)macws_cgsession_private_compat,
+                          ptrauth_key_function_pointer));
+    if ((insn[0] & 0xfc000000u) == 0x14000000u) {
+        int64_t imm = (int64_t)((int32_t)(insn[0] << 6) >> 6) * 4;
+        uint32_t *t = (uint32_t *)((uintptr_t)insn + imm);
+        Dl_info ti = {0};
+        dladdr(t, &ti);
+        dprintf(2, "#### CGSESSION-HOOK %s b-target=%p image=%s insn=%08x %08x %08x %08x\n",
+                phase, t, ti.dli_fname ? ti.dli_fname : "?",
+                t[0], t[1], t[2], t[3]);
+    }
+}
+
 static void macws_install_cgsession_login_handoff_compatibility(void) {
     // The provider is an AppKit login-state dependency.  Headless tools and
     // daemons cannot consume this result, and patching the shared-cache entry
@@ -2863,10 +2906,23 @@ static void macws_install_cgsession_login_handoff_compatibility(void) {
         RTLD_DEFAULT, "CGSSessionCopyCurrentSessionProperties");
     void *publicProvider = dlsym(
         RTLD_DEFAULT, "CGSessionCopyCurrentDictionary");
+    // Ventura's shared-cache SLSSessionCopyCurrentSessionProperties (the
+    // target of the CoreGraphics CGS re-export) is a one-instruction `b`
+    // thunk into the real body.  Runtime-confirmed on 2026-11-09 (iPad14,5,
+    // iPadOS 16.5): ElleKit retargets an existing leading `b` in place by
+    // rewriting imm26, so a replacement 2.6 GB away was truncated to a
+    // branch into the middle of MPSNeuralNetwork/libLAPACK and System
+    // Settings died with SIGILL/SIGSEGV right after main called the
+    // provider.  Hook the thunk's real body instead.
+    privateProvider = macws_cgsession_follow_branch_thunk(privateProvider);
+    publicProvider = macws_cgsession_follow_branch_thunk(publicProvider);
     if (privateProvider) {
+        macws_cgsession_hook_dump("before", privateProvider, NULL);
         MSHookFunction(privateProvider,
                        (void *)macws_cgsession_private_compat,
                        (void **)&macws_cgsession_private_orig);
+        macws_cgsession_hook_dump("after", privateProvider,
+                                  (void *)macws_cgsession_private_orig);
     }
     if (publicProvider && publicProvider != privateProvider) {
         MSHookFunction(publicProvider,
@@ -9557,6 +9613,63 @@ static _Atomic uint64_t g_vnc_poll_accept_count = 0;
 static _Atomic uint64_t g_vnc_poll_drop_count = 0;
 static _Atomic uint64_t g_vnc_poll_clean_count = 0;
 static _Atomic uint64_t g_vnc_poll_error_count = 0;
+
+// Composite stage-stack leak fix (2026-11-09, iPad14,5 MACWS_MEMDIAG run).
+// SkyLight closes some composites without reaching the hooked
+// MetalContext::EndCurrentComposite(bool), so the per-context stack only grew:
+// composite_stage_depth reached 329 and every entry retained a display-sized
+// pf550 destination (~30 MB IOSurface), driving WindowServer phys_footprint to
+// 9.2 GB and a vm-compressor-space-shortage jetsam.  Two bounds now apply:
+//   * the outermost EndUpdate (Flush) drains the context's whole stack, since
+//     no composite of that update can still be open after Flush;
+//   * the stack is hard-capped (default 8, MACWS_VNC_STAGE_CAP) and the oldest
+//     entry is dropped first, because the matching End pops the newest entry.
+// MACWS_VNC_STAGE_DRAIN=0 restores the old unbounded behaviour (A/B rollback
+// only).  Both environment values are read once per process.
+static _Atomic uint64_t g_vnc_stages_drained_at_endupdate = 0;
+static _Atomic uint64_t g_vnc_stages_capped = 0;
+#define MACWS_VNC_STAGE_CAP_DEFAULT 8u
+#define MACWS_VNC_STAGE_CAP_MAX 4096u
+
+static BOOL macws_vnc_stage_drain_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        const char *flag = getenv("MACWS_VNC_STAGE_DRAIN");
+        value = !(flag && strcmp(flag, "0") == 0);
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static NSUInteger macws_vnc_stage_cap(void) {
+    static _Atomic long cached = -1;
+    long value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = MACWS_VNC_STAGE_CAP_DEFAULT;
+        const char *text = getenv("MACWS_VNC_STAGE_CAP");
+        if (text && *text) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long parsed = strtoul(text, &end, 10);
+            if (errno == 0 && end && *end == '\0' && parsed >= 1 &&
+                parsed <= MACWS_VNC_STAGE_CAP_MAX)
+                value = (long)parsed;
+        }
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return (NSUInteger)value;
+}
+
+static uint64_t macws_vnc_stages_drained_at_endupdate(void) {
+    return atomic_load_explicit(&g_vnc_stages_drained_at_endupdate,
+                                memory_order_relaxed);
+}
+
+static uint64_t macws_vnc_stages_capped(void) {
+    return atomic_load_explicit(&g_vnc_stages_capped, memory_order_relaxed);
+}
+
 void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
     if (!context || !texture) return;
     static dispatch_once_t once;
@@ -9564,6 +9677,9 @@ void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
         g_vnc_composite_stages = [NSMutableDictionary new];
         g_vnc_composite_pending = [NSMutableDictionary new];
     });
+    BOOL bounded = macws_vnc_stage_drain_enabled();
+    NSUInteger cap = bounded ? macws_vnc_stage_cap() : 0;
+    NSMutableArray *dropped = nil;
     NSValue *key = [NSValue valueWithPointer:context];
     @synchronized(g_vnc_composite_stages) {
         NSMutableArray *stack = g_vnc_composite_stages[key];
@@ -9572,6 +9688,18 @@ void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
             g_vnc_composite_stages[key] = stack;
         }
         [stack addObject:texture];
+        if (bounded && [stack count] > cap) {
+            NSRange oldest = NSMakeRange(0, [stack count] - cap);
+            // Release the dropped destinations outside the lock: a texture
+            // dealloc can re-enter libmachook's allocator/lease hooks.
+            dropped = macws_vnc_retain([stack subarrayWithRange:oldest]);
+            [stack removeObjectsInRange:oldest];
+        }
+    }
+    if (dropped) {
+        atomic_fetch_add_explicit(&g_vnc_stages_capped, [dropped count],
+                                  memory_order_relaxed);
+        macws_vnc_release(dropped);
     }
 }
 
@@ -9923,9 +10051,26 @@ void macws_vnc_finish_update(void *context) {
         ? atomic_fetch_add(&g_vnc_finish_count, 1) + 1 : 0;
     NSValue *key = [NSValue valueWithPointer:context];
     id<MTLTexture> texture = nil;
+    NSMutableArray *drainedStages = nil;
+    BOOL drain = macws_vnc_stage_drain_enabled();
     @synchronized(g_vnc_composite_stages) {
         texture = macws_vnc_retain(g_vnc_composite_pending[key]);
         [g_vnc_composite_pending removeObjectForKey:key];
+        // Outermost EndUpdate has flushed this context; any stage still on
+        // its stack belongs to a composite SkyLight closed without the hooked
+        // EndCurrentComposite.  Drop it here (see macws_vnc_stage_composite).
+        if (drain) {
+            drainedStages = macws_vnc_retain(g_vnc_composite_stages[key]);
+            if (drainedStages)
+                [g_vnc_composite_stages removeObjectForKey:key];
+        }
+    }
+    if (drainedStages) {
+        NSUInteger drainedCount = [drainedStages count];
+        if (drainedCount)
+            atomic_fetch_add_explicit(&g_vnc_stages_drained_at_endupdate,
+                                      drainedCount, memory_order_relaxed);
+        macws_vnc_release(drainedStages);
     }
     if (!texture) {
         uint64_t missing = diagnostics
@@ -12166,6 +12311,10 @@ static void macws_log_mtldesc(MTLTextureDescriptor *desc, IOSurfaceRef iosurface
 //
 // Translation list ordered by closeness to the source layout. Add formats here
 // as new IOSurface fourCCs surface in the trace.
+// Read-only reference for MACWS_MEMDIAG to the shadow IOSurface cache that
+// hooked_newTextureWithDescriptor:iosurface:plane: owns (never evicted).
+static NSMutableDictionary *g_macws_memdiag_shadow_cache = nil;
+
 static const NSUInteger kMacwsTexFmt550Fallbacks[] = {
     552,  // BGRA10_XR
     553,  // BGRA10_XR_sRGB
@@ -12793,7 +12942,10 @@ static MTLTextureDescriptor *macws_native_agx_texture_descriptor(
             if (is_apple_compressed) {
                 static NSMutableDictionary *shadowCache = nil;
                 static dispatch_once_t once;
-                dispatch_once(&once, ^{ shadowCache = [NSMutableDictionary new]; });
+                dispatch_once(&once, ^{
+                    shadowCache = [NSMutableDictionary new];
+                    g_macws_memdiag_shadow_cache = shadowCache;
+                });
                 NSValue *origKey = [NSValue valueWithPointer:(void *)iosurface];
                 NSValue *shadowVal;
                 @synchronized(shadowCache) {
@@ -22588,7 +22740,29 @@ static id macws_new_dag_library_compat(id self, SEL selector, NSString *dag,
     }
     if (all_companions)
         dag = [dag stringByAppendingString:macws_metal2metal_runtime_objects()->dagCacheSuffix];
-    return g_macws_new_dag_library_orig(self, selector, dag, functions, error);
+    NSError *local_error = nil;
+    id library = g_macws_new_dag_library_orig(self, selector, dag, functions,
+                                              error ? error : &local_error);
+    if (macws_runtime_diagnostics_enabled()) {
+        NSError *returned = error ? *error : local_error;
+        NSUInteger companions = 0;
+        for (id function in functions)
+            if (objc_getAssociatedObject(function,
+                    kMacWSMetal2MetalCompanionFunctionKey)) companions++;
+        dprintf(STDERR_FILENO,
+            "#### MACWS-DAG result=%p functions=%lu companions=%lu "
+            "error=%s\n", (void *)library, (unsigned long)functions.count,
+            (unsigned long)companions,
+            returned ? returned.description.UTF8String : "(nil)");
+        if (!library) for (id function in functions) {
+            dprintf(STDERR_FILENO, "#### MACWS-DAG  fn=%s class=%s companion=%d\n",
+                [[(id<MTLFunction>)function name] UTF8String] ?: "(nil)",
+                class_getName([function class]),
+                objc_getAssociatedObject(function,
+                    kMacWSMetal2MetalCompanionFunctionKey) != nil);
+        }
+    }
+    return library;
 }
 
 static void macws_install_qc_desktop_function_compatibility(void) {
@@ -23190,6 +23364,535 @@ static Class *macws_copy_agx_driver_classes(unsigned int *count) {
     return NULL;
 }
 
+// ─── MACWS_MEMDIAG: WindowServer memory-growth observer ─────────────────────
+// Off by default.  Enabled only when the process starts with MACWS_MEMDIAG=1
+// (read once and cached).  When disabled nothing below is installed and no
+// allocation path changes.  When enabled it:
+//   * wraps the externally visible AGX device allocators (plain and IOSurface
+//     texture, buffer and heap creation) AFTER the production swizzles, so the
+//     production IMPs still run unchanged underneath; each newly seen
+//     resource gets one associated dispatch_data record whose destructor
+//     decrements the live counters when the resource is deallocated;
+//   * logs, every ~10 s and on every dispatch memory-pressure event, the
+//     TASK_VM_INFO footprint ledgers, malloc zone usage, the sizes of the
+//     libmachook-owned caches that are not covered by MACWS-MEMORY-REAP, the
+//     AGX_LIFE kernel-resource totals, and live count/bytes of tracked Metal
+//     resources bucketed by kind, storageMode and pixelFormat.
+// Purely observational: no resource is retained, released, aliased or
+// evicted by this code.  See docs/windowserver-memory-investigation.md.
+BOOL macws_memdiag_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        const char *flag = getenv("MACWS_MEMDIAG");
+        value = flag && strcmp(flag, "1") == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+extern NSMutableDictionary *g_wscd_tex;
+extern int macws_agx_life_memdiag_format(char *buffer, size_t length);
+
+enum {
+    MACWS_MEMDIAG_KIND_PLAIN_NATIVE = 0, // plain newTexture, no IOSurface
+    MACWS_MEMDIAG_KIND_PLAIN_LEASE,      // plain newTexture -> lease pool
+    MACWS_MEMDIAG_KIND_IOSURF,           // newTexture:iosurface:plane:
+    MACWS_MEMDIAG_KIND_IOSURF_OWNED,     // ... remapped to owned scanout
+    MACWS_MEMDIAG_KIND_BUFFER,
+    MACWS_MEMDIAG_KIND_HEAP,
+    MACWS_MEMDIAG_KIND_COUNT
+};
+static const char *const kMacwsMemdiagKindNames[MACWS_MEMDIAG_KIND_COUNT] = {
+    "plain-native", "plain-lease", "iosurf", "iosurf-owned", "buffer", "heap",
+};
+
+typedef struct {
+    uint16_t kind;
+    uint16_t storage;
+    uint32_t pixel_format;
+    uint64_t bytes;
+} macws_memdiag_record;
+
+typedef struct {
+    uint32_t key; // 0 = empty; otherwise kind/storage/pf + 1
+    uint64_t live;
+    uint64_t bytes;
+    uint64_t created;
+} macws_memdiag_bucket;
+
+#define MACWS_MEMDIAG_BUCKETS 256u
+static macws_memdiag_bucket g_macws_memdiag_buckets[MACWS_MEMDIAG_BUCKETS];
+static uint64_t g_macws_memdiag_bucket_overflow;
+static uint64_t g_macws_memdiag_tracked_total;
+static uint64_t g_macws_memdiag_freed_total;
+static pthread_mutex_t g_macws_memdiag_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_macws_memdiag_association_key;
+static uint64_t g_macws_memdiag_tick;
+
+static uint32_t macws_memdiag_key(const macws_memdiag_record *record) {
+    return (((uint32_t)record->kind & 0xfu) << 24 |
+            ((uint32_t)record->storage & 0xfu) << 20 |
+            (record->pixel_format & 0xfffffu)) + 1u;
+}
+
+// Caller holds g_macws_memdiag_lock.
+static macws_memdiag_bucket *macws_memdiag_bucket_locked(uint32_t key) {
+    unsigned start = (unsigned)((key * 2654435761u) >> 24) &
+        (MACWS_MEMDIAG_BUCKETS - 1);
+    for (unsigned probe = 0; probe < MACWS_MEMDIAG_BUCKETS; probe++) {
+        macws_memdiag_bucket *bucket = &g_macws_memdiag_buckets[
+            (start + probe) & (MACWS_MEMDIAG_BUCKETS - 1)];
+        if (bucket->key == key) return bucket;
+        if (bucket->key == 0) {
+            bucket->key = key;
+            return bucket;
+        }
+    }
+    return NULL;
+}
+
+static void macws_memdiag_untrack(macws_memdiag_record *record) {
+    pthread_mutex_lock(&g_macws_memdiag_lock);
+    macws_memdiag_bucket *bucket =
+        macws_memdiag_bucket_locked(macws_memdiag_key(record));
+    if (bucket) {
+        if (bucket->live) bucket->live--;
+        bucket->bytes = bucket->bytes >= record->bytes
+            ? bucket->bytes - record->bytes : 0;
+    }
+    g_macws_memdiag_freed_total++;
+    pthread_mutex_unlock(&g_macws_memdiag_lock);
+}
+
+static void macws_memdiag_track(id resource, uint16_t kind, uint16_t storage,
+                                uint32_t pixel_format, uint64_t bytes) {
+    if (!resource) return;
+    if (objc_getAssociatedObject(resource, &g_macws_memdiag_association_key))
+        return; // lease-pool hits return the same texture repeatedly
+    macws_memdiag_record *record = calloc(1, sizeof(*record));
+    if (!record) return;
+    record->kind = kind;
+    record->storage = storage;
+    record->pixel_format = pixel_format;
+    record->bytes = bytes;
+    pthread_mutex_lock(&g_macws_memdiag_lock);
+    macws_memdiag_bucket *bucket =
+        macws_memdiag_bucket_locked(macws_memdiag_key(record));
+    if (bucket) {
+        bucket->live++;
+        bucket->bytes += bytes;
+        bucket->created++;
+    } else {
+        g_macws_memdiag_bucket_overflow++;
+    }
+    g_macws_memdiag_tracked_total++;
+    pthread_mutex_unlock(&g_macws_memdiag_lock);
+    if (!bucket) {
+        free(record);
+        return;
+    }
+    // The association is released while the resource is being destroyed;
+    // the dispatch_data destructor then runs asynchronously and only
+    // updates counters.
+    dispatch_data_t marker = dispatch_data_create(
+        record, sizeof(*record),
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            macws_memdiag_untrack(record);
+            free(record);
+        });
+    if (!marker) {
+        macws_memdiag_untrack(record);
+        free(record);
+        return;
+    }
+    objc_setAssociatedObject(resource, &g_macws_memdiag_association_key,
+                             (id)marker, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_release(marker);
+}
+
+static uint64_t macws_memdiag_resource_bytes(id resource, uint64_t fallback) {
+    if (resource && [resource respondsToSelector:@selector(allocatedSize)]) {
+        NSUInteger size = [(id<MTLResource>)resource allocatedSize];
+        if (size) return size;
+    }
+    return fallback;
+}
+
+static void macws_memdiag_track_texture(id<MTLTexture> texture,
+                                        BOOL iosurface_selector) {
+    if (!texture) return;
+    uint16_t kind;
+    if (iosurface_selector) {
+        kind = macws_is_owned_scanout_texture(texture)
+            ? MACWS_MEMDIAG_KIND_IOSURF_OWNED : MACWS_MEMDIAG_KIND_IOSURF;
+    } else {
+        IOSurfaceRef surface = [texture respondsToSelector:@selector(iosurface)]
+            ? [texture iosurface] : NULL;
+        kind = surface ? MACWS_MEMDIAG_KIND_PLAIN_LEASE
+                       : MACWS_MEMDIAG_KIND_PLAIN_NATIVE;
+    }
+    macws_memdiag_track(texture, kind, (uint16_t)[texture storageMode],
+                        (uint32_t)[texture pixelFormat],
+                        macws_memdiag_resource_bytes(texture, 0));
+}
+
+static id (*g_macws_memdiag_new_texture_orig)(id, SEL, id) = NULL;
+static id macws_memdiag_new_texture(id self, SEL selector, id descriptor) {
+    id texture = g_macws_memdiag_new_texture_orig(self, selector, descriptor);
+    macws_memdiag_track_texture(texture, NO);
+    return texture;
+}
+
+static id (*g_macws_memdiag_new_iosurface_texture_orig)(
+    id, SEL, id, IOSurfaceRef, NSUInteger) = NULL;
+static id macws_memdiag_new_iosurface_texture(id self, SEL selector,
+                                              id descriptor,
+                                              IOSurfaceRef surface,
+                                              NSUInteger plane) {
+    id texture = g_macws_memdiag_new_iosurface_texture_orig(
+        self, selector, descriptor, surface, plane);
+    macws_memdiag_track_texture(texture, YES);
+    return texture;
+}
+
+static void macws_memdiag_track_buffer(id buffer, NSUInteger options,
+                                       NSUInteger length) {
+    if (!buffer) return;
+    macws_memdiag_track(buffer, MACWS_MEMDIAG_KIND_BUFFER,
+        (uint16_t)((options >> MTLResourceStorageModeShift) & 0xf), 0,
+        macws_memdiag_resource_bytes(buffer, length));
+}
+
+static id (*g_macws_memdiag_new_buffer_orig)(id, SEL, NSUInteger,
+                                             NSUInteger) = NULL;
+static id macws_memdiag_new_buffer(id self, SEL selector, NSUInteger length,
+                                   NSUInteger options) {
+    id buffer = g_macws_memdiag_new_buffer_orig(self, selector, length,
+                                                options);
+    macws_memdiag_track_buffer(buffer, options, length);
+    return buffer;
+}
+
+static id (*g_macws_memdiag_new_buffer_bytes_orig)(
+    id, SEL, const void *, NSUInteger, NSUInteger) = NULL;
+static id macws_memdiag_new_buffer_bytes(id self, SEL selector,
+                                         const void *bytes, NSUInteger length,
+                                         NSUInteger options) {
+    id buffer = g_macws_memdiag_new_buffer_bytes_orig(
+        self, selector, bytes, length, options);
+    macws_memdiag_track_buffer(buffer, options, length);
+    return buffer;
+}
+
+static id (*g_macws_memdiag_new_buffer_nocopy_orig)(
+    id, SEL, void *, NSUInteger, NSUInteger, id) = NULL;
+static id macws_memdiag_new_buffer_nocopy(id self, SEL selector, void *bytes,
+                                          NSUInteger length,
+                                          NSUInteger options,
+                                          id deallocator) {
+    id buffer = g_macws_memdiag_new_buffer_nocopy_orig(
+        self, selector, bytes, length, options, deallocator);
+    macws_memdiag_track_buffer(buffer, options, length);
+    return buffer;
+}
+
+static id (*g_macws_memdiag_new_heap_orig)(id, SEL, id) = NULL;
+static id macws_memdiag_new_heap(id self, SEL selector, id descriptor) {
+    id heap = g_macws_memdiag_new_heap_orig(self, selector, descriptor);
+    if (heap) {
+        NSUInteger size = [heap respondsToSelector:@selector(size)]
+            ? [(id<MTLHeap>)heap size] : 0;
+        NSUInteger storage = [heap respondsToSelector:@selector(storageMode)]
+            ? [(id<MTLHeap>)heap storageMode] : 0;
+        macws_memdiag_track(heap, MACWS_MEMDIAG_KIND_HEAP, (uint16_t)storage,
+                            0, size);
+    }
+    return heap;
+}
+
+static double macws_memdiag_mb(uint64_t bytes) {
+    return (double)bytes / (1024.0 * 1024.0);
+}
+
+static uint64_t macws_memdiag_ledger(BOOL available, int64_t value) {
+    return available && value > 0 ? (uint64_t)value : 0;
+}
+
+extern void macws_purgediag_log(unsigned long long tick);
+static void macws_memdiag_log(const char *reason) {
+    @autoreleasepool {
+        uint64_t tick = ++g_macws_memdiag_tick;
+        task_vm_info_data_t vm = {0};
+        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+        kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO,
+                                     (task_info_t)&vm, &count);
+        BOOL ledgers = kr == KERN_SUCCESS && count >= TASK_VM_INFO_REV3_COUNT;
+        malloc_statistics_t heap = {0};
+        malloc_zone_statistics(NULL, &heap);
+        dprintf(STDERR_FILENO,
+            "#### MACWS-MEMDIAG tick=%llu reason=%s kr=%#x "
+            "phys_footprint=%.1fMB peak=%.1fMB internal=%.1fMB "
+            "compressed=%.1fMB resident=%.1fMB "
+            "purgeable_volatile_resident=%.1fMB "
+            "graphics_footprint=%.1fMB graphics_compressed=%.1fMB "
+            "malloc_in_use=%.1fMB malloc_allocated=%.1fMB "
+            "ledger_purgeable_nonvolatile=%.1fMB "
+            "ledger_purgeable_novolatile_compressed=%.1fMB "
+            "media_footprint=%.1fMB media_footprint_compressed=%.1fMB "
+            "media_nofootprint=%.1fMB neural_footprint=%.1fMB "
+            "neural_footprint_compressed=%.1fMB neural_nofootprint=%.1fMB "
+            "vm_info_count=%u\n",
+            (unsigned long long)tick, reason, kr,
+            macws_memdiag_mb(vm.phys_footprint),
+            macws_memdiag_mb(ledgers && vm.ledger_phys_footprint_peak > 0
+                ? (uint64_t)vm.ledger_phys_footprint_peak : 0),
+            macws_memdiag_mb(vm.internal),
+            macws_memdiag_mb(vm.compressed),
+            macws_memdiag_mb(vm.resident_size),
+            macws_memdiag_mb(vm.purgeable_volatile_resident),
+            macws_memdiag_mb(ledgers && vm.ledger_tag_graphics_footprint > 0
+                ? (uint64_t)vm.ledger_tag_graphics_footprint : 0),
+            macws_memdiag_mb(ledgers &&
+                vm.ledger_tag_graphics_footprint_compressed > 0
+                ? (uint64_t)vm.ledger_tag_graphics_footprint_compressed : 0),
+            macws_memdiag_mb(heap.size_in_use),
+            macws_memdiag_mb(heap.size_allocated),
+            // REV3 ledgers (purgeable and tagged media/neural); zero when the
+            // kernel returned a shorter TASK_VM_INFO.
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_purgeable_nonvolatile)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_purgeable_novolatile_compressed)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_media_footprint)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_media_footprint_compressed)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_media_nofootprint)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_neural_footprint)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_neural_footprint_compressed)),
+            macws_memdiag_mb(macws_memdiag_ledger(ledgers,
+                vm.ledger_tag_neural_nofootprint)),
+            (unsigned)count);
+
+        // libmachook-owned caches outside MACWS-MEMORY-REAP.
+        NSUInteger ownedBytes = 0, wscd = 0, stageContexts = 0;
+        NSUInteger stageDepth = 0, pending = 0, shadowCount = 0;
+        NSUInteger dispTracked = 0;
+        uint64_t shadowBytes = 0;
+        if (g_macws_owned_scanout_lock) {
+            @synchronized(g_macws_owned_scanout_lock) {
+                ownedBytes = g_macws_owned_scanout_pool_bytes;
+            }
+        }
+        NSMutableDictionary *wscdMap = g_wscd_tex;
+        if (wscdMap) {
+            @synchronized(wscdMap) { wscd = wscdMap.count; }
+        }
+        if (g_vnc_composite_stages) {
+            @synchronized(g_vnc_composite_stages) {
+                stageContexts = g_vnc_composite_stages.count;
+                for (NSValue *key in g_vnc_composite_stages)
+                    stageDepth += [g_vnc_composite_stages[key] count];
+                pending = g_vnc_composite_pending.count;
+            }
+        }
+        NSMutableDictionary *shadow = g_macws_memdiag_shadow_cache;
+        if (shadow) {
+            @synchronized(shadow) {
+                shadowCount = shadow.count;
+                for (NSValue *key in shadow) {
+                    IOSurfaceRef surface =
+                        (IOSurfaceRef)[shadow[key] pointerValue];
+                    if (surface) shadowBytes += IOSurfaceGetAllocSize(surface);
+                }
+            }
+        }
+        if (g_dispSurfs) {
+            @synchronized(g_dispSurfs) { dispTracked = g_dispSurfs.count; }
+        }
+        dprintf(STDERR_FILENO,
+            "#### MACWS-MEMDIAG caches tick=%llu owned_scanout=%.1fMB "
+            "wscd_map=%lu composite_stage_contexts=%lu "
+            "composite_stage_depth=%lu composite_pending=%lu "
+            "shadow_surfaces=%lu shadow=%.1fMB disp_tracked=%lu "
+            "stages_drained_at_endupdate=%llu stages_capped=%llu "
+            "stage_drain=%d stage_cap=%lu\n",
+            (unsigned long long)tick, macws_memdiag_mb(ownedBytes),
+            (unsigned long)wscd, (unsigned long)stageContexts,
+            (unsigned long)stageDepth, (unsigned long)pending,
+            (unsigned long)shadowCount, macws_memdiag_mb(shadowBytes),
+            (unsigned long)dispTracked,
+            (unsigned long long)macws_vnc_stages_drained_at_endupdate(),
+            (unsigned long long)macws_vnc_stages_capped(),
+            macws_vnc_stage_drain_enabled() ? 1 : 0,
+            (unsigned long)(macws_vnc_stage_drain_enabled()
+                ? macws_vnc_stage_cap() : 0));
+
+        char agx[384] = {0};
+        if (macws_agx_life_memdiag_format(agx, sizeof(agx)) > 0) {
+            dprintf(STDERR_FILENO, "#### MACWS-MEMDIAG agx_life tick=%llu %s\n",
+                    (unsigned long long)tick, agx);
+        }
+
+        macws_memdiag_bucket snapshot[MACWS_MEMDIAG_BUCKETS];
+        uint64_t tracked = 0, freed = 0, overflow = 0;
+        pthread_mutex_lock(&g_macws_memdiag_lock);
+        memcpy(snapshot, g_macws_memdiag_buckets, sizeof(snapshot));
+        tracked = g_macws_memdiag_tracked_total;
+        freed = g_macws_memdiag_freed_total;
+        overflow = g_macws_memdiag_bucket_overflow;
+        pthread_mutex_unlock(&g_macws_memdiag_lock);
+        uint64_t kindLive[MACWS_MEMDIAG_KIND_COUNT] = {0};
+        uint64_t kindBytes[MACWS_MEMDIAG_KIND_COUNT] = {0};
+        for (unsigned i = 0; i < MACWS_MEMDIAG_BUCKETS; i++) {
+            if (!snapshot[i].key) continue;
+            unsigned kind = ((snapshot[i].key - 1) >> 24) & 0xf;
+            if (kind >= MACWS_MEMDIAG_KIND_COUNT) continue;
+            kindLive[kind] += snapshot[i].live;
+            kindBytes[kind] += snapshot[i].bytes;
+        }
+        uint64_t nonleaseLive = 0, nonleaseBytes = 0;
+        for (unsigned kind = 0; kind < MACWS_MEMDIAG_KIND_COUNT; kind++) {
+            if (kind == MACWS_MEMDIAG_KIND_PLAIN_LEASE) continue;
+            nonleaseLive += kindLive[kind];
+            nonleaseBytes += kindBytes[kind];
+        }
+        dprintf(STDERR_FILENO,
+            "#### MACWS-MEMDIAG metal-total tick=%llu nonlease_live=%llu "
+            "nonlease=%.1fMB lease_live=%llu lease=%.1fMB "
+            "plain_native=%llu/%.1fMB iosurf=%llu/%.1fMB "
+            "iosurf_owned=%llu/%.1fMB buffer=%llu/%.1fMB heap=%llu/%.1fMB "
+            "tracked=%llu freed=%llu bucket_overflow=%llu\n",
+            (unsigned long long)tick,
+            (unsigned long long)nonleaseLive,
+            macws_memdiag_mb(nonleaseBytes),
+            (unsigned long long)kindLive[MACWS_MEMDIAG_KIND_PLAIN_LEASE],
+            macws_memdiag_mb(kindBytes[MACWS_MEMDIAG_KIND_PLAIN_LEASE]),
+            (unsigned long long)kindLive[MACWS_MEMDIAG_KIND_PLAIN_NATIVE],
+            macws_memdiag_mb(kindBytes[MACWS_MEMDIAG_KIND_PLAIN_NATIVE]),
+            (unsigned long long)kindLive[MACWS_MEMDIAG_KIND_IOSURF],
+            macws_memdiag_mb(kindBytes[MACWS_MEMDIAG_KIND_IOSURF]),
+            (unsigned long long)kindLive[MACWS_MEMDIAG_KIND_IOSURF_OWNED],
+            macws_memdiag_mb(kindBytes[MACWS_MEMDIAG_KIND_IOSURF_OWNED]),
+            (unsigned long long)kindLive[MACWS_MEMDIAG_KIND_BUFFER],
+            macws_memdiag_mb(kindBytes[MACWS_MEMDIAG_KIND_BUFFER]),
+            (unsigned long long)kindLive[MACWS_MEMDIAG_KIND_HEAP],
+            macws_memdiag_mb(kindBytes[MACWS_MEMDIAG_KIND_HEAP]),
+            (unsigned long long)tracked, (unsigned long long)freed,
+            (unsigned long long)overflow);
+
+        // Per-bucket detail, largest live bytes first, bounded output.
+        for (unsigned emitted = 0; emitted < 24; emitted++) {
+            int best = -1;
+            for (unsigned i = 0; i < MACWS_MEMDIAG_BUCKETS; i++) {
+                if (!snapshot[i].key || !snapshot[i].live) continue;
+                if (best < 0 || snapshot[i].bytes > snapshot[best].bytes)
+                    best = (int)i;
+            }
+            if (best < 0) break;
+            uint32_t key = snapshot[best].key - 1;
+            unsigned kind = (key >> 24) & 0xf;
+            dprintf(STDERR_FILENO,
+                "#### MACWS-MEMDIAG metal tick=%llu kind=%s storage=%u "
+                "pf=%u live=%llu bytes=%.1fMB created=%llu\n",
+                (unsigned long long)tick,
+                kind < MACWS_MEMDIAG_KIND_COUNT
+                    ? kMacwsMemdiagKindNames[kind] : "?",
+                (key >> 20) & 0xf, key & 0xfffff,
+                (unsigned long long)snapshot[best].live,
+                macws_memdiag_mb(snapshot[best].bytes),
+                (unsigned long long)snapshot[best].created);
+            snapshot[best].live = 0;
+        }
+        macws_purgediag_log((unsigned long long)tick);
+    }
+}
+
+static void macws_memdiag_hook(Class cls, SEL selector, IMP replacement,
+                               IMP *original, const char *name) {
+    if (!cls || !class_getInstanceMethod(cls, selector)) {
+        dprintf(STDERR_FILENO,
+            "#### MACWS-MEMDIAG hook-missing class=%s selector=%s\n",
+            cls ? class_getName(cls) : "(nil)", name);
+        return;
+    }
+    MSHookMessageEx(cls, selector, replacement, original);
+    dprintf(STDERR_FILENO,
+        "#### MACWS-MEMDIAG hook-installed class=%s selector=%s orig=%p\n",
+        class_getName(cls), name, original ? (void *)*original : NULL);
+}
+
+// Must run after the production swizzles on `agx` so the wrappers observe
+// the final result of the production allocation paths.
+static void macws_memdiag_install(Class agx) {
+    if (!macws_memdiag_enabled() || !agx) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        macws_memdiag_hook(agx, @selector(newTextureWithDescriptor:),
+            (IMP)macws_memdiag_new_texture,
+            (IMP *)&g_macws_memdiag_new_texture_orig,
+            "newTextureWithDescriptor:");
+        macws_memdiag_hook(agx,
+            @selector(newTextureWithDescriptor:iosurface:plane:),
+            (IMP)macws_memdiag_new_iosurface_texture,
+            (IMP *)&g_macws_memdiag_new_iosurface_texture_orig,
+            "newTextureWithDescriptor:iosurface:plane:");
+        macws_memdiag_hook(agx, @selector(newBufferWithLength:options:),
+            (IMP)macws_memdiag_new_buffer,
+            (IMP *)&g_macws_memdiag_new_buffer_orig,
+            "newBufferWithLength:options:");
+        macws_memdiag_hook(agx, @selector(newBufferWithBytes:length:options:),
+            (IMP)macws_memdiag_new_buffer_bytes,
+            (IMP *)&g_macws_memdiag_new_buffer_bytes_orig,
+            "newBufferWithBytes:length:options:");
+        macws_memdiag_hook(agx,
+            @selector(newBufferWithBytesNoCopy:length:options:deallocator:),
+            (IMP)macws_memdiag_new_buffer_nocopy,
+            (IMP *)&g_macws_memdiag_new_buffer_nocopy_orig,
+            "newBufferWithBytesNoCopy:length:options:deallocator:");
+        macws_memdiag_hook(agx, @selector(newHeapWithDescriptor:),
+            (IMP)macws_memdiag_new_heap,
+            (IMP *)&g_macws_memdiag_new_heap_orig,
+            "newHeapWithDescriptor:");
+
+        dispatch_queue_t queue = dispatch_queue_create(
+            "com.macwsguide.memdiag", DISPATCH_QUEUE_SERIAL);
+        dispatch_source_t timer = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        dispatch_source_set_timer(timer,
+            dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+            5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+        dispatch_source_set_event_handler(timer, ^{
+            macws_memdiag_log("timer");
+        });
+        dispatch_resume(timer);
+        dispatch_source_t pressure = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+            DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN |
+                DISPATCH_MEMORYPRESSURE_CRITICAL, queue);
+        if (pressure) {
+            dispatch_source_set_event_handler(pressure, ^{
+                unsigned long level = dispatch_source_get_data(pressure);
+                macws_memdiag_log(
+                    (level & DISPATCH_MEMORYPRESSURE_CRITICAL)
+                        ? "pressure-critical"
+                        : (level & DISPATCH_MEMORYPRESSURE_WARN)
+                            ? "pressure-warn" : "pressure-normal");
+            });
+            dispatch_resume(pressure);
+        }
+        dprintf(STDERR_FILENO,
+            "#### MACWS-MEMDIAG enabled pid=%d prog=%s agx=%s interval=5s "
+            "pressure=%s\n", getpid(), getprogname() ?: "?",
+            class_getName(agx), pressure ? "yes" : "no");
+        macws_memdiag_log("start");
+    });
+}
+
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
@@ -23576,6 +24279,8 @@ static void install_agx_init_redirect(Class agx) {
         fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled AGXG13GFamilyDevice newTextureWithDescriptor:\n");
     }
 #endif // !arm64e || !on-device — MTLFakeDevice unavailable on arm64e on-device
+    // Diagnostic only (MACWS_MEMDIAG=1); wraps the swizzled IMPs above.
+    macws_memdiag_install(agx);
 
     // Public NoCopy buffers retain their original CPU allocation. The former
     // copy-and-early-deallocate redirect breaks that contract (and Office's
@@ -23948,8 +24653,19 @@ static const char *macws_private_lsd_service_name(const char *name) {
         ? rewritten : name;
 }
 
+// Shared-cache xpc_connection_create_mach_service uses this table. It must
+// include the CARenderServer rewrite that macws_private_bootstrap_service_name
+// already applies: WindowServer publishes only
+// com.apple.macosbooter.CARenderServer. QuartzCore looks the name up through
+// libxpc in the shared cache, so DYLD_INTERPOSE on bootstrap_look_up is not
+// enough. A missing rewrite leaves WebKit's CAContext/CALayerHost with no
+// render server and a blank content view (AppKit chrome still paints via CGS).
+// Do not call macws_private_bootstrap_service_name from this file: it is
+// static, and exporting it broke dyld interposing (flat-namespace abort).
 static const char *macws_private_chroot_service_name(const char *name) {
     if (!name) return name;
+    if (!strcmp(name, "com.apple.CARenderServer"))
+        return "com.apple.macosbooter.CARenderServer";
     // RunningBoard names the launchd endpoints from the registered iOS first
     // image, while Ventura's ExtensionFoundation names them from the real
     // application-extension record.  `launchctl procinfo` runtime-confirmed
@@ -24307,6 +25023,21 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
         return orig_xpc_connection_create(name, targetq);
     }
     name = macws_private_chroot_service_name(name);
+    if (originalName && strstr(originalName, "CARenderServer")) {
+        char line[256];
+        int n = snprintf(line, sizeof(line),
+            "pid=%d xpc_connection_create_mach_service '%s'%s%s%s flags=%#llx\n",
+            getpid(), originalName,
+            name != originalName ? " -> '" : "",
+            name != originalName ? name : "",
+            name != originalName ? "'" : "",
+            (unsigned long long)flags);
+        if (n > 0) {
+            int fd = open("/tmp/macws-webkit-paint.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) { (void)write(fd, line, (size_t)n); close(fd); }
+        }
+    }
     // Connection tracing is a diagnostic flight recorder.  Terminal used to
     // enable it implicitly, making an ordinary production shell write every
     // XPC lookup to stderr.  Keep the functional privileged-flag translation
@@ -24327,11 +25058,124 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
 }
 
 // Also trace xpc_connection_create (the XPC service / bundle-name style)
+
+// From mac_hooks.m — Application-type XPC (WebKit/TSV) with seatbelt-friendly names.
+extern int macws_xpc_overlay_activate(const char *name);
+extern int macws_xpc_overlay_supersedes_tsv(const char *name);
+extern const char *macws_xpc_overlay_service_name(const char *name);
+extern xpc_connection_t macws_xpc_create_application_service(
+    const char *name, dispatch_queue_t targetq,
+    xpc_connection_t (*create_fn)(const char *, dispatch_queue_t));
+extern void macws_xpc_wrap_app_event_handler(
+    xpc_connection_t connection, xpc_handler_t handler,
+    void (*orig)(xpc_connection_t, xpc_handler_t));
+extern void macws_xpc_app_logf(const char *fmt, ...);
+extern const char *macws_xpc_lookup_app_conn_name(xpc_connection_t conn);
+static void (*orig_xpc_connection_set_event_handler)(
+    xpc_connection_t, xpc_handler_t);
+static void hooked_xpc_connection_set_event_handler(
+        xpc_connection_t connection, xpc_handler_t handler) {
+    macws_xpc_wrap_app_event_handler(
+        connection, handler, orig_xpc_connection_set_event_handler);
+}
+
+// Shared-cache WebKit/libxpc never hits DYLD_INTERPOSE of
+// xpc_connection_set_instance (net25 logged 0 skips). Instance UUIDs are
+// launchd MultipleInstances metadata and can invalidate a
+// create_from_endpoint unique peer. Skip them here, and log resume / send
+// so the field run can tell whether Safari actually talks on that conn.
+static void (*orig_xpc_connection_set_instance)(
+    xpc_connection_t, const unsigned char[16]);
+static void hooked_xpc_connection_set_instance(
+        xpc_connection_t connection, const unsigned char instance[16]) {
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20)) {
+        macws_xpc_app_logf("pid=%d wk-peer skip-set-instance peer=%s\n",
+                           getpid(), svc);
+        return;
+    }
+    if (orig_xpc_connection_set_instance)
+        orig_xpc_connection_set_instance(connection, instance);
+}
+
+static void (*orig_xpc_connection_resume)(xpc_connection_t);
+static void hooked_xpc_connection_resume(xpc_connection_t connection) {
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20))
+        macws_xpc_app_logf("pid=%d wk-peer resume peer=%s conn=%p\n",
+                           getpid(), svc, connection);
+    if (orig_xpc_connection_resume)
+        orig_xpc_connection_resume(connection);
+}
+
+static void (*orig_xpc_connection_send_message)(xpc_connection_t, xpc_object_t);
+static void hooked_xpc_connection_send_message(
+        xpc_connection_t connection, xpc_object_t message) {
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20)) {
+        const char *typ = "other";
+        if (message && xpc_get_type(message) == XPC_TYPE_DICTIONARY)
+            typ = "dictionary";
+        macws_xpc_app_logf(
+            "pid=%d wk-peer send-message peer=%s conn=%p type=%s\n",
+            getpid(), svc, connection, typ);
+    }
+    if (orig_xpc_connection_send_message)
+        orig_xpc_connection_send_message(connection, message);
+}
+
+static void (*orig_xpc_connection_send_message_with_reply)(
+    xpc_connection_t, xpc_object_t, dispatch_queue_t, xpc_handler_t);
+static void hooked_xpc_connection_send_message_with_reply(
+        xpc_connection_t connection, xpc_object_t message,
+        dispatch_queue_t replyq, xpc_handler_t handler) {
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    xpc_handler_t reply = handler;
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20)) {
+        macws_xpc_app_logf(
+            "pid=%d wk-peer send-message-with-reply peer=%s conn=%p\n",
+            getpid(), svc, connection);
+        if (handler) {
+            const char *peer = svc;
+            reply = ^(xpc_object_t event) {
+                const char *typ = "other";
+                if (!event)
+                    typ = "null";
+                else if (xpc_get_type(event) == XPC_TYPE_ERROR)
+                    typ = "error";
+                else if (xpc_get_type(event) == XPC_TYPE_DICTIONARY)
+                    typ = "dictionary";
+                macws_xpc_app_logf(
+                    "pid=%d wk-peer reply peer=%s type=%s\n",
+                    getpid(), peer, typ);
+                handler(event);
+            };
+        }
+    }
+    if (orig_xpc_connection_send_message_with_reply)
+        orig_xpc_connection_send_message_with_reply(
+            connection, message, replyq, reply);
+}
+
 xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {
     const char *originalName = name;
     if (name && (!strcmp(name, "com.apple.FileCoordination") ||
                  !strcmp(name, "com.apple.ProgressReporting"))) {
         return orig_xpc_connection_create(name, queue);
+    }
+    // Generic Application-type XPC via a launchd-managed overlay bundle
+    // (field notes §59). Only names without an explicit chroot remap.
+    if (name && (macws_private_chroot_service_name(name) == name ||
+                 macws_xpc_overlay_supersedes_tsv(name)) &&
+        macws_xpc_overlay_activate(name))
+        return orig_xpc_connection_create(
+            macws_xpc_overlay_service_name(name), queue);
+    // Shared-cache callers never hit DYLD_INTERPOSE macws_xpc_connection_create_early.
+    // Activate Application-type proxies here (stock name for sandbox checks).
+    {
+        xpc_connection_t app = macws_xpc_create_application_service(
+            name, queue, orig_xpc_connection_create);
+        if (app) return app;
     }
     name = macws_private_chroot_service_name(name);
     if (originalName && getenv("MACWS_XPC_DEBUG")) {
@@ -24354,6 +25198,63 @@ xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t
     return orig_xpc_connection_create(name, queue);
 }
 
+
+// Shared-cache sandbox_check (App Sandbox mach-lookup). Allow MacWS private
+// service names so remapped Application-type XPC works for any sandboxed app.
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+static int (*orig_sandbox_check)(pid_t pid, const char *operation, int type, ...);
+enum { MACWS_MH_SANDBOX_FILTER_GLOBAL_NAME = 2 };
+static int hooked_sandbox_check(pid_t pid, const char *operation, int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    if (operation && !strcmp(operation, "mach-lookup") &&
+        type == MACWS_MH_SANDBOX_FILTER_GLOBAL_NAME) {
+        const char *svc = va_arg(ap, const char *);
+        va_end(ap);
+        if (svc && (!strncmp(svc, "com.apple.macosbooter.", 22) ||
+                    !strncmp(svc, "com.macwsguide.wk.i.", 20)))
+            return 0;
+        int checked = orig_sandbox_check(pid, operation, type, svc);
+        if (checked != 0) {
+            char **argv = *_NSGetArgv();
+            const char *exe = (argv && argv[0]) ? argv[0] : "";
+            if (strstr(exe, "com.apple.WebKit.WebContent")) {
+                static _Atomic unsigned denied;
+                unsigned n = atomic_fetch_add_explicit(&denied, 1, memory_order_relaxed);
+                if (n < 64) {
+                    char line[256];
+                    int len = snprintf(line, sizeof(line),
+                        "pid=%d exe=%s sandbox_check DENY mach-lookup %s result=%d\n",
+                        getpid(), exe, svc ? svc : "?", checked);
+                    int fd = open("/tmp/macws-webkit-paint.log",
+                                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+                    if (fd >= 0) {
+                        if (len > 0) (void)write(fd, line, (size_t)len);
+                        close(fd);
+                    }
+                }
+            }
+        }
+        return checked;
+    }
+    if (type == 0) {
+        va_end(ap);
+        return orig_sandbox_check(pid, operation, type);
+    }
+    const void *arg = va_arg(ap, const void *);
+    va_end(ap);
+    return orig_sandbox_check(pid, operation, type, arg);
+}
+static void macws_install_sandbox_mach_lookup_hooks(void) {
+    MSImageRef sand = MSGetImageByName("/usr/lib/system/libsystem_sandbox.dylib");
+    if (!sand)
+        sand = MSGetImageByName("/usr/lib/system/libsystem_kernel.dylib");
+    void *sym = sand ? MSFindSymbol(sand, "_sandbox_check") : NULL;
+    if (!sym)
+        sym = dlsym(RTLD_DEFAULT, "sandbox_check");
+    if (sym)
+        MSHookFunction(sym, (void *)hooked_sandbox_check, (void *)&orig_sandbox_check);
+}
 static void macws_install_private_xpc_name_hooks(void) {
     // CoreFoundation performs the cfprefsd lookup from inside the shared
     // cache, so a client dylib's static interpose alone cannot rewrite it.
@@ -24368,6 +25269,32 @@ static void macws_install_private_xpc_name_hooks(void) {
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"),
                    hooked_xpc_connection_create,
                    (void *)&orig_xpc_connection_create);
+    void *seteh = MSFindSymbol(xpc, "_xpc_connection_set_event_handler");
+    if (seteh)
+        MSHookFunction(seteh,
+                       (void *)hooked_xpc_connection_set_event_handler,
+                       (void *)&orig_xpc_connection_set_event_handler);
+    void *setinst = MSFindSymbol(xpc, "_xpc_connection_set_instance");
+    if (setinst)
+        MSHookFunction(setinst,
+                       (void *)hooked_xpc_connection_set_instance,
+                       (void *)&orig_xpc_connection_set_instance);
+    void *res = MSFindSymbol(xpc, "_xpc_connection_resume");
+    if (res)
+        MSHookFunction(res,
+                       (void *)hooked_xpc_connection_resume,
+                       (void *)&orig_xpc_connection_resume);
+    void *send = MSFindSymbol(xpc, "_xpc_connection_send_message");
+    if (send)
+        MSHookFunction(send,
+                       (void *)hooked_xpc_connection_send_message,
+                       (void *)&orig_xpc_connection_send_message);
+    void *sendr = MSFindSymbol(xpc, "_xpc_connection_send_message_with_reply");
+    if (sendr)
+        MSHookFunction(sendr,
+                       (void *)hooked_xpc_connection_send_message_with_reply,
+                       (void *)&orig_xpc_connection_send_message_with_reply);
+    macws_install_sandbox_mach_lookup_hooks();
 }
 
 extern int xpc_connection_enable_sim2host_4sim();

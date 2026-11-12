@@ -8,6 +8,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
+
+#ifndef MACWS_SETTINGS_DEFAULT_STRATEGY
+#define MACWS_SETTINGS_DEFAULT_STRATEGY 0
+#endif
 #include "../include/macws_settings_paths.h"
 #include "../include/macws_settings_bridge_notify.h"
 
@@ -83,6 +88,49 @@ static BOOL MacWSBuildSettingsCarrier(const char *identifier,
         identifierLength > 0 && identifierLength < PATH_MAX;
 }
 
+
+// iPadOS 16.5 Sandbox.kext re-applies container + executable-path checks at
+// the proxy's post-chroot execve() of the macOS appex (runtime-confirmed
+// 2026-11-09, iPad14,5).  Overlay ServiceType strategies 1-3 were evaluated
+// after a runningboardd restart and do NOT clear those kills; the durable
+// fix is ensure_chroot_sandbox_paths.sh (rootfs self-link + PluginKitPlugin
+// container mirrors inside the chroot).  The strategy file remains as a
+// diagnostic knob:
+//   /var/jb/var/mobile/macws-settings-overlay-strategy  (absent/0 = stock)
+//   1 = ServiceType System, 2 = drop ServiceType, 3 = ServiceType System and
+//   JoinExistingSession removed.  Every submission is logged with its
+//   strategy and the final overlay description to
+//   /var/jb/var/mobile/macws-settings-overlay.log.
+static int MacWSSettingsContainerStrategy(void) {
+    int fd = open("/var/jb/var/mobile/macws-settings-overlay-strategy",
+                  O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return MACWS_SETTINGS_DEFAULT_STRATEGY;
+    char buffer[8] = {0};
+    ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (n <= 0 || buffer[0] < '0' || buffer[0] > '9') return 0;
+    return buffer[0] - '0';
+}
+
+static void MacWSApplySettingsContainerStrategy(xpc_object_t overlay,
+                                                xpc_object_t service) {
+    int strategy = MacWSSettingsContainerStrategy();
+    if (strategy == 1 || strategy == 3)
+        xpc_dictionary_set_string(service, "ServiceType", "System");
+    else if (strategy == 2)
+        xpc_dictionary_set_value(service, "ServiceType", NULL);
+    if (strategy == 3)
+        xpc_dictionary_set_value(service, "JoinExistingSession", NULL);
+    int fd = open("/var/jb/var/mobile/macws-settings-overlay.log",
+                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    char *description = xpc_copy_description(overlay);
+    dprintf(fd, "strategy=%d overlay=%s\n", strategy,
+            description ? description : "(null)");
+    free(description);
+    close(fd);
+}
+
 static BOOL MacWSPrepareSettingsExtensionOverlay(
     xpc_object_t overlay, const char *target,
     char proxyExecutable[PATH_MAX]) {
@@ -138,6 +186,7 @@ static BOOL MacWSPrepareSettingsExtensionOverlay(
         xpc_dictionary_set_value(service, "EnvironmentVariables",
                                  environment);
     }
+    MacWSApplySettingsContainerStrategy(overlay, service);
     xpc_dictionary_set_string(environment, "MACWS_EXTENSION_TARGET",
                               target);
     xpc_dictionary_set_string(environment, "MACWS_EXTENSION_IDENTIFIER",

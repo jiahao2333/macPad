@@ -33,6 +33,16 @@ if [ ! -d "$EXTENSIONS_ROOT" ]; then
     echo '[INFO] Settings extension runtime deferred: macOS rootfs is not mounted'
     exit 0
 fi
+
+# iPadOS 16.5 Sandbox.kext needs the host realpath and any Settings
+# PluginKitPlugin containers to resolve inside the chroot (see
+# ensure_chroot_sandbox_paths.sh). Run before any pane is signed/launched.
+if [ -f /var/jb/usr/macOS/bin/ensure_chroot_sandbox_paths.sh ]; then
+    bash /var/jb/usr/macOS/bin/ensure_chroot_sandbox_paths.sh || {
+        echo '[ERROR] ensure_chroot_sandbox_paths.sh failed' >&2
+        exit 1
+    }
+fi
 for required in "$LIBMACHOOK" "$SUBSTRATE" "$TRAMPOLINES" \
                 "$MACHO_PATCHER" "$LOAD_PATCHER" "$SETTINGS_ENT"; do
     if [ ! -f "$required" ]; then

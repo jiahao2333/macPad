@@ -7,10 +7,11 @@
 <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
 <key>MinimumOSVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
-<key>NSPrincipalClass</key><string>NSViewServiceApplication</string>
-<key>ViewService</key><dict><key>WantsMasquerade</key><false/></dict>
+<key>NSPrincipalClass</key><string>NSApplication</string>
 <key>XPCService</key><dict>
 <key>JoinExistingSession</key><true/>
 <key>RunLoopType</key><string>_NSApplicationMain</string>
 <key>ServiceType</key><string>Application</string>
-</dict></dict></plist>
+<key>_MultipleInstances</key><true/>
+</dict>
+</dict></plist>

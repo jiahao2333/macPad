@@ -1,9 +1,7 @@
 #ifndef MACWS_WEBKIT_SERVICES_H
 #define MACWS_WEBKIT_SERVICES_H
-// Runtime Safari XPC trace selects these exact services. Native macOS bundle
-// identifiers must not resolve to an iPadOS WebKit process/version. Preserve
-// XPC per-instance activation and the one-shot bootstrap context through the
-// same freestanding first-image transition as DockHelper.
+// Prefer stock Ventura XPC paths after macws_admit_rootfs_binary (CT policy).
+// Runtime Safari XPC remaps to macosbooter.* + xpc_add_bundle (DockHelper-style).
 typedef struct {
     const char *original;
     const char *privateName;

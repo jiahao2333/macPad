@@ -1,0 +1,7 @@
+# original_name	activate_name	proxy_relative
+# activate_name may differ (private macosbooter.*) so sandboxed apps do not
+# collide with iOS peers; libmachook allows macosbooter.* mach-lookup system-wide.
+com.apple.WebKit.WebContent	com.apple.macosbooter.WebKit.WebContent	WebKit.framework/Versions/A/XPCServices/WebContentProxy.xpc
+com.apple.WebKit.Networking	com.apple.macosbooter.WebKit.Networking	WebKit.framework/Versions/A/XPCServices/WebNetworkingProxy.xpc
+com.apple.WebKit.GPU	com.apple.macosbooter.WebKit.GPU	WebKit.framework/Versions/A/XPCServices/WebGPUProxy.xpc
+com.apple.Safari.SandboxBroker	com.apple.macosbooter.Safari.SandboxBroker	WebKit.framework/Versions/A/XPCServices/SafariSandboxProxy.xpc

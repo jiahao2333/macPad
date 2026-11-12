@@ -1153,6 +1153,68 @@ chmod 0700 "$ROOTFS/Users/mobile/Library/Containers/com.gameloft.asphalt9mac" \
 # Registering the existing dyld and chroot CydiaSubstrate CodeDirectories made
 # the unchanged bash process complete normally.  Keep this upstream of the
 # Ventura codesign calls rather than weakening their result checks.
+# issue #1 item 6 / AppPluginTrust: stock rootfs has no in-chroot CydiaSubstrate;
+# /var/mnt/rootfs/var/jb/Library (and usr) were symlinks into /var/jb so
+# macws_system_app_prepare.py reported "dependency escapes rootfs" when
+# libmachook's @rpath resolved Substrate (and then libswift*) through them.
+# Install macOS-platform ellekit copies inside the rootfs (System framework and
+# usr/local/lib/.jbroot).  NEVER replace rootfs/var/jb/usr or var/jb/Library
+# with real trees: ensure_jb_usr_bind.sh only accepts a symlink exactly to
+# /var/jb/usr, an existing mount, or an EMPTY dir (bind-mounted with
+# mount_bindfs); a nonempty dir aborts startup.  libswift admission for
+# System Settings is still open on devices without mount_bindfs.
+ensure_cydia_substrate_rootfs() {
+	local src=/var/jb/usr/lib/libellekit.dylib
+	local patcher=/var/jb/usr/macOS/bin/set_macos_version.py
+	local sys="$ROOTFS/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate"
+	local jbroot="$ROOTFS/usr/local/lib/.jbroot/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate"
+	local dest tmp
+	[ -f "$src" ] || return 0
+	[ -f "$patcher" ] || return 0
+
+	# Only (re)create in-rootfs Substrate copies that are missing or not
+	# entitlement-signed; the previous file is kept as .macws-original.
+	# Never populate var/jb/usr (ensure_jb_usr_bind) or rewrite var/jb/Library.
+	install_one_if_missing() {
+		dest="$1"
+		# Keep an existing copy only when it is macOS-platform AND carries the
+		# project entitlements; a bare `ldid -S` copy is silently AMFI-killed
+		# (SystemUIServer/ControlCenter die at launch with no .ips).
+		if [ -f "$dest" ] && otool -l "$dest" 2>/dev/null |
+			grep -A4 LC_BUILD_VERSION | grep -q 'platform 1' &&
+			ldid -e "$dest" 2>/dev/null |
+			grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>'; then
+			add_all_trustcache "$dest"
+			return 0
+		fi
+		mkdir -p "$(dirname "$dest")"
+		tmp="${dest}.macws-new.$$"
+		# Fresh inode: never re-sign the live file in place.
+		cp -p "$src" "$tmp" || return 1
+		/var/jb/usr/bin/python3 "$patcher" "$tmp" || { rm -f "$tmp"; return 1; }
+		# issue #1 item 9: bare -S is AMFI-killed; use project entitlements
+		ldid -S"$ENT" -M "$tmp" || { rm -f "$tmp"; return 1; }
+		ldid -S"$ENT" -M "$tmp" || { rm -f "$tmp"; return 1; }
+		chown root:wheel "$tmp" || { rm -f "$tmp"; return 1; }
+		chmod 0755 "$tmp" || { rm -f "$tmp"; return 1; }
+		otool -l "$tmp" 2>/dev/null | grep -A4 LC_BUILD_VERSION | grep -q 'platform 1' || {
+			rm -f "$tmp"; return 1;
+		}
+		if [ -f "$dest" ] && [ ! -e "${dest}.macws-original" ]; then
+			cp -p "$dest" "${dest}.macws-original" || true
+		fi
+		rm -f "$dest"
+		mv -f "$tmp" "$dest" || return 1
+		add_all_trustcache "$dest"
+	}
+
+	install_one_if_missing "$jbroot" || return 1
+	install_one_if_missing "$sys" || return 1
+	echo '[INFO] ensured in-rootfs CydiaSubstrate (System + .jbroot, entitlements-signed)'
+}
+
+ensure_cydia_substrate_rootfs || exit 1
+
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld
 add_all_trustcache \
 	/var/mnt/rootfs/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate
@@ -1469,7 +1531,36 @@ add_all_trustcache /var/mnt/rootfs/bin/ls
 add_all_trustcache /var/mnt/rootfs/bin/kill
 add_all_trustcache /var/mnt/rootfs/bin/pwd
 add_all_trustcache /var/mnt/rootfs/usr/bin/python3
-add_all_trustcache /var/mnt/rootfs/usr/bin/defaults
+# iPad14,5 / 20F66: stock Apple-signed helpers used with DYLD_INSERT libmachook
+# are AMFI SIGKILLed even when their Apple CDHashes are trusted (same class as
+# bash/codesign). Merge project entitlements onto a new inode and register the
+# resulting CDHashes. sign_and_trustcache alone can no-op when the stock hashes
+# are already in the dynamic trustcache, so require the project marker.
+ensure_insert_helper_signature() {
+	local path="$1"
+	local backup="${path}.macws-original"
+	[ -f "$path" ] || return 0
+	if ldid -e "$path" 2>/dev/null | grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>'; then
+		add_all_trustcache "$path"
+		return 0
+	fi
+	if [ ! -e "$backup" ]; then
+		cp -p "$path" "$backup" || return 1
+	fi
+	local tmp="${path}.macws-new.$$"
+	cp -p "$backup" "$tmp" || return 1
+	ldid -S"$ENT" -M "$tmp" || { rm -f "$tmp"; return 1; }
+	ldid -S"$ENT" -M "$tmp" || { rm -f "$tmp"; return 1; }
+	chown root:wheel "$tmp" || { rm -f "$tmp"; return 1; }
+	chmod 0755 "$tmp" || { rm -f "$tmp"; return 1; }
+	rm -f "$path"
+	mv -f "$tmp" "$path" || return 1
+	add_all_trustcache "$path"
+}
+
+ensure_insert_helper_signature /var/mnt/rootfs/usr/bin/defaults || exit 1
+ensure_insert_helper_signature /var/mnt/rootfs/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister || exit 1
+# WindowServer must go through prepare_windowserver_runtime (ARM64/ALL + sign), not ensure_insert_helper_signature.
 add_all_trustcache /var/mnt/rootfs/usr/bin/perl
 add_all_trustcache /var/mnt/rootfs/usr/bin/perl5.30
 add_all_trustcache /var/mnt/rootfs/usr/bin/which
@@ -1849,6 +1940,20 @@ if [ -d "$ROOTFS/opt/local" ]; then
     done
     echo "[INFO] Processed $MACHO_COUNT MacPorts files"
 fi
+
+# Field notes §62: persist the Safari-over-HTTPS route proven in §61 (r93).
+# All three steps are idempotent and non-fatal for the package install.
+#  - macOS trustd/securityd: project signature once (backup kept), CDHashes
+#    admitted; macos_gui.sh re-admits them and bootstraps the jobs per start.
+#  - WebKit/Safari overlay XPC bundles + chroot index (WebKit only, not --all),
+#    MacWSXPCProxy 0755 + MacWSXPCProxy.priv 4755.
+#  - Optional: Safari first-run onboarding state (one key, backup kept).
+bash /var/jb/usr/macOS/bin/macws_macos_trust_services.sh --install ||
+    echo "[WARN] macOS trustd/securityd install step reported errors (HTTPS may fail)"
+bash /var/jb/usr/macOS/bin/macws_webkit_overlay_install.sh ||
+    echo "[WARN] WebKit overlay route install reported errors"
+/var/jb/usr/bin/python3 /var/jb/usr/macOS/bin/macws_safari_first_run.py ||
+    echo "[WARN] Safari onboarding pre-seed failed (optional)"
 
 # Input protocol receivers map libmachook/macwsinputd for their complete
 # lifetime.  Replacing the files on disk cannot update a running Dock or input

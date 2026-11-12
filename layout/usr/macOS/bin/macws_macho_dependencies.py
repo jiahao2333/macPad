@@ -135,8 +135,18 @@ def closure(executable, seeds, root, cache=None):
         for name in commands['loads']:
             candidates = ([os.path.join(value, name[7:]) for value in rpaths]
                           if name.startswith('@rpath/') else [expand(name, loader)])
+            searched = name.startswith('@rpath/')
             for candidate in candidates:
                 if not candidate:
+                    continue
+                if searched and not os.path.realpath(candidate).startswith(root + '/'):
+                    # An @rpath search entry that only resolves outside the
+                    # rootfs (e.g. LC_RPATH /var/jb/Library/Frameworks via
+                    # the rootfs/var/jb/Library -> /var/jb/Library symlink)
+                    # cannot be what dyld loads inside the chroot, where that
+                    # symlink points back at itself. dyld moves on to the
+                    # next rpath; so does admission. Explicit absolute and
+                    # @loader_path/@executable_path imports still fail closed.
                     continue
                 candidate = contained(candidate)
                 if os.path.isfile(candidate):

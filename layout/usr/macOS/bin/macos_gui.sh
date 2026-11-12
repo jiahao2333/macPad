@@ -39,6 +39,7 @@
 # NO shebang on purpose: this jailbreak's AMFI SIGKILLs execve() of any file with
 # a `#!` line (see CLAUDE.md).  Always invoke via `bash <path>`.
 
+# Also treat iPad14,5 / 20F66 like 20F75 for cold-start / AGX 0x78 (local port).
 set -u
 
 # ─── Paths ──────────────────────────────────────────────────────────────────
@@ -139,6 +140,7 @@ AUTHD_LABEL=com.macwsguide.authd
 DESKTOP_SERVICES_HELPER_LABEL=com.macwsguide.desktopserviceshelper
 FINDER_DESKTOP_LABEL=com.macwsguide.finder-desktop
 DOCK_LABEL=com.macwsguide.dock
+DOCK_TILES_HELPER=/var/jb/usr/macOS/bin/macws_dock_tiles.py
 SYSTEMUI_LABEL=com.macwsguide.systemuiserver
 CONTROL_CENTER_LABEL=com.macwsguide.controlcenter
 INPUT_LABEL=UIKitApplication:com.macwsguide.input
@@ -1608,6 +1610,10 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/PrivateFrameworks/TimelineUI.framework/Versions/A/TimelineUI" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" \
+        "$ROOTFS/usr/local/libexec/macws-xpc/WebKit.framework" \
+        /var/jb/usr/macOS/Frameworks/WebKit.framework \
+        "$ROOTFS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices" \
+        "$ROOTFS/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app/Contents/XPCServices" \
         "$ROOTFS$CSNAMEDDATAD_BIN" \
         "$ROOTFS$CORESERVICESD_BIN" \
         "$ROOTFS$AUTHD_BIN" \
@@ -1693,6 +1699,26 @@ restore_cold_boot_trust() {
         "$@" || return 1
     BASE_TRUST_READY=1
     log "Cold-boot trust closure ready (complete dependency closure; live membership verified)."
+    # Application-type WebKit/Safari proxies: the bundle executable must
+    # stay non-setuid so iOS xpcproxy deposits the one-shot receive right
+    # (setugid XPC services are refused). The *.priv sibling is the
+    # setuid-root chroot helper used only when the stub is still
+    # unprivileged. macws_admit_rootfs_binary.sh ends with chmod 755;
+    # restore both modes after every cold-boot trust restore.
+    for _macws_proxy in WebContentProxy WebNetworkingProxy WebGPUProxy SafariSandboxProxy; do
+        for _macws_bin in \
+            "$ROOTFS/usr/local/libexec/macws-xpc/WebKit.framework/Versions/A/XPCServices/${_macws_proxy}.xpc/${_macws_proxy}" \
+            "/var/jb/usr/macOS/Frameworks/WebKit.framework/Versions/A/XPCServices/${_macws_proxy}.xpc/${_macws_proxy}"; do
+            if [ -f "$_macws_bin" ]; then
+                chown root:wheel "$_macws_bin" 2>/dev/null || true
+                chmod 0755 "$_macws_bin" || true
+            fi
+            if [ -f "${_macws_bin}.priv" ]; then
+                chown root:wheel "${_macws_bin}.priv" 2>/dev/null || true
+                chmod 4755 "${_macws_bin}.priv" || true
+            fi
+        done
+    done
 }
 
 # True if a macOS binary can actually run in the chroot right now.
@@ -1908,6 +1934,25 @@ ensure_chroot_works() {
         log "ERROR: chroot devfs is unavailable; Terminal cannot create a pty."
         tail -n 10 "$LOGDIR/mountdevfs.log" 2>/dev/null || true
         return 1
+    fi
+
+    # iPadOS 16.5 Sandbox execve hooks resolve /var/mnt/rootfs/... and
+    # PluginKitPlugin containers inside the chroot. Seed those paths before
+    # any macOS XPC/ExtensionKit proxy execs (Settings panes, ViewBridge, ...).
+    if [ -f /var/jb/usr/macOS/bin/ensure_chroot_sandbox_paths.sh ]; then
+        if ! bash /var/jb/usr/macOS/bin/ensure_chroot_sandbox_paths.sh \
+                > "$LOGDIR/chroot-sandbox-paths.log" 2>&1; then
+            log "ERROR: chroot sandbox path seed failed."
+            tail -n 20 "$LOGDIR/chroot-sandbox-paths.log" 2>/dev/null || true
+            return 1
+        fi
+    fi
+    # Curl SecureTransport fails with errSSLBadCert in chroot; NSURLSession is
+    # fine. Seed LibreSSL/curl + PEM defaults for CLI TLS validation.
+    if [ -f /var/jb/usr/macOS/bin/ensure_chroot_ssl_defaults.sh ]; then
+        bash /var/jb/usr/macOS/bin/ensure_chroot_ssl_defaults.sh \
+            > "$LOGDIR/chroot-ssl-defaults.log" 2>&1 || \
+            log "WARN: chroot SSL defaults seed failed (non-fatal)."
     fi
     # A restored/rootfs snapshot can regress only the data-only shader artifact
     # while every executable trust sentinel remains valid. Hash-check the
@@ -3714,6 +3759,53 @@ publish_settings_service_contracts() {
     log "Private macOS ViewBridge, ExtensionKit, HIServices and GeoServices contracts ready."
 }
 
+# macOS trustd/securityd back TLS for Safari/WebKit (field notes §61.6, §62).
+# Their CDHashes live in Dopamine's reboot-volatile trustcache and the jobs
+# are not RunAtLoad-scanned, so re-admit the on-disk hashes (computed now from
+# the rootfs images, never hard-coded) and bootstrap both into the system
+# domain on every GUI start. Idempotent: running jobs are left alone.
+# Non-fatal by design: without them only HTTPS breaks (-1202/-9807), the
+# desktop itself does not depend on them.
+ensure_macos_trust_services() {
+    local helper=/var/jb/usr/macOS/bin/macws_macos_trust_services.sh
+    if [ ! -f "$helper" ]; then
+        log "WARN: $helper missing; macOS trustd/securityd not started (HTTPS will fail)."
+        return 0
+    fi
+    if bash "$helper" --start >> "$LOGDIR/macos-trust-services.log" 2>&1; then
+        log "macOS trustd/securityd ready (com.macwsguide.trustd / com.macwsguide.securityd)."
+    else
+        log "WARN: macOS trustd/securityd not fully ready; HTTPS may fail. See $LOGDIR/macos-trust-services.log"
+        tail -n 8 "$LOGDIR/macos-trust-services.log" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# macOS Safari's Safe Browsing lookup has no working provider here: the
+# com.apple.Safari.SafeBrowsing.Service Mach name resolves to the iPadOS
+# service, which accepts the connection and never answers the Ventura client.
+# WebKit holds every http(s) main-frame navigation until both the policy
+# delegate and the Safe Browsing result arrive, so once Safari had fetched its
+# remote configuration (first successful TLS session, field notes §63) every
+# page stayed blank with a spinning address bar. Turn the lookup off through
+# the live macOS cfprefsd (a direct plist edit would be overwritten by its
+# cache). Idempotent; non-fatal (only Safari's fraud warning depends on it).
+ensure_safari_safe_browsing_off() {
+    local key value
+    for key in WarnAboutFraudulentWebsites \
+               com.apple.Safari.ContentPageGroupIdentifier.WebKit2SafeBrowsingEnabled; do
+        value=$(HOME=/var/root run_defaults_utility read com.apple.Safari "$key" 2>/dev/null | tail -n 1)
+        [ "$value" = 0 ] && continue
+        if HOME=/var/root run_defaults_utility write com.apple.Safari "$key" -bool false >/dev/null 2>&1 &&
+           [ "$(HOME=/var/root run_defaults_utility read com.apple.Safari "$key" 2>/dev/null | tail -n 1)" = 0 ]; then
+            log "Safari Safe Browsing lookup disabled ($key=0; iPadOS provider never replies)."
+        else
+            log "WARN: could not set Safari $key=0; Safari page loads may hang (field notes §63)."
+        fi
+    done
+    return 0
+}
+
 publish_desktop_operation_services() {
     local plist="" label="" authd_pid="" waited=0
     [ -x "$CSNAMEDDATA_PROXY" ] || {
@@ -3801,6 +3893,41 @@ run_mobile_defaults_utility() {
         "$CHROOTEXEC" 501 501 "$ROOTFS" "$DEFAULTS_BIN" "$@"
 }
 
+# Ventura Dock resolves persistent-apps tiles only at startup. A tile whose
+# bundle is absent from this rootfs (stock template iWork entries, or an app
+# such as Safari that appeared after the tile was created) is drawn as "?" and
+# its click never reaches LSOpenFromURLSpec. Drop only tiles whose file URL
+# does not resolve inside the chroot, through cfprefsd, before Dock loads.
+# Failure is logged and non-fatal: it can only leave the previous tiles.
+sanitize_dock_tiles() {
+    local export_rel=/tmp/macws-dock-tiles.export.plist
+    local output_rel=/tmp/macws-dock-tiles.sanitized.plist
+    local status=0
+    [ -f "$DOCK_TILES_HELPER" ] || return 0
+    rm -f "$ROOTFS$export_rel" "$ROOTFS$output_rel"
+    if ! run_defaults_utility export com.apple.dock "$export_rel" \
+            > "$LOGDIR/dock-tiles.log" 2>&1 ||
+       [ ! -s "$ROOTFS$export_rel" ]; then
+        log "WARNING: Dock tile sanitizer could not export com.apple.dock."
+        return 0
+    fi
+    /var/jb/usr/bin/python3 "$DOCK_TILES_HELPER" "$ROOTFS" \
+        "$ROOTFS$export_rel" "$ROOTFS$output_rel" >> "$LOGDIR/dock-tiles.log" 2>&1 ||
+        status=$?
+    if [ "$status" -eq 0 ]; then
+        if run_defaults_utility import com.apple.dock "$output_rel" \
+                >> "$LOGDIR/dock-tiles.log" 2>&1; then
+            log "Dock tiles sanitized: $(tail -n 1 "$LOGDIR/dock-tiles.log")"
+        else
+            log "WARNING: Dock tile sanitizer could not import com.apple.dock."
+        fi
+    elif [ "$status" -ne 3 ]; then
+        log "WARNING: Dock tile sanitizer failed (status=$status)."
+    fi
+    rm -f "$ROOTFS$export_rel" "$ROOTFS$output_rel"
+    return 0
+}
+
 verify_preferences_persistence() {
     local value="" mission_control="" app_expose=""
     local dock_magnification="" dock_large_size="" dock_minimize_effect=""
@@ -3869,6 +3996,7 @@ verify_preferences_persistence() {
         return 1
     fi
     log "Private macOS CFPreferences database ready; native gestures, Genie minimize and maximum Dock hover magnification enabled."
+    sanitize_dock_tiles
 }
 
 verify_mobile_preferences_persistence() {
@@ -4812,6 +4940,9 @@ start_macos() {
     publish_settings_service_contracts || return 1
     log "Publishing Ventura authorization and DesktopServices helpers..."
     publish_desktop_operation_services || return 1
+    log "Publishing macOS trustd/securityd for TLS (non-fatal)..."
+    ensure_macos_trust_services
+    ensure_safari_safe_browsing_off
 
     log "Loading legacy macOS launchservicesd..."
     launchctl load "$LAUNCHSERVICESD_PLIST" || return 1

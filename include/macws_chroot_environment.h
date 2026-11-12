@@ -40,4 +40,26 @@ static inline int MacWSBuildChrootRootEnvironment(
     return 0;
 }
 
+// When the proxy is already inside the rootfs (posix_spawn from a chrooted
+// client), F_GETPATH of /var/mnt/rootfs is "/" and
+// MacWSBuildChrootRootEnvironment correctly rejects it. Reuse the parent's
+// already-canonical MACWS_CHROOT_HOST_ROOT instead of inventing "/" or
+// exiting. Inherited must be an absolute path with a second character.
+static inline int MacWSAdoptInheritedChrootRootEnvironment(
+        const char *inherited, char *output, size_t capacity) {
+    static const char prefix[] = MACWS_CHROOT_ROOT_PREFIX;
+    if (!inherited || inherited[0] != '/' || !inherited[1] || !output ||
+        capacity < MACWS_CHROOT_ROOT_ENV_SIZE) return 0;
+    size_t n = 0;
+    while (inherited[n]) {
+        if (n + 1 >= MACWS_CHROOT_PATH_MAX) return 0;
+        n++;
+    }
+    if (n < 2) return 0;
+    for (size_t i = 0; i < sizeof(prefix) - 1; i++) output[i] = prefix[i];
+    for (size_t i = 0; i <= n; i++)
+        output[sizeof(prefix) - 1 + i] = inherited[i];
+    return 1;
+}
+
 #endif

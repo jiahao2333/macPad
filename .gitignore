@@ -9,3 +9,4 @@ __pycache__/
 .ldid.entitlements.plist
 tmp/
 macws-preview-*
+field-artifacts/

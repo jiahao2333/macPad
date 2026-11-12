@@ -10,12 +10,8 @@
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>XPCService</key><dict>
 <key>JoinExistingSession</key><true/>
-<key>RunLoopType</key><string>NSRunLoop</string>
+<key>RunLoopType</key><string>_NSApplicationMain</string>
 <key>ServiceType</key><string>Application</string>
 <key>_MultipleInstances</key><true/>
-<key>_HighBitsASLR</key><true/>
-<key>_ProcessType</key><string>App</string>
-<key>_AdditionalProperties</key><dict><key>RunningBoard</key><dict>
-<key>Managed</key><true/><key>Reported</key><true/>
-</dict></dict>
-</dict></dict></plist>
+</dict>
+</dict></plist>

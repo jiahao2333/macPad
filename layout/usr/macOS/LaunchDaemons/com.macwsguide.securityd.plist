@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- System-wide Ventura securityd (SecurityServer) on private Mach name. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.macwsguide.securityd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy</string>
+        <string>-i</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.macosbooter.SecurityServer</key>
+        <dict><key>ResetAtClose</key><true/></dict>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XPC_SERVICE_NAME</key><string>com.macwsguide.securityd</string>
+        <key>MACWS_XPC_TARGET</key><string>/usr/sbin/securityd</string>
+        <key>HOME</key><string>/Users/root</string>
+        <key>TMPDIR</key><string>/tmp</string>
+        <key>__CFPREFERENCES_AVOID_DAEMON</key><string>1</string>
+    </dict>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>/var/jb/var/mobile/securityd-macos.log</string>
+    <key>StandardErrorPath</key><string>/var/jb/var/mobile/securityd-macos.log</string>
+</dict>
+</plist>

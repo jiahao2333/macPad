@@ -55,6 +55,19 @@ int main(void) {
     assert(!MacWSBuildChrootRootEnvironment("relative", output, sizeof(output), kernel));
     assert(!MacWSBuildChrootRootEnvironment("/var/mnt/rootfs", NULL, sizeof(output), kernel));
     assert(stage == 0);
+
+    // Inherited fallback: accept a real host-root path, never bare "/".
+    assert(MacWSAdoptInheritedChrootRootEnvironment(
+        "/private/var/mnt/rootfs", output, sizeof(output)));
+    assert(strcmp(output, MACWS_CHROOT_ROOT_PREFIX "/private/var/mnt/rootfs") == 0);
+    assert(MacWSAdoptInheritedChrootRootEnvironment(
+        "/var/mnt/rootfs", output, sizeof(output)));
+    assert(strcmp(output, MACWS_CHROOT_ROOT_PREFIX "/var/mnt/rootfs") == 0);
+    assert(!MacWSAdoptInheritedChrootRootEnvironment("/", output, sizeof(output)));
+    assert(!MacWSAdoptInheritedChrootRootEnvironment(NULL, output, sizeof(output)));
+    assert(!MacWSAdoptInheritedChrootRootEnvironment("relative", output, sizeof(output)));
+    assert(!MacWSAdoptInheritedChrootRootEnvironment(
+        "/private/var/mnt/rootfs", output, 8));
     puts("chroot canonical vnode metadata contract PASS");
     return 0;
 }

@@ -92,6 +92,20 @@ class DependencyTests(unittest.TestCase):
             paths, _ = deps.closure(str(main), [], root, metadata)
             self.assertIn(root + '/A', paths)
 
+    def test_escaping_rpath_entry_is_skipped_like_dyld(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as outside:
+            Path(outside, 'Lib').write_bytes(image())
+            Path(root, 'jb').symlink_to(outside)
+            Path(root, 'local').mkdir()
+            Path(root, 'local', 'Lib').write_bytes(image())
+            main = Path(root, 'Main')
+            main.write_bytes(image(['@rpath/Lib'], ['/jb', '@loader_path/local']))
+            paths, _ = deps.closure(str(main), [], root)
+            real = os.path.realpath(root)
+            self.assertIn(real + '/local/Lib', paths)
+            self.assertFalse(any(p.startswith(os.path.realpath(outside)) for p in paths))
+
     def test_escaping_alias_and_graph_budget_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
             main = Path(root, 'Main')

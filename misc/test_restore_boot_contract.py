@@ -31,6 +31,26 @@ class RestoreBootContract(unittest.TestCase):
         self.assertIn(
             '[ -x "$target_dir/$proxy_relative" ]', BIND)
         self.assertLess(BIND.index(symlink_probe), BIND.index(directory_creation))
+        # The host-only /var/jb/usr symlink is not enough: require an
+        # in-chroot canary read so xpc_add_bundle can parse the plist.
+        self.assertIn("in_chroot_readable", BIND)
+        self.assertIn(
+            '"$run_bash" -c "test -r /var/jb/usr/$relative"',
+            BIND)
+        self.assertIn("run_bash=/var/jb/usr/macOS/bin/run_bash.sh", BIND)
+        self.assertIn(
+            "webkit_canary=macOS/Frameworks/WebKit.framework/", BIND)
+        link_block = BIND.split(symlink_probe, 1)[1].split(
+            directory_creation, 1)[0]
+        self.assertIn('in_chroot_readable "$webkit_canary"', link_block)
+        self.assertIn("if in_chroot_readable", link_block)
+
+    def test_bind_fallback_exposes_macws_xpc_in_both_namespaces(self):
+        self.assertIn("install_macws_xpc_framework_links", BIND)
+        self.assertIn("usr.pre-macws-hostlink", BIND)
+        self.assertIn("/var/mnt/rootfs/usr/local/libexec/macws-xpc", BIND)
+        self.assertNotIn('mkdir -p "$target_dir/lib"', BIND)
+        self.assertNotIn("$target_dir/usr/lib", BIND)
 
     def test_filtered_restore_recreates_only_the_volatile_tmp_directory(self):
         self.assertIn("ROOTFS=/var/mnt/rootfs", AUTOSIGND)

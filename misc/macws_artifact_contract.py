@@ -36,6 +36,8 @@ PACKAGE_PATHS = (
     'var/jb/usr/macOS/bin/macws_metal_cache_migration.py',
     'var/jb/usr/macOS/bin/macws_refresh_managed_job.py',
     'var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh',
+    'var/jb/usr/macOS/bin/ensure_chroot_sandbox_paths.sh',
+    'var/jb/usr/macOS/bin/macws_dock_tiles.py',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.audiocomponentregistrar.plist',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.audio-output.plist',
@@ -61,6 +63,10 @@ SOURCE_PAYLOADS = {
         'layout/usr/macOS/bin/macws_refresh_managed_job.py',
     'var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh':
         'layout/usr/macOS/bin/ensure_settings_extensions_runtime.sh',
+    'var/jb/usr/macOS/bin/ensure_chroot_sandbox_paths.sh':
+        'layout/usr/macOS/bin/ensure_chroot_sandbox_paths.sh',
+    'var/jb/usr/macOS/bin/macws_dock_tiles.py':
+        'layout/usr/macOS/bin/macws_dock_tiles.py',
     'var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh':
         'layout/usr/macOS/bin/ensure_metal2metal_compat.sh',
     'var/jb/usr/macOS/bin/ensure_office_metal2metal.py':

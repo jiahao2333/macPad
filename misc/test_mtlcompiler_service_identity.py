@@ -39,6 +39,10 @@ class MTLCompilerServiceIdentity(unittest.TestCase):
             "iOS 16.5.1 (20F75)  UUID B5CBF457-B300-3FD0-A646-1261DA6E86B0",
             self.adapter,
         )
+        self.assertIn(
+            "iOS 16.5   (20F66)",
+            self.adapter,
+        )
 
     def test_unknown_service_builds_keep_stock_behavior(self):
         self.assertIn(

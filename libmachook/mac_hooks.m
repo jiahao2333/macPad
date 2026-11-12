@@ -11,6 +11,10 @@
 #import <dispatch/dispatch.h>
 #import <dlfcn.h>
 #import <xpc/xpc.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <signal.h>
+extern char **environ;
 #import <sys/sysctl.h>
 #import <sys/file.h>
 #import <malloc/malloc.h>
@@ -32,6 +36,8 @@
 #import <sys/un.h>
 #import <poll.h>
 #import <pwd.h>
+#include <dirent.h>
+#include <mach-o/dyld.h>
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 #import "macws_process_ancestry.h"
@@ -257,11 +263,25 @@ static BOOL macws_process_needs_settings_symbol_raster(void) {
     if (program && strcmp(program, "iconservicesagent") == 0) return YES;
     char executable[PATH_MAX] = {0};
     if (proc_pidpath(getpid(), executable, sizeof(executable)) <= 0) return NO;
-    return strcmp(executable,
-                  "/System/Applications/System Settings.app/Contents/MacOS/"
-                  "System Settings") == 0 ||
-           strcmp(executable,
-                  "/System/Library/CoreServices/iconservicesagent") == 0;
+    if (strcmp(executable,
+               "/System/Applications/System Settings.app/Contents/MacOS/"
+               "System Settings") == 0 ||
+        strcmp(executable,
+               "/System/Library/CoreServices/iconservicesagent") == 0)
+        return YES;
+    // Settings pane extensions draw their own row icons (General: About,
+    // Software Update, Storage, ...) through the same ISGraphicSymbol /
+    // CUI vector-glyph path as the Settings sidebar. Runtime on iPad14,5
+    // 2026-11-09: with only System Settings covered, every GeneralSettings
+    // row icon stayed an empty tile while the sidebar rendered. Cover every
+    // Settings ExtensionKit pane by location, not by bundle name, so a pane
+    // added in a later rootfs is included. proc_pidpath may report either
+    // the namespace path or the /private/var/mnt/rootfs-prefixed spelling.
+    BOOL appex = strstr(executable, ".appex/Contents/MacOS/") != NULL;
+    return appex &&
+        (strstr(executable, "/System/Library/ExtensionKit/Extensions/") ||
+         strstr(executable,
+                "/System/Applications/System Settings.app/Contents/PlugIns/"));
 }
 
 // Expensive observation must never ride along with the normal interactive
@@ -5569,9 +5589,653 @@ static void macws_configure_controlcenter_airplay_settings_route(void) {
     fflush(stderr);
 }
 
+
+// Ventura WebKit InitializeWebKit2 (WebKit2InitializeCocoa.mm:51):
+//   RELEASE_ASSERT_WITH_MESSAGE([NSThread isMainThread],
+//       "InitializeWebKit2 should be called on the main thread");
+// Stock WebContent/Networking are linked with a new-enough SDK that
+// InitializeWebKit2 calls runInitializationCode() immediately when
+// linkedOnOrAfterSDK(InitializeWebKit2MainThreadAssertion) is true,
+// instead of bouncing to the main queue. Apple's xpcproxy delivers the
+// first Application-type XPC event on the main NSRunLoop; our setuid
+// chroot proxy execve's the stock image after xpcproxy has already
+// treated the proxy as the service, so the inherited XPC event can
+// arrive on a libdispatch queue. Field crash 2026-11-10 15:35 CST:
+// WTFCrashWithInfo line 51, same BRK in WebContent and Networking
+// (PAC_EXCEPTION reports are the same BRK). The idle xpc_bundle_probe2
+// stays up because its empty message never enters InitializeWebKit2.
+// System-level: run InitializeWebKit2 on the main thread for every
+// libmachook process (same policy as WebKit's old-SDK fallback).
+static void (*orig_InitializeWebKit2)(void);
+static _Atomic bool g_macws_webkit_init_hooked = false;
+
+
+static void macws_install_cacontext_paint_hooks(void);
+
+static void macws_paint_log(const char *msg) {
+    int fd = open("/tmp/macws-webkit-paint.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char line[512];
+    const char *exe = "?";
+    char **argv = *_NSGetArgv();
+    if (argv && argv[0] && argv[0][0])
+        exe = argv[0];
+    int n = snprintf(line, sizeof(line), "pid=%d exe=%s %s\n",
+                     getpid(), exe, msg ? msg : "?");
+    if (n > 0) (void)write(fd, line, (size_t)n);
+    close(fd);
+}
+
+static void macws_webkit_init_log(const char *msg) {
+    int fd = open("/tmp/macws-webkit-init.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char line[768];
+    const char *exe = "?";
+    char **argv = *_NSGetArgv();
+    if (argv && argv[0] && argv[0][0])
+        exe = argv[0];
+    int n = snprintf(line, sizeof(line), "pid=%d exe=%s %s pthread_main=%d\n",
+                     getpid(), exe, msg ? msg : "?", pthread_main_np());
+    if (n > 0) (void)write(fd, line, (size_t)n);
+    close(fd);
+}
+
+// The net7 crash is in the stock WebContent/Networking XPCs. Hooking
+// InitializeWebKit2 inside Safari.app or the control probe is unnecessary
+// and, after the UUID-offset hook was first deployed, coincided with
+// launch-path failing to publish an AppKit window (16:13 CST).
+static bool macws_is_webkit_helper_process(void) {
+    char **argv = *_NSGetArgv();
+    const char *p = (argv && argv[0]) ? argv[0] : "";
+    if (strstr(p, "com.apple.WebKit.WebContent") ||
+        strstr(p, "com.apple.WebKit.Networking") ||
+        strstr(p, "com.apple.WebKit.GPU") ||
+        strstr(p, "com.apple.Safari.SandboxBroker"))
+        return true;
+    char path[1024];
+    uint32_t sz = sizeof(path);
+    if (_NSGetExecutablePath(path, &sz) == 0) {
+        if (strstr(path, "com.apple.WebKit.WebContent") ||
+            strstr(path, "com.apple.WebKit.Networking") ||
+            strstr(path, "com.apple.WebKit.GPU") ||
+            strstr(path, "com.apple.Safari.SandboxBroker"))
+            return true;
+    }
+    return false;
+}
+
+static bool macws_exe_contains(const char *needle) {
+    if (!needle || !needle[0])
+        return false;
+    char **argv = *_NSGetArgv();
+    const char *p = (argv && argv[0]) ? argv[0] : "";
+    if (p[0] && strstr(p, needle))
+        return true;
+    char path[1024];
+    uint32_t sz = sizeof(path);
+    if (_NSGetExecutablePath(path, &sz) == 0 && strstr(path, needle))
+        return true;
+    return false;
+}
+
+// Narrower than macws_is_webkit_helper_process: only the WebContent XPC.
+static bool macws_is_webcontent_process(void) {
+    return macws_exe_contains("com.apple.WebKit.WebContent");
+}
+
+static bool macws_is_safari_process(void) {
+    // Safari.app itself, not SafariSandboxBroker / Safari services.
+    return macws_exe_contains("/Safari.app/Contents/MacOS/Safari");
+}
+
+static void hooked_InitializeWebKit2(void) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "InitializeWebKit2 call orig=%p",
+             (void *)(uintptr_t)orig_InitializeWebKit2);
+    macws_webkit_init_log(msg);
+    if (pthread_main_np()) {
+        orig_InitializeWebKit2();
+        macws_webkit_init_log("InitializeWebKit2 orig returned");
+        return;
+    }
+    macws_webkit_init_log("InitializeWebKit2 off main; dispatch_sync");
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        orig_InitializeWebKit2();
+        macws_webkit_init_log("InitializeWebKit2 orig returned on main");
+    });
+}
+
+// The RELEASE_ASSERT lives in runInitializationCode, called via
+// std::call_once from InitializeWebKit2. Hook it too in case the
+// InitializeWebKit2 site is a thunk, PACIA auth, or is inlined at a
+// different address than the crash-derived function start.
+static void (*orig_runInitializationCode)(void *);
+static void hooked_runInitializationCode(void *context) {
+    char msg[192];
+    snprintf(msg, sizeof(msg), "runInitializationCode call orig=%p ctx=%p",
+             (void *)(uintptr_t)orig_runInitializationCode, context);
+    macws_webkit_init_log(msg);
+    if (pthread_main_np()) {
+        orig_runInitializationCode(context);
+        macws_webkit_init_log("runInitializationCode orig returned");
+        return;
+    }
+    macws_webkit_init_log("runInitializationCode off main; dispatch_sync");
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        orig_runInitializationCode(context);
+        macws_webkit_init_log("runInitializationCode orig returned on main");
+    });
+}
+
+// Ventura 13.4 (22F66) WebKit-7615.1.26.11.5, crash 2026-11-10 15:35 CST.
+// InitializeWebKit2 is not in the shared-cache export trie (MSFindSymbol and
+// dlsym both miss), but IPS imageOffset 126680 symbolLocation 84 pins the
+// start at +126596 in UUID 72317905-49DA-3A07-A8C1-D93B91F653CB.
+enum {
+    kMacWSInitializeWebKit2Offset = 126596,
+    kMacWSRunInitializationCodeOffset = 2342696,
+    kMacWSWebContentServiceInitializerOffset = 125656,
+    kMacWSWebContentServiceInitializerCall = 125852,
+};
+static const uint8_t kMacWSWebKitUUID[16] = {
+    0x72, 0x31, 0x79, 0x05, 0x49, 0xda, 0x3a, 0x07,
+    0xa8, 0xc1, 0xd9, 0x3b, 0x91, 0xf6, 0x53, 0xcb,
+};
+
+static bool macws_header_uuid_equals(const struct mach_header *header,
+                                     const uint8_t expected[16]) {
+    if (!header || (header->magic != MH_MAGIC_64 && header->magic != MH_CIGAM_64))
+        return false;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)header;
+    const uint8_t *p = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmdsize < sizeof(*lc))
+            return false;
+        if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+            const struct uuid_command *u = (const struct uuid_command *)lc;
+            return memcmp(u->uuid, expected, 16) == 0;
+        }
+        p += lc->cmdsize;
+    }
+    return false;
+}
+
+// Shared-cache offset hooks elsewhere in this file (QuartzCore
+// enable_frame_info_tag_list, OSXvnc rfbGetFB) pass an unsigned
+// header+offset to MSHookFunction. A ptrauth-signed pointer can make
+// Ellekit/Substrate hook the wrong address (PAC bits in the VA) so the
+// real InitializeWebKit2 keeps running unhooked — which matches net8d:
+// install logged, but hooked_InitializeWebKit2 never ran.
+static void *macws_resolve_webkit_text_offset(const struct mach_header *header,
+                                              uint32_t offset,
+                                              const char *label) {
+    if (!header || !macws_header_uuid_equals(header, kMacWSWebKitUUID))
+        return NULL;
+    const uint32_t *words =
+        (const uint32_t *)((const uint8_t *)header + offset);
+    if (words[0] != 0xd503237f) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "%s prologue mismatch 0x%08x", label ? label : "?", words[0]);
+        macws_webkit_init_log(msg);
+        return NULL;
+    }
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "%s raw=%p words=%08x %08x %08x %08x",
+             label ? label : "?", (const void *)words,
+             words[0], words[1], words[2], words[3]);
+    macws_webkit_init_log(msg);
+    return (void *)(uintptr_t)words;
+}
+
+static void macws_log_webkit_service_initializer_callsite(
+        const struct mach_header *header) {
+    if (!header || !macws_header_uuid_equals(header, kMacWSWebKitUUID))
+        return;
+    const uint8_t *base = (const uint8_t *)header;
+    const uint32_t *w =
+        (const uint32_t *)(base + kMacWSWebContentServiceInitializerCall);
+    uint32_t insn = w[0];
+    char msg[220];
+    if ((insn & 0xFC000000u) == 0x94000000u) {
+        int32_t imm26 = (int32_t)(insn & 0x03FFFFFFu);
+        if (imm26 & 0x02000000)
+            imm26 |= ~0x03FFFFFF;
+        const uint8_t *target = (const uint8_t *)w + ((intptr_t)imm26 << 2);
+        snprintf(msg, sizeof(msg),
+                 "WebContentServiceInitializer+196 BL %p init2=%p runInit=%p %s",
+                 (const void *)target,
+                 (const void *)(base + kMacWSInitializeWebKit2Offset),
+                 (const void *)(base + kMacWSRunInitializationCodeOffset),
+                 target == base + kMacWSInitializeWebKit2Offset ? "MATCH" : "MISMATCH");
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "WebContentServiceInitializer+196 insn=0x%08x 0x%08x 0x%08x 0x%08x",
+                 w[0], w[1], w[2], w[3]);
+    }
+    macws_webkit_init_log(msg);
+}
+
+static bool macws_is_overlay_xpc_helper(void);
+
+static void macws_install_webkit_init_mainthread(const struct mach_header *header) {
+    if (!macws_is_webkit_helper_process())
+        return;
+    // §61: overlay helpers run the stock xpcproxy contract, so the
+    // bootstrap already reaches InitializeWebKit2 on the real main thread.
+    // The offset hook here never got a trampoline (orig=0x0) but still
+    // rewrote the shared-cache text page that also holds
+    // NetworkServiceInitializer / WebContentServiceInitializer: the first
+    // call into that page faulted (BUS_ADRALN at
+    // NetworkServiceInitializer+0, every Networking in net39f).
+    if (macws_is_overlay_xpc_helper()) {
+        if (!atomic_exchange_explicit(&g_macws_webkit_init_hooked, true,
+                                      memory_order_acq_rel))
+            macws_webkit_init_log(
+                "overlay helper: skip InitializeWebKit2/runInitializationCode "
+                "offset hooks");
+        return;
+    }
+    if (atomic_exchange_explicit(&g_macws_webkit_init_hooked, true,
+                                 memory_order_acq_rel))
+        return;
+    macws_log_webkit_service_initializer_callsite(header);
+    void *sym = NULL;
+    if (header) {
+        sym = MSFindSymbol((MSImageRef)header,
+                           "__ZN6WebKit16InitializeWebKit2Ev");
+        if (!sym)
+            sym = MSFindSymbol((MSImageRef)header,
+                               "_ZN6WebKit16InitializeWebKit2Ev");
+    }
+    if (!sym)
+        sym = dlsym(RTLD_DEFAULT, "_ZN6WebKit16InitializeWebKit2Ev");
+    if (!sym)
+        sym = dlsym(RTLD_DEFAULT, "__ZN6WebKit16InitializeWebKit2Ev");
+    const char *how = "symbol";
+    if (!sym && header) {
+        sym = macws_resolve_webkit_text_offset(
+            header, kMacWSInitializeWebKit2Offset, "InitializeWebKit2");
+        how = "offset-unsigned";
+    }
+    if (!sym) {
+        atomic_store_explicit(&g_macws_webkit_init_hooked, false,
+                              memory_order_release);
+        return;
+    }
+    MSHookFunction(sym, (void *)hooked_InitializeWebKit2,
+                   (void **)&orig_InitializeWebKit2);
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "hooked InitializeWebKit2 via %s sym=%p orig=%p",
+             how, sym, (void *)(uintptr_t)orig_InitializeWebKit2);
+    macws_webkit_init_log(msg);
+
+    void *run = macws_resolve_webkit_text_offset(
+        header, kMacWSRunInitializationCodeOffset, "runInitializationCode");
+    if (run) {
+        MSHookFunction(run, (void *)hooked_runInitializationCode,
+                       (void **)&orig_runInitializationCode);
+        snprintf(msg, sizeof(msg),
+                 "hooked runInitializationCode raw=%p orig=%p",
+                 run, (void *)(uintptr_t)orig_runInitializationCode);
+        macws_webkit_init_log(msg);
+    } else {
+        macws_webkit_init_log("runInitializationCode hook skipped");
+    }
+}
+
+__attribute__((constructor))
+static void macws_ctor_webkit_init_mainthread(void) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        if (atomic_load_explicit(&g_macws_webkit_init_hooked, memory_order_acquire))
+            break;
+        macws_install_webkit_init_mainthread(_dyld_get_image_header(i));
+    }
+    // Many libmachook processes never load WebKit; stay quiet unless a later
+    // add-image callback finds the UUID-matched image and still cannot hook.
+    macws_install_cacontext_paint_hooks();
+}
+
+
+// WebKit in-process compositing hosts remote layers through CAContext /
+// CALayerHost over CARenderServer. Log the boundary so a blank content area can be distinguished from a missing GPU process.
+// Ventura WebKit-7615 TiledCoreAnimationDrawingArea::updateLayerHostingContext
+// uses LayerHostingContext::createForPort(compositingRenderServerPort), which
+// is [CAContext remoteContextWithOptions:@{ kCAContextPortNumber: port }].
+// The port is passed from Safari as [CARemoteLayerServer sharedServer].serverPort,
+// not looked up by WebContent itself.
+
+static mach_port_t macws_lookup_macosbooter_carender(void) {
+    // Call the original bootstrap_look_up (interpose does not recurse from
+    // this replacement TU) with the already-rewritten host name. Do not
+    // export a remapper symbol.
+    extern kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
+    mach_port_t bp = MACH_PORT_NULL;
+    mach_port_t sp = MACH_PORT_NULL;
+    // task_get_bootstrap_port is a macro around task_get_special_port.
+    if (task_get_bootstrap_port(mach_task_self(), &bp) != KERN_SUCCESS || !bp)
+        return MACH_PORT_NULL;
+    kern_return_t kr = bootstrap_look_up(
+        bp, "com.apple.macosbooter.CARenderServer", &sp);
+    if (kr != KERN_SUCCESS)
+        return MACH_PORT_NULL;
+    return sp;
+}
+
+static unsigned macws_opts_port_number(id opts) {
+    if (!opts)
+        return 0;
+    id portObj = ((id (*)(id, SEL, id))objc_msgSend)(
+        opts, sel_registerName("objectForKey:"), @"portNumber");
+    if (!portObj)
+        return 0;
+    return ((unsigned (*)(id, SEL))objc_msgSend)(
+        portObj, sel_registerName("unsignedIntValue"));
+}
+
+static id (*orig_CAContext_remoteContextWithOptions)(id, SEL, id);
+static id hooked_CAContext_remoteContextWithOptions(id self, SEL sel, id opts) {
+    unsigned portIn = macws_opts_port_number(opts);
+    unsigned nkeys = 0;
+    if (opts) {
+        id keys = ((id (*)(id, SEL))objc_msgSend)(
+            opts, sel_registerName("allKeys"));
+        if (keys)
+            nkeys = ((unsigned (*)(id, SEL))objc_msgSend)(
+                keys, sel_registerName("count"));
+    }
+    id ctx = orig_CAContext_remoteContextWithOptions
+        ? orig_CAContext_remoteContextWithOptions(self, sel, opts) : nil;
+    unsigned cid = 0;
+    if (ctx) {
+        cid = ((unsigned (*)(id, SEL))objc_msgSend)(
+            ctx, sel_registerName("contextId"));
+    }
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "CAContext remoteContextWithOptions -> %p contextId=%u "
+             "portNumber=%u keys=%u",
+             ctx, cid, portIn, nkeys);
+    macws_paint_log(msg);
+
+    // WebContent-only observation of a null/dropped compositing port from
+    // the UI process. Do not alter Safari's remoteContextWithOptions path,
+    // and do not retry here until logs show a generic fix is warranted.
+    if (macws_is_webcontent_process() &&
+        (portIn == 0 || !ctx || cid == 0)) {
+        mach_port_t recovered = macws_lookup_macosbooter_carender();
+        snprintf(msg, sizeof(msg),
+                 "CAContext remoteContext dropped portNumber=%u ctx=%p "
+                 "contextId=%u lookup=%#x",
+                 portIn, ctx, cid, recovered);
+        macws_paint_log(msg);
+    }
+    return ctx;
+}
+
+static id (*orig_CAContext_contextWithCGSConnection)(id, SEL, uint32_t, id);
+static id hooked_CAContext_contextWithCGSConnection(id self, SEL sel,
+                                                    uint32_t conn, id opts) {
+    id ctx = orig_CAContext_contextWithCGSConnection
+        ? orig_CAContext_contextWithCGSConnection(self, sel, conn, opts) : nil;
+    unsigned cid = 0;
+    if (ctx) {
+        cid = ((unsigned (*)(id, SEL))objc_msgSend)(
+            ctx, sel_registerName("contextId"));
+    }
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "CAContext contextWithCGSConnection:%u -> %p contextId=%u",
+             conn, ctx, cid);
+    macws_paint_log(msg);
+    return ctx;
+}
+
+static void (*orig_CALayerHost_setContextId)(id, SEL, unsigned);
+static void hooked_CALayerHost_setContextId(id self, SEL sel, unsigned cid) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "CALayerHost setContextId:%u host=%p",
+             cid, self);
+    macws_paint_log(msg);
+    if (orig_CALayerHost_setContextId)
+        orig_CALayerHost_setContextId(self, sel, cid);
+}
+
+static void (*orig_CAContext_setAllowsCGSConnections)(id, SEL, BOOL);
+static void hooked_CAContext_setAllowsCGSConnections(id self, SEL sel, BOOL allow) {
+    if (macws_is_webcontent_process()) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "CAContext setAllowsCGSConnections:%d",
+                 (int)allow);
+        macws_paint_log(msg);
+    }
+    if (orig_CAContext_setAllowsCGSConnections)
+        orig_CAContext_setAllowsCGSConnections(self, sel, allow);
+}
+
+static void (*orig_CALayer_setGeometryFlipped)(id, SEL, BOOL);
+static void hooked_CALayer_setGeometryFlipped(id self, SEL sel, BOOL flipped) {
+    // TiledCoreAnimationDrawingArea constructor sets geometryFlipped:YES on
+    // its hosting layer before createForPort. A breadcrumb that the drawing
+    // area constructor ran, since shared-cache C++ hooks do not intercept.
+    if (macws_is_webcontent_process()) {
+        static _Atomic unsigned n;
+        unsigned i = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+        if (i < 16) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "CALayer setGeometryFlipped:%d layer=%p n=%u "
+                     "(drawing-area ctor breadcrumb)",
+                     (int)flipped, self, i);
+            macws_paint_log(msg);
+        }
+    }
+    if (orig_CALayer_setGeometryFlipped)
+        orig_CALayer_setGeometryFlipped(self, sel, flipped);
+}
+
+static id (*orig_CARemoteLayerServer_sharedServer)(id, SEL);
+static id hooked_CARemoteLayerServer_sharedServer(id self, SEL sel) {
+    id server = orig_CARemoteLayerServer_sharedServer
+        ? orig_CARemoteLayerServer_sharedServer(self, sel) : nil;
+    if (macws_is_safari_process() || macws_is_webcontent_process()) {
+        unsigned port = 0;
+        if (server) {
+            port = ((unsigned (*)(id, SEL))objc_msgSend)(
+                server, sel_registerName("serverPort"));
+        }
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "CARemoteLayerServer sharedServer -> %p serverPort=%u",
+                 server, port);
+        macws_paint_log(msg);
+    }
+    return server;
+}
+
+static unsigned (*orig_CARemoteLayerServer_serverPort)(id, SEL);
+static unsigned hooked_CARemoteLayerServer_serverPort(id self, SEL sel) {
+    unsigned port = orig_CARemoteLayerServer_serverPort
+        ? orig_CARemoteLayerServer_serverPort(self, sel) : 0;
+    mach_port_t recovered = MACH_PORT_NULL;
+    if (port == 0 &&
+        (macws_is_safari_process() || macws_is_webcontent_process())) {
+        recovered = macws_lookup_macosbooter_carender();
+        if (recovered)
+            port = (unsigned)recovered;
+    }
+    if (macws_is_safari_process() || macws_is_webcontent_process()) {
+        static _Atomic unsigned n;
+        unsigned i = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+        if (i < 16) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "CARemoteLayerServer serverPort -> %u recovered=%#x n=%u",
+                     port, recovered, i);
+            macws_paint_log(msg);
+        }
+    }
+    return port;
+}
+
+// Do not MSHookFunction SkyLight CGS*/SLS* symbols. Hooking
+// CGSMainConnectionID from libmachook caused SIGBUS (signal 10):
+// globally in every process (net11) and in Safari before it could
+// publish an AppKit window (net11b). Call through dlsym instead.
+static uint32_t macws_dlsym_cgs_main(void) {
+    static uint32_t (*fn)(void);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "CGSMainConnectionID");
+    });
+    return fn ? fn() : 0;
+}
+
+static uint32_t macws_dlsym_sls_main(void) {
+    static uint32_t (*fn)(void);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "SLSMainConnectionID");
+    });
+    return fn ? fn() : 0;
+}
+
+static void macws_webcontent_paint_heartbeat(const char *tag) {
+    uint32_t cgs = macws_dlsym_cgs_main();
+    uint32_t sls = macws_dlsym_sls_main();
+    unsigned car = 0;
+    unsigned nctx = 0;
+    Class rls = objc_getClass("CARemoteLayerServer");
+    if (rls) {
+        id server = ((id (*)(id, SEL))objc_msgSend)(
+            rls, sel_registerName("sharedServer"));
+        if (server)
+            car = ((unsigned (*)(id, SEL))objc_msgSend)(
+                server, sel_registerName("serverPort"));
+    }
+    Class ctxcls = objc_getClass("CAContext");
+    if (ctxcls) {
+        id all = ((id (*)(id, SEL))objc_msgSend)(
+            ctxcls, sel_registerName("allContexts"));
+        if (all)
+            nctx = ((unsigned (*)(id, SEL))objc_msgSend)(
+                all, sel_registerName("count"));
+    }
+    void *deny_sym = dlsym(RTLD_DEFAULT, "CGSSetDenyWindowServerConnections");
+    char msg[240];
+    snprintf(msg, sizeof(msg),
+             "heartbeat %s CGSMain=%u SLSMain=%u CARemotePort=%u allContexts=%u "
+             "CGSSetDeny_sym=%p",
+             tag ? tag : "?", cgs, sls, car, nctx, deny_sym);
+    macws_paint_log(msg);
+}
+
+static void macws_install_cacontext_paint_hooks(void) {
+    static _Atomic bool installed = false;
+    if (atomic_exchange_explicit(&installed, true, memory_order_acq_rel))
+        return;
+    Class ctx = objc_getClass("CAContext");
+    Class host = objc_getClass("CALayerHost");
+    Class layer = objc_getClass("CALayer");
+    Class rls = objc_getClass("CARemoteLayerServer");
+    if (ctx) {
+        Method m = class_getClassMethod(ctx, @selector(remoteContextWithOptions:));
+        if (m) {
+            orig_CAContext_remoteContextWithOptions =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CAContext_remoteContextWithOptions);
+        }
+        m = class_getClassMethod(ctx, @selector(contextWithCGSConnection:options:));
+        if (m) {
+            orig_CAContext_contextWithCGSConnection =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CAContext_contextWithCGSConnection);
+        }
+    }
+    if (host) {
+        Method m = class_getInstanceMethod(host, @selector(setContextId:));
+        if (m) {
+            orig_CALayerHost_setContextId = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_CALayerHost_setContextId);
+        }
+    }
+    // New ObjC hooks stay WebContent-only. Hooking CGSMainConnectionID
+    // (and installing CARemoteLayerServer IMPs in Safari) caused SIGBUS
+    // before Safari published an AppKit window (net11b). Observe Safari
+    // serverPort without replacing methods.
+    // New ObjC hooks stay WebContent-only. Do not install extra CAContext
+    // IMPs in Safari, and do not hook SkyLight CGS*/SLS*.
+    bool wc = macws_is_webcontent_process();
+    if (wc && ctx) {
+        Method m = class_getClassMethod(ctx, @selector(setAllowsCGSConnections:));
+        if (m) {
+            orig_CAContext_setAllowsCGSConnections =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CAContext_setAllowsCGSConnections);
+        }
+    }
+    if (wc && layer) {
+        Method m = class_getInstanceMethod(layer, @selector(setGeometryFlipped:));
+        if (m) {
+            orig_CALayer_setGeometryFlipped = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_CALayer_setGeometryFlipped);
+        }
+    }
+    if (wc && rls) {
+        Method m = class_getClassMethod(rls, @selector(sharedServer));
+        if (m) {
+            orig_CARemoteLayerServer_sharedServer =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CARemoteLayerServer_sharedServer);
+        }
+        m = class_getInstanceMethod(rls, @selector(serverPort));
+        if (m) {
+            orig_CARemoteLayerServer_serverPort =
+                (void *)method_getImplementation(m);
+            method_setImplementation(m,
+                (IMP)hooked_CARemoteLayerServer_serverPort);
+        }
+    }
+
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "CAContext hooks ctx=%p host=%p layer=%p rls=%p wc=%d safari=%d",
+             ctx, host, layer, rls,
+             wc ? 1 : 0, macws_is_safari_process() ? 1 : 0);
+    macws_paint_log(msg);
+
+    // Do not dispatch_after onto the main queue from this constructor.
+    // net11c did that in Safari; the process stayed up but never published
+    // an AppKit window, and the delayed block never ran (main queue idle).
+    // Do not log Safari serverPort from remoteContextWithOptions either.
+
+    if (macws_is_webcontent_process()) {
+        macws_paint_log("WebContent paint hooks installed; no ctor dispatch_after");
+        // Heartbeats run from the first XPC event instead of dispatch_after
+        // on the main queue during the constructor (see net11c Safari hang).
+    }
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info = {};
     (void)dladdr(header, &info);
+    // WebKit may live in the dyld shared cache, where dladdr() reports the
+    // cache path rather than .../WebKit.framework/Versions/A/WebKit. Probe
+    // each image for the InitializeWebKit2 symbol until hooked.
+    if (!atomic_load_explicit(&g_macws_webkit_init_hooked, memory_order_acquire))
+        macws_install_webkit_init_mainthread(header);
+    if (info.dli_fname && strstr(info.dli_fname, "QuartzCore") != NULL)
+        macws_install_cacontext_paint_hooks();
     if (info.dli_fname &&
         strstr(info.dli_fname, "/AirPlaySupport.framework/") != NULL) {
         macws_configure_controlcenter_airplay_settings_route();
@@ -7462,6 +8126,200 @@ static void macws_crash_diag_handler(int signo, siginfo_t *info, void *uctx_) {
     if (len > MACWS_CRASH_BUF_LEN) len = MACWS_CRASH_BUF_LEN;
     (void)write(STDERR_FILENO, macws_crash_buf, len);
     _exit(128 + signo);
+}
+
+// §61 overlay-helper diagnostics. launchd discards stderr of the stock
+// macOS WebKit helpers started through MacWSXPCProxy, and WebKit's own
+// reasons (RELEASE_LOG / RELEASE_LOG_FAULT) only go to os_log. For
+// overlay helpers (XPC_SERVICE_NAME com.macwsguide.xpc.*) send fd 1/2 to
+// /tmp/macws-xpchelper/<leaf>.<pid>.log, install the crash handler, and
+// mirror os_log calls (format + scalar/string args, no ObjC description)
+// to that file. Safari mirrors only WebKit-family dsos into
+// /tmp/macws-xpchelper/Safari.<pid>.log. No exports; internal only.
+static int g_macws_wklog_fd = -1;
+static int g_macws_wklog_safari = 0;
+static _Atomic unsigned g_macws_wklog_lines;
+static __thread int g_macws_wklog_busy;
+
+static int macws_wklog_dso_wanted(void *dso) {
+    if (!g_macws_wklog_safari) return 1;
+    Dl_info di;
+    if (!dso || !dladdr(dso, &di) || !di.dli_fname) return 0;
+    const char *f = di.dli_fname;
+    return strstr(f, "/WebKit.framework/") || strstr(f, "/WebCore.framework/") ||
+           strstr(f, "/WebKitLegacy.framework/") || strstr(f, "/JavaScriptCore.framework/");
+}
+
+static void macws_wklog_emit(void *dso, unsigned type, const char *fmt,
+                             const uint8_t *buf, uint32_t size) {
+    if (g_macws_wklog_fd < 0 || g_macws_wklog_busy) return;
+    if (atomic_fetch_add_explicit(&g_macws_wklog_lines, 1,
+                                  memory_order_relaxed) > 20000) return;
+    g_macws_wklog_busy = 1;
+    if (!macws_wklog_dso_wanted(dso)) { g_macws_wklog_busy = 0; return; }
+    char out[1600];
+    size_t o = 0;
+#define WKPUT(...) do { if (o < sizeof(out) - 1) { int k_ = snprintf(out + o, sizeof(out) - o, __VA_ARGS__); \
+        if (k_ > 0) { o += (size_t)k_; if (o > sizeof(out) - 2) o = sizeof(out) - 2; } } } while (0)
+    struct timeval tv; gettimeofday(&tv, NULL);
+    WKPUT("%ld.%03d oslog t=0x%x main=%d tid=%llu ", (long)tv.tv_sec,
+          (int)(tv.tv_usec / 1000), type, pthread_main_np(),
+          (unsigned long long)pthread_mach_thread_np(pthread_self()));
+    WKPUT("%.700s", fmt ? fmt : "(null)");
+    if (buf && size >= 2) {
+        uint32_t i = 2;
+        unsigned n = buf[1];
+        WKPUT(" |");
+        for (unsigned a = 0; a < n && i + 2 <= size; a++) {
+            uint8_t d = buf[i], len = buf[i + 1];
+            i += 2;
+            if (i + len > size) break;
+            unsigned t = d >> 4;
+            if (t == 0 && len <= 8) {
+                uint64_t v = 0;
+                memcpy(&v, buf + i, len);
+                int64_t sv = len == 1 ? (int8_t)v : len == 2 ? (int16_t)v :
+                             len == 4 ? (int32_t)v : (int64_t)v;
+                WKPUT(" %lld", (long long)sv);
+            } else if (t == 2 && len == 8) {
+                const char *str = NULL;
+                memcpy(&str, buf + i, 8);
+                WKPUT(" \"%.240s\"", str ? str : "(null)");
+            } else {
+                WKPUT(" <t%u/%u>", t, (unsigned)len);
+            }
+            i += len;
+        }
+    }
+    WKPUT("\n");
+#undef WKPUT
+    (void)write(g_macws_wklog_fd, out, o);
+    g_macws_wklog_busy = 0;
+}
+
+typedef void (*macws_oslog_fn)(void *, void *, unsigned, const char *,
+                               uint8_t *, uint32_t);
+#define MACWS_OSLOG_HOOK(NAME) \
+    static macws_oslog_fn orig_##NAME; \
+    static void hooked_##NAME(void *dso, void *log, unsigned type, \
+                              const char *fmt, uint8_t *buf, uint32_t size) { \
+        macws_wklog_emit(dso, type, fmt, buf, size); \
+        orig_##NAME(dso, log, type, fmt, buf, size); \
+    }
+MACWS_OSLOG_HOOK(_os_log_impl)
+MACWS_OSLOG_HOOK(_os_log_error_impl)
+MACWS_OSLOG_HOOK(_os_log_fault_impl)
+MACWS_OSLOG_HOOK(_os_log_debug_impl)
+
+// §61 macOS sandbox profiles cannot be applied by the iOS kernel
+// (`Could not apply cached/compiled sandbox: Operation not supported`), and
+// WebKit's AuxiliaryProcess::initializeSandbox then CRASH()es every
+// Networking/WebContent; after that it also needs macOS quarantine
+// (enableSandboxStyleFileQuarantine -> -2 -> exit(EX_NOPERM)).
+// sandbox_init / sandbox_init_with_parameters are already the chroot's
+// no-op compatibility boundary (sandbox_init_new). Apply the same boundary
+// one level up for overlay WebKit helpers only: AuxiliaryProcess::
+// initializeSandbox returns without applying a profile. (An inline hook on
+// libsandbox's sandbox_apply was tried first and is unsafe: the entry is
+// shorter than the 16-byte patch and clobbered the neighbouring function,
+// random-pc crashes at initializeSandbox+0x9c0 in net39h.)
+static void hooked_macws_wk_initialize_sandbox(void *self, const void *params,
+                                               void *sandboxParams) {
+    (void)self; (void)params; (void)sandboxParams;
+    static _Atomic unsigned logged;
+    if (atomic_fetch_add_explicit(&logged, 1, memory_order_relaxed) < 2) {
+        macws_webkit_init_log("SANDBOX-COMPAT AuxiliaryProcess::initializeSandbox "
+                              "-> skipped (macOS sandbox/quarantine unavailable "
+                              "on iOS host)");
+        fprintf(stderr, "#### SANDBOX-COMPAT AuxiliaryProcess::initializeSandbox skipped\n");
+    }
+}
+
+static void macws_install_overlay_helper_sandbox_compat(void) {
+    static const char *names[] = {
+        "_ZN6WebKit16AuxiliaryProcess17initializeSandboxERKNS_40AuxiliaryProcessInitializationParametersERNS_31SandboxInitializationParametersE",
+        "__ZN6WebKit16AuxiliaryProcess17initializeSandboxERKNS_40AuxiliaryProcessInitializationParametersERNS_31SandboxInitializationParametersE",
+    };
+    void *sym = NULL;
+    for (size_t i = 0; i < 2 && !sym; i++)
+        sym = dlsym(RTLD_DEFAULT, names[i]);
+    if (!sym) {
+        for (uint32_t i = 0, n = _dyld_image_count(); i < n && !sym; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (!nm || !strstr(nm, "/WebKit.framework/")) continue;
+            MSImageRef img = MSGetImageByName(nm);
+            if (img) sym = MSFindSymbol(img, names[1]);
+        }
+    }
+    void *unused = NULL;
+    if (sym)
+        MSHookFunction(sym, (void *)hooked_macws_wk_initialize_sandbox, &unused);
+    char m[200];
+    snprintf(m, sizeof(m),
+             "overlay helper initializeSandbox hook sym=%p tramp=%p", sym, unused);
+    macws_webkit_init_log(m);
+}
+
+static void macws_crash_diag_install_signals(void);
+
+static void macws_install_overlay_helper_diag(void) {
+    const char *svc = getenv("XPC_SERVICE_NAME");
+    const char *prog = getprogname();
+    int helper = svc && !strncmp(svc, "com.macwsguide.xpc.", 19) &&
+                 macws_is_webkit_helper_process();
+    int safari = prog && !strcmp(prog, "Safari");
+    if (!helper && !safari) return;
+    if (helper) macws_install_overlay_helper_sandbox_compat();
+    if (access("/usr/local/etc/macws-xpchelper-diag.disable", F_OK) == 0) return;
+    mkdir("/tmp/macws-xpchelper", 0755);
+    char path[256];
+    const char *leaf = helper ? svc + 19 : "Safari";
+    const char *dot = strrchr(leaf, '.');
+    if (helper && dot && dot[1]) leaf = dot + 1;
+    snprintf(path, sizeof(path), "/tmp/macws-xpchelper/%s.%d.log", leaf, getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    if (helper) {
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        g_macws_wklog_fd = STDERR_FILENO;
+        close(fd);
+        macws_crash_diag_install_signals();
+    } else {
+        g_macws_wklog_fd = fd;
+        g_macws_wklog_safari = 1;
+    }
+    char hdr[400];
+    int n = snprintf(hdr, sizeof(hdr),
+                     "#### macws diag pid=%d ppid=%d prog=%s svc=%s helper=%d\n",
+                     getpid(), getppid(), prog ? prog : "?", svc ? svc : "-", helper);
+    if (n > 0) (void)write(g_macws_wklog_fd, hdr, (size_t)n);
+    struct { const char *sym; void *rep; void **orig; } hooks[] = {
+        { "_os_log_impl", (void *)hooked__os_log_impl, (void **)&orig__os_log_impl },
+        { "_os_log_error_impl", (void *)hooked__os_log_error_impl, (void **)&orig__os_log_error_impl },
+        { "_os_log_fault_impl", (void *)hooked__os_log_fault_impl, (void **)&orig__os_log_fault_impl },
+        { "_os_log_debug_impl", (void *)hooked__os_log_debug_impl, (void **)&orig__os_log_debug_impl },
+    };
+    for (size_t k = 0; k < sizeof(hooks) / sizeof(hooks[0]); k++) {
+        void *sym = dlsym(RTLD_DEFAULT, hooks[k].sym);
+        if (sym) MSHookFunction(sym, hooks[k].rep, hooks[k].orig);
+        n = snprintf(hdr, sizeof(hdr), "#### oslog hook %s=%p orig=%p\n",
+                     hooks[k].sym, sym, *hooks[k].orig);
+        if (n > 0) (void)write(g_macws_wklog_fd, hdr, (size_t)n);
+    }
+}
+
+static void macws_crash_diag_install_signals(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = macws_crash_diag_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
 }
 
 static void macws_install_crash_diag(void) {
@@ -11261,6 +12119,7 @@ __attribute__((constructor)) void InitStuff() {
     // and executable replacement-code admission are established.
     MacWSInstallExtensionRuntimeCompatibility();
     macws_install_crash_diag();
+    macws_install_overlay_helper_diag();
     macws_install_osxvnc_hooks();
     // HID bypass is OPT-IN. Whole-IOKit-symbol hooking creates a tower of
     // MSHook'd functions; if any one of them is itself called recursively
@@ -14073,6 +14932,123 @@ DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
 DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
+
+// System-level Gigacage policy for macPad chroot on iPadOS.
+// Field-measured on iPad14,5 (iPadOS 16.5 / macOS 13.4 chroot):
+//   best mach_vm_map reservation ≈ 31 GiB at 32 GiB alignment, ≈ 53 GiB at 1 GiB
+//   alignment. Ventura JavaScriptCore requests totalSize=80 GiB with
+//   maxAlignment=32 GiB → KERN_NO_SPACE, then FATAL abort in Gigacage::ensureGigacage.
+// Full-size Gigacage reservation is therefore platform-infeasible here (not a
+// per-app bug). Default GIGACAGE_ENABLED to "0" for every libmachook process so
+// newly installed JSC/WebKit clients keep running without per-app env. Explicit
+// GIGACAGE_ENABLED=1 still wins (diagnostic). MACWS_ALLOW_GIGACAGE=1 also forces
+// pass-through when unset. This is the most general feasible substitute until a
+// larger VA window exists (kernel/platform); we will not unlock that via OS upgrade/wipe.
+static char *macws_gigacage_enabled_default = "0";
+
+// System-level App Sandbox mach-lookup allow for MacWS private service names.
+// Remapped com.apple.macosbooter.* endpoints must be reachable from sandboxed
+// macOS apps (Safari WebKit, etc.) without per-app entitlement re-signing.
+// Only applies inside MacWS chroot processes (DYLD-inserted libmachook).
+enum { MACWS_SANDBOX_FILTER_GLOBAL_NAME = 2 }; // SANDBOX_FILTER_GLOBAL_NAME
+static bool macws_sandbox_allow_macosbooter_mach_name(const char *name) {
+    if (!name) return false;
+    if (!strncmp(name, "com.apple.macosbooter.", 22)) return true;
+    // Unique per-instance WebKit peer listeners (not the public
+    // macosbooter.WebKit.* name).
+    if (!strncmp(name, "com.macwsguide.wk.i.", 20)) return true;
+    return false;
+}
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+extern int sandbox_check_by_audit_token(audit_token_t token, const char *operation,
+                                        int type, ...);
+int sandbox_check_new(pid_t pid, const char *operation, int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    if (operation && strcmp(operation, "mach-lookup") == 0 &&
+        type == MACWS_SANDBOX_FILTER_GLOBAL_NAME) {
+        const char *svc = va_arg(ap, const char *);
+        va_end(ap);
+        if (macws_sandbox_allow_macosbooter_mach_name(svc)) {
+            static _Atomic unsigned allowed;
+            unsigned n = atomic_fetch_add_explicit(&allowed, 1, memory_order_relaxed);
+            if (n < 32) {
+                int fd = open("/tmp/macws-sandbox-allow.log",
+                              O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (fd >= 0) {
+                    char line[256];
+                    int len = snprintf(line, sizeof(line),
+                        "pid=%d sandbox_check allow mach-lookup %s\n",
+                        getpid(), svc);
+                    if (len > 0) (void)write(fd, line, (size_t)len);
+                    close(fd);
+                }
+            }
+            return 0;
+        }
+        int checked = sandbox_check(pid, operation, type, svc);
+        if (checked != 0 && macws_is_webcontent_process()) {
+            static _Atomic unsigned denied;
+            unsigned n = atomic_fetch_add_explicit(&denied, 1, memory_order_relaxed);
+            if (n < 64) {
+                char msg[192];
+                snprintf(msg, sizeof(msg),
+                         "sandbox_check DENY mach-lookup %s result=%d",
+                         svc ? svc : "?", checked);
+                macws_paint_log(msg);
+            }
+        }
+        return checked;
+    }
+    // Non-mach-lookup or other filter types: forward without consuming args we
+    // do not understand by calling through a typed helper where possible.
+    // For unknown filter payloads, fall back to deny-safe original via
+    // sandbox_check with no extra args when type is 0 (SANDBOX_FILTER_NONE).
+    if (type == 0) {
+        va_end(ap);
+        return sandbox_check(pid, operation, type);
+    }
+    // Best-effort: one pointer arg is the common GLOBAL_NAME / LITERAL shape.
+    const void *arg = va_arg(ap, const void *);
+    va_end(ap);
+    return sandbox_check(pid, operation, type, arg);
+}
+int sandbox_check_by_audit_token_new(audit_token_t token, const char *operation,
+                                     int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    if (operation && strcmp(operation, "mach-lookup") == 0 &&
+        type == MACWS_SANDBOX_FILTER_GLOBAL_NAME) {
+        const char *svc = va_arg(ap, const char *);
+        va_end(ap);
+        if (macws_sandbox_allow_macosbooter_mach_name(svc))
+            return 0;
+        return sandbox_check_by_audit_token(token, operation, type, svc);
+    }
+    if (type == 0) {
+        va_end(ap);
+        return sandbox_check_by_audit_token(token, operation, type);
+    }
+    const void *arg = va_arg(ap, const void *);
+    va_end(ap);
+    return sandbox_check_by_audit_token(token, operation, type, arg);
+}
+
+char *getenv_new(const char *name) {
+    char *value = getenv(name);
+    if (!name || strcmp(name, "GIGACAGE_ENABLED") != 0)
+        return value;
+    if (value)
+        return value;
+    char *allow = getenv("MACWS_ALLOW_GIGACAGE");
+    if (allow && allow[0] && allow[0] != '0')
+        return value;
+    return macws_gigacage_enabled_default;
+}
+
+DYLD_INTERPOSE(sandbox_check_new, sandbox_check);
+DYLD_INTERPOSE(sandbox_check_by_audit_token_new, sandbox_check_by_audit_token);
+DYLD_INTERPOSE(getenv_new, getenv);
 DYLD_INTERPOSE(mmap_new, mmap);
 DYLD_INTERPOSE(mprotect_new, mprotect);
 DYLD_INTERPOSE(munmap_new, munmap);
@@ -14140,6 +15116,10 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 #define HISERVICES_SERVICE_NEW  "com.apple.macosbooter.hiservices-xpcservice"
 #define AUTHD_SERVICE_ORIG "com.apple.authd"
 #define AUTHD_SERVICE_NEW  "com.apple.macosbooter.authd"
+#define TRUSTD_SERVICE_ORIG "com.apple.trustd"
+#define TRUSTD_SERVICE_NEW  "com.apple.macosbooter.trustd"
+#define SECURITYSERVER_SERVICE_ORIG "com.apple.SecurityServer"
+#define SECURITYSERVER_SERVICE_NEW  "com.apple.macosbooter.SecurityServer"
 #define CORESERVICESD_SERVICE_ORIG "com.apple.CoreServices.coreservicesd"
 #define CORESERVICESD_SERVICE_NEW \
     "com.apple.macosbooter.CoreServices.coreservicesd"
@@ -14196,6 +15176,1576 @@ static void macws_register_dock_helper_bundle_if_needed(void) {
              "/var/jb/usr/macOS/Frameworks");
     xpc_add_bundle(path, 2);
 }
+
+
+// Generic Application-type XPC table (system-level). Rows live in
+// /var/jb/usr/macOS/etc/macws-xpc-app-services.tsv so newly installed software
+// can be remapped without rebuilding libmachook. Hardcoded WebKit branches
+// below remain as a fast path / bootstrap when the TSV is missing.
+typedef struct {
+    char original[128];
+    char privateName[128];
+    char relativeProxy[512];
+} MacWSXpcAppServiceRow;
+enum { MACWS_XPC_APP_SERVICE_MAX = 64 };
+static MacWSXpcAppServiceRow g_macws_xpc_app_services[MACWS_XPC_APP_SERVICE_MAX];
+static int g_macws_xpc_app_service_count = -1;
+static void macws_xpc_app_services_load(void) {
+    if (g_macws_xpc_app_service_count >= 0) return;
+    g_macws_xpc_app_service_count = 0;
+    FILE *fp = fopen("/usr/local/etc/macws-xpc-app-services.tsv", "r");
+    if (!fp)
+        fp = fopen("/var/jb/usr/macOS/etc/macws-xpc-app-services.tsv", "r");
+    if (!fp) return;
+    char line[768];
+    while (fgets(line, sizeof(line), fp) &&
+           g_macws_xpc_app_service_count < MACWS_XPC_APP_SERVICE_MAX) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+        char *tab1 = strchr(line, '\t'); if (!tab1) continue; *tab1 = 0;
+        char *tab2 = strchr(tab1 + 1, '\t'); if (!tab2) continue; *tab2 = 0;
+        MacWSXpcAppServiceRow *row =
+            &g_macws_xpc_app_services[g_macws_xpc_app_service_count];
+        snprintf(row->original, sizeof(row->original), "%s", line);
+        snprintf(row->privateName, sizeof(row->privateName), "%s", tab1 + 1);
+        snprintf(row->relativeProxy, sizeof(row->relativeProxy), "%s", tab2 + 1);
+        g_macws_xpc_app_service_count++;
+    }
+    fclose(fp);
+}
+static const MacWSXpcAppServiceRow *macws_xpc_app_services_lookup(
+        const char *name) {
+    if (!name) return NULL;
+    macws_xpc_app_services_load();
+    for (int i = 0; i < g_macws_xpc_app_service_count; i++) {
+        if (!strcmp(g_macws_xpc_app_services[i].original, name))
+            return &g_macws_xpc_app_services[i];
+    }
+    return NULL;
+}
+
+// Resolve an Application-type chroot-proxy bundle path that iOS launchd can
+// spawn. xpc_add_bundle records the path string; launchd/xpcproxy resolves
+// it in the *host* namespace, then the setuid proxy chroots into rootfs.
+//
+// /usr/local/libexec/macws-xpc exists only inside the chroot, so add_bundle
+// of that path yields "Connection invalid" and never starts the proxy
+// (runtime, 2026-11-10). Prefer:
+//   1. /var/mnt/rootfs/usr/local/libexec/macws-xpc/... — host-visible, and
+//      also visible inside the chroot via the rootfs self-symlink
+//      (/var/mnt/rootfs -> /).
+//   2. /var/jb/usr/macOS/Frameworks/... — the DockHelper pattern. access()
+//      may fail inside the chroot because rootfs /var/jb/usr is an absolute
+//      symlink loop; launchd still resolves the path on the host.
+__attribute__((visibility("hidden")))
+void macws_xpc_app_logf(const char *fmt, ...) {
+    int fd = open("/tmp/macws-xpc-app.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char line[640];
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (len > 0) {
+        if ((size_t)len >= sizeof(line)) len = (int)sizeof(line) - 1;
+        (void)write(fd, line, (size_t)len);
+    }
+    close(fd);
+}
+
+static void macws_xpc_host_visible_proxy_path(char *path, size_t pathsz,
+        const char *relativeProxy) {
+    if (!path || pathsz == 0 || !relativeProxy) return;
+    // Prefer the DockHelper pattern. launchd/xpcproxy resolve xpc_add_bundle
+    // paths in the iOS host namespace. /var/jb/usr/macOS/Frameworks/<rel> is
+    // host-visible; access() of that path fails inside the chroot because
+    // /var/jb is a symlink loop, so do not use in-chroot access() as a gate.
+    // Same-boot probe 2026-11-10 15:15 CST: this path spawned stock
+    // WebContent (~29 MB, Ss, ppid 1) and kept it up. The previously
+    // preferred /var/mnt/rootfs/usr/local/libexec/macws-xpc/<rel> is visible
+    // in both namespaces but produced Connection interrupted and no helper.
+    snprintf(path, pathsz, "/var/jb/usr/macOS/Frameworks/%s", relativeProxy);
+}
+
+// Remember Application-type connections so we can log XPC errors (Connection
+// invalid / interrupted) after the client installs its own event handler.
+#define MACWS_XPC_APP_CONN_MAX 128
+static struct {
+    xpc_connection_t conn;
+    char name[96];
+    int unique_listener;
+} g_macws_xpc_app_conns[MACWS_XPC_APP_CONN_MAX];
+static int g_macws_xpc_app_conn_n = 0;
+static pthread_mutex_t g_macws_xpc_app_conn_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void macws_xpc_remember_app_conn_ex(xpc_connection_t conn,
+        const char *name, int unique_listener) {
+    if (!conn || !name) return;
+    pthread_mutex_lock(&g_macws_xpc_app_conn_mu);
+    int slot = g_macws_xpc_app_conn_n;
+    if (slot < MACWS_XPC_APP_CONN_MAX)
+        g_macws_xpc_app_conn_n++;
+    else
+        slot = slot % MACWS_XPC_APP_CONN_MAX; // overwrite oldest-ring
+    g_macws_xpc_app_conns[slot].conn = conn;
+    snprintf(g_macws_xpc_app_conns[slot].name,
+             sizeof(g_macws_xpc_app_conns[slot].name), "%s", name);
+    g_macws_xpc_app_conns[slot].unique_listener = unique_listener ? 1 : 0;
+    pthread_mutex_unlock(&g_macws_xpc_app_conn_mu);
+}
+
+static void macws_xpc_remember_app_conn(xpc_connection_t conn,
+        const char *name) {
+    macws_xpc_remember_app_conn_ex(conn, name, 0);
+}
+
+/* Mark the unique-path anonymous listener so the helper wrap does not
+ * force it onto the main queue. Direct calls to set_event_handler_raw
+ * still hit DYLD_INTERPOSE / the shared-cache MSHook (field, net32:
+ * 31 helper=1 lines on the listener). Both hooks enter
+ * macws_xpc_wrap_app_event_handler; skip the wrap there. Incoming
+ * accepted peers stay unmarked and still get the main-queue wrap. */
+static void macws_xpc_remember_unique_listener(xpc_connection_t conn,
+        const char *name) {
+    macws_xpc_remember_app_conn_ex(conn, name, 1);
+}
+
+static int macws_xpc_app_conn_is_unique_listener(xpc_connection_t conn) {
+    if (!conn) return 0;
+    pthread_mutex_lock(&g_macws_xpc_app_conn_mu);
+    int found = 0;
+    for (int i = 0; i < g_macws_xpc_app_conn_n && i < MACWS_XPC_APP_CONN_MAX;
+         i++) {
+        if (g_macws_xpc_app_conns[i].conn == conn) {
+            found = g_macws_xpc_app_conns[i].unique_listener;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_xpc_app_conn_mu);
+    return found;
+}
+
+__attribute__((visibility("hidden")))
+const char *macws_xpc_lookup_app_conn_name(xpc_connection_t conn) {
+    if (!conn) return NULL;
+    pthread_mutex_lock(&g_macws_xpc_app_conn_mu);
+    const char *found = NULL;
+    for (int i = 0; i < g_macws_xpc_app_conn_n && i < MACWS_XPC_APP_CONN_MAX;
+         i++) {
+        if (g_macws_xpc_app_conns[i].conn == conn) {
+            found = g_macws_xpc_app_conns[i].name;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_xpc_app_conn_mu);
+    return found;
+}
+
+/* Live background serial queue for unique accepted peers. The
+ * unsandboxed probe delivered dictionaries on a non-main serial
+ * queue; net33 forced those peers onto main (helper wrap +
+ * macws_webkit_xpc_main_connection) and saw 30 accepts + resume
+ * but 0 dictionary events. dispatch_main may not drain libxpc
+ * sources the way a live GCD serial queue does. Bounce the
+ * user handler to main separately so InitializeWebKit2 still
+ * sees isMainThread. */
+static dispatch_queue_t macws_wk_unique_incoming_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.macwsguide.wk.peer-incoming",
+                                  DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+static int macws_xpc_app_conn_is_unique_incoming(xpc_connection_t conn) {
+    if (!conn || macws_xpc_app_conn_is_unique_listener(conn))
+        return 0;
+    const char *name = macws_xpc_lookup_app_conn_name(conn);
+    return name && !strncmp(name, "com.macwsguide.wk.i.", 20);
+}
+
+static void macws_xpc_log_and_add_bundle(const char *path, const char *tag) {
+    int acc = (path && path[0]) ? access(path, F_OK) : -1;
+    int err = (acc == 0) ? 0 : errno;
+    macws_xpc_app_logf(
+        "pid=%d add_bundle tag=%s path=%s access=%d errno=%d\n",
+        getpid(), tag ? tag : "?", path ? path : "", acc, err);
+    if (path && path[0])
+        xpc_add_bundle((char *)path, 2);
+    // xpc_add_bundle is void; the useful result is a later XPC error
+    // (Connection invalid) or a spawned helper.
+    macws_xpc_app_logf("pid=%d add_bundle_done tag=%s path=%s\n",
+                       getpid(), tag ? tag : "?", path ? path : "");
+}
+
+// §60: overlay-launched WebKit helpers (launchd-managed alias
+// com.macwsguide.xpc.*). Stock xpc_main installs its own listener /
+// bootstrap handlers through the hooked set_event_handler; forcing those
+// onto the main queue deadlocked the first accept (Application-type
+// xpc_main does not drain the main queue until the first peer arrives).
+// Only connections handed to macws_webkit_xpc_main_connection get the
+// main-queue wrap; everything else passes straight to the original.
+#define MACWS_OVERLAY_ACCEPTED_MAX 32
+static pthread_mutex_t g_macws_overlay_accepted_mu = PTHREAD_MUTEX_INITIALIZER;
+static void *g_macws_overlay_accepted[MACWS_OVERLAY_ACCEPTED_MAX];
+static int g_macws_overlay_accepted_n;
+
+static bool macws_is_overlay_xpc_helper(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *svc = getenv("XPC_SERVICE_NAME");
+        cached = (svc && !strncmp(svc, "com.macwsguide.xpc.", 19)) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static void macws_overlay_remember_accepted(xpc_connection_t conn) {
+    if (!conn) return;
+    pthread_mutex_lock(&g_macws_overlay_accepted_mu);
+    if (g_macws_overlay_accepted_n < MACWS_OVERLAY_ACCEPTED_MAX)
+        g_macws_overlay_accepted[g_macws_overlay_accepted_n++] = (void *)conn;
+    pthread_mutex_unlock(&g_macws_overlay_accepted_mu);
+}
+
+static bool macws_overlay_is_accepted(xpc_connection_t conn) {
+    bool hit = false;
+    pthread_mutex_lock(&g_macws_overlay_accepted_mu);
+    for (int i = 0; i < g_macws_overlay_accepted_n; i++)
+        if (g_macws_overlay_accepted[i] == (void *)conn) { hit = true; break; }
+    pthread_mutex_unlock(&g_macws_overlay_accepted_mu);
+    return hit;
+}
+
+// Wrap a client's event handler so Connection invalid / interrupted are
+// logged with the activate service name. orig must be the unhooked
+// xpc_connection_set_event_handler (or MSHook's saved original).
+void macws_xpc_wrap_app_event_handler(
+        xpc_connection_t connection, xpc_handler_t handler,
+        void (*orig)(xpc_connection_t, xpc_handler_t)) {
+    if (!orig) return;
+    // Helper-side: Apple's xpcproxy would deliver Application-type
+    // events on the main NSRunLoop. After our setuid chroot proxy
+    // execve's the stock image, the first event can arrive on a
+    // libdispatch queue. Force the connection target queue and bounce
+    // any off-main handler onto the main queue so InitializeWebKit2's
+    // isMainThread assertion holds.
+    if (macws_is_webkit_helper_process() && handler &&
+        macws_is_overlay_xpc_helper() &&
+        !macws_overlay_is_accepted(connection)) {
+        static _Atomic unsigned passlog;
+        if (atomic_fetch_add_explicit(&passlog, 1, memory_order_relaxed) < 8) {
+            char m[160];
+            snprintf(m, sizeof(m),
+                     "overlay helper set_event_handler passthrough conn=%p "
+                     "main=%d", connection, pthread_main_np());
+            macws_webkit_init_log(m);
+        }
+        orig(connection, handler);
+        return;
+    }
+    if (macws_is_webkit_helper_process() && handler) {
+        const char *hsvc = macws_xpc_lookup_app_conn_name(connection);
+        /* Unique anonymous listener: do not force main or wrap the
+         * accept handler. The unsandboxed probe delivered on a live
+         * background serial queue without this wrap. */
+        if (macws_xpc_app_conn_is_unique_listener(connection)) {
+            macws_xpc_app_logf(
+                "pid=%d wk-peer set-event-handler-raw peer=%s conn=%p "
+                "helper=0 wrap=0\n",
+                getpid(), hsvc ? hsvc : "?", connection);
+            orig(connection, handler);
+            return;
+        }
+        /* Unique accepted peer: keep delivery on a live background
+         * serial queue (probe path). Still wrap and bounce off-main
+         * events onto main for isMainThread. Do not force mainq. */
+        if (macws_xpc_app_conn_is_unique_incoming(connection)) {
+            macws_xpc_app_logf(
+                "pid=%d wk-peer set-event-handler-incoming peer=%s "
+                "conn=%p helper=1 wrap=1 mainq=0\n",
+                getpid(), hsvc ? hsvc : "?", connection);
+            xpc_connection_set_target_queue(
+                connection, macws_wk_unique_incoming_queue());
+        } else {
+            if (hsvc && !strncmp(hsvc, "com.macwsguide.wk.i.", 20))
+                macws_xpc_app_logf(
+                    "pid=%d wk-peer set-event-handler peer=%s conn=%p "
+                    "helper=1\n",
+                    getpid(), hsvc, connection);
+            xpc_connection_set_target_queue(
+                connection, dispatch_get_main_queue());
+        }
+        xpc_handler_t user = handler;
+        orig(connection, ^(xpc_object_t event) {
+            void (^run)(void) = ^{
+                if (event && xpc_get_type(event) == XPC_TYPE_ERROR &&
+                    macws_is_overlay_xpc_helper()) {
+                    const char *desc = xpc_dictionary_get_string(
+                        event, XPC_ERROR_KEY_DESCRIPTION);
+                    char em[200];
+                    snprintf(em, sizeof(em),
+                             "overlay helper accepted conn=%p xpc error=%s",
+                             connection, desc ? desc : "?");
+                    macws_webkit_init_log(em);
+                }
+                if (macws_is_webcontent_process()) {
+                    const char *typ = "other";
+                    if (!event)
+                        typ = "null";
+                    else if (xpc_get_type(event) == XPC_TYPE_ERROR)
+                        typ = "error";
+                    else if (xpc_get_type(event) == XPC_TYPE_DICTIONARY)
+                        typ = "dictionary";
+                    else if (xpc_get_type(event) == XPC_TYPE_CONNECTION)
+                        typ = "connection";
+                    char msg[192];
+                    snprintf(msg, sizeof(msg),
+                             "xpc event begin type=%s main=%d "
+                             "(InitializeWebProcess/CreateWebPage ride this conn)",
+                             typ, pthread_main_np());
+                    macws_paint_log(msg);
+                    if (hsvc && !strncmp(hsvc, "com.macwsguide.wk.i.", 20))
+                        macws_xpc_app_logf(
+                            "pid=%d wk-peer xpc-event peer=%s conn=%p "
+                            "type=%s helper=1\n",
+                            getpid(), hsvc, connection, typ);
+                }
+                user(event);
+                if (macws_is_webcontent_process()) {
+                    static _Atomic unsigned n;
+                    unsigned i = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+                    macws_paint_log("xpc event end");
+                    if (i < 2) {
+                        char tag[16];
+                        snprintf(tag, sizeof(tag), "xpc%u", i);
+                        macws_webcontent_paint_heartbeat(tag);
+                    }
+                }
+            };
+            if (pthread_main_np()) {
+                run();
+                return;
+            }
+            /* Unique incoming conns can be accepted on a background
+             * queue before dispatch_main is draining; dispatch_sync
+             * would deadlock. Async parks the work on the main queue. */
+            macws_webkit_init_log("xpc event off main; dispatch_async");
+            dispatch_async(dispatch_get_main_queue(), run);
+        });
+        return;
+    }
+    const char *svc = macws_xpc_lookup_app_conn_name(connection);
+    if (svc && !strncmp(svc, "com.macwsguide.wk.i.", 20))
+        macws_xpc_app_logf(
+            "pid=%d wk-peer set-event-handler peer=%s conn=%p helper=%d\n",
+            getpid(), svc, connection, macws_is_webkit_helper_process() ? 1 : 0);
+    if (!svc || !handler) {
+        orig(connection, handler);
+        return;
+    }
+    char *nameCopy = strdup(svc);
+    xpc_handler_t user = handler;
+    orig(connection, ^(xpc_object_t event) {
+        if (event && xpc_get_type(event) == XPC_TYPE_ERROR) {
+            const char *desc = xpc_dictionary_get_string(
+                event, XPC_ERROR_KEY_DESCRIPTION);
+            macws_xpc_app_logf("pid=%d xpc_error service=%s desc=%s\n",
+                               getpid(), nameCopy ? nameCopy : "?",
+                               desc ? desc : "?");
+        }
+        user(event);
+    });
+}
+
+static void macws_register_xpc_app_proxy_bundle(const char *relativeProxy) {
+    if (!relativeProxy || !relativeProxy[0]) return;
+    static char registered[MACWS_XPC_APP_SERVICE_MAX][512];
+    static int registeredCount = 0;
+    for (int i = 0; i < registeredCount; i++) {
+        if (!strcmp(registered[i], relativeProxy)) return;
+    }
+    if (registeredCount < MACWS_XPC_APP_SERVICE_MAX)
+        snprintf(registered[registeredCount++], sizeof(registered[0]),
+                 "%s", relativeProxy);
+    char path[PATH_MAX];
+    macws_xpc_host_visible_proxy_path(path, sizeof(path), relativeProxy);
+    macws_xpc_log_and_add_bundle(path, relativeProxy);
+}
+
+// Safari WebKit XPC services are Application-type (_MultipleInstances +
+// NSRunLoop), same activation class as DockHelper. A permanent launchd Mach
+// listener cannot preserve xpcproxy's per-instance NSApplication context and
+// exits with "An XPC Service cannot be run directly." Register the freestanding
+// chroot proxy bundles so xpc_connection_create activates them on demand.
+static void macws_register_webkit_bundle_if_needed(const char *proxyLeaf) {
+    if (!proxyLeaf) return;
+    typedef struct {
+        const char *leaf;
+        _Atomic bool registered;
+    } MacWSWebKitBundleSlot;
+    static MacWSWebKitBundleSlot slots[] = {
+        {"WebContentProxy.xpc", false},
+        {"WebNetworkingProxy.xpc", false},
+        {"WebGPUProxy.xpc", false},
+        {"SafariSandboxProxy.xpc", false},
+    };
+    for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); i++) {
+        if (strcmp(slots[i].leaf, proxyLeaf) != 0) continue;
+        if (atomic_exchange_explicit(&slots[i].registered, true,
+                                     memory_order_acq_rel))
+            return;
+        char path[PATH_MAX];
+        char rel[PATH_MAX];
+        snprintf(rel, sizeof(rel),
+                 "WebKit.framework/Versions/A/XPCServices/%s", proxyLeaf);
+        macws_xpc_host_visible_proxy_path(path, sizeof(path), rel);
+        macws_xpc_log_and_add_bundle(path, rel);
+        return;
+    }
+}
+
+// System-level Application-type XPC activation for sandboxed AND unsandboxed
+// clients. Prefer keeping activate_name == original so App Sandbox mach-lookup
+// checks the stock name the app is already allowed to use; the freestanding
+// chroot proxy is attached via xpc_add_bundle in this process's domain.
+// When activate_name differs (DockHelper), remap after register.
+#define WEBKIT_WEBCONTENT_SERVICE "com.apple.WebKit.WebContent"
+#define WEBKIT_WEBCONTENT_SERVICE_NEW "com.apple.macosbooter.WebKit.WebContent"
+#define WEBKIT_NETWORKING_SERVICE "com.apple.WebKit.Networking"
+#define WEBKIT_NETWORKING_SERVICE_NEW "com.apple.macosbooter.WebKit.Networking"
+#define WEBKIT_GPU_SERVICE "com.apple.WebKit.GPU"
+#define WEBKIT_GPU_SERVICE_NEW "com.apple.macosbooter.WebKit.GPU"
+#define SAFARI_SANDBOX_BROKER_SERVICE "com.apple.Safari.SandboxBroker"
+#define SAFARI_SANDBOX_BROKER_SERVICE_NEW "com.apple.macosbooter.Safari.SandboxBroker"
+
+
+// Issue+consume a mach sandbox extension for a MacWS private name when the
+// process is allowed to issue WebKit mach extensions (Safari/WebKit apps).
+// Generic for any com.apple.macosbooter.* activation — no entitlement re-sign.
+static void macws_issue_mach_extension_unchecked(const char *serviceName);
+static void macws_issue_macosbooter_mach_extension(const char *serviceName) {
+    if (!macws_sandbox_allow_macosbooter_mach_name(serviceName)) return;
+    macws_issue_mach_extension_unchecked(serviceName);
+}
+
+// §60: also used for overlay services, i.e. the app's own bundled
+// XPCServices registered into its pid domain. macOS launchd never sandbox-
+// checks pid-domain service lookups; iOS launchd does ("denied lookup ...
+// flags = 0x20 ... Sandbox restriction"), so the client needs the same mach
+// extension the macosbooter.* route already relies on.
+static void macws_issue_mach_extension_unchecked(const char *serviceName) {
+    if (!serviceName || !*serviceName) return;
+    typedef char *(*issue_fn)(const char *, const char *, uint32_t);
+    typedef int (*consume_fn)(const char *);
+    static issue_fn issue = NULL;
+    static consume_fn consume = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        issue = (issue_fn)dlsym(RTLD_DEFAULT, "sandbox_extension_issue_mach");
+        consume = (consume_fn)dlsym(RTLD_DEFAULT, "sandbox_extension_consume");
+    });
+    if (!issue || !consume) return;
+    // Prefer WebKit's extension class (Safari sbpl already allows issuing it).
+    const char *classes[] = {
+        "com.apple.webkit.extension.mach",
+        "com.apple.app-sandbox.mach",
+        "com.apple.security.exception.mach-lookup.global-name",
+    };
+    for (size_t i = 0; i < sizeof(classes)/sizeof(classes[0]); i++) {
+        char *token = issue(classes[i], serviceName, 0);
+        if (token) {
+            (void)consume(token);
+            free(token);
+            int fd = open("/tmp/macws-sandbox-allow.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                char line[320];
+                int len = snprintf(line, sizeof(line),
+                    "pid=%d extension class=%s service=%s\n",
+                    getpid(), classes[i], serviceName);
+                if (len > 0) (void)write(fd, line, (size_t)len);
+                close(fd);
+            }
+            return;
+        }
+    }
+    int fd = open("/tmp/macws-sandbox-allow.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        char line[320];
+        int len = snprintf(line, sizeof(line),
+            "pid=%d extension FAILED service=%s errno=%d\n",
+            getpid(), serviceName, errno);
+        if (len > 0) (void)write(fd, line, (size_t)len);
+        close(fd);
+    }
+}
+
+
+#define MACWS_WK_PEER_ENV "MACWS_WK_PEER"
+#define MACWS_WK_PEER_PREFIX "com.macwsguide.wk.i."
+#define MACWS_WK_PEER_PREFIX_LEN 20
+#define MACWS_WK_PEER_HEX_LEN 32
+
+static int macws_wk_peer_name_valid(const char *name) {
+    if (!name || strncmp(name, MACWS_WK_PEER_PREFIX, MACWS_WK_PEER_PREFIX_LEN) != 0)
+        return 0;
+    const char *hex = name + MACWS_WK_PEER_PREFIX_LEN;
+    size_t n = 0;
+    while (hex[n]) {
+        char c = hex[n];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return 0;
+        n++;
+    }
+    return n == MACWS_WK_PEER_HEX_LEN;
+}
+
+static void macws_wk_peer_make_name(char *out, size_t outsz) {
+    unsigned char raw[16];
+    if (outsz < MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1) {
+        if (outsz) out[0] = 0;
+        return;
+    }
+    arc4random_buf(raw, sizeof(raw));
+    memcpy(out, MACWS_WK_PEER_PREFIX, MACWS_WK_PEER_PREFIX_LEN);
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        out[MACWS_WK_PEER_PREFIX_LEN + 2 * i] = hex[(raw[i] >> 4) & 0xf];
+        out[MACWS_WK_PEER_PREFIX_LEN + 2 * i + 1] = hex[raw[i] & 0xf];
+    }
+    out[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN] = 0;
+}
+
+static int macws_wk_proxy_executable_path(const char *leaf, char *path,
+                                          size_t pathsz) {
+    if (!leaf || !path || pathsz < 16) return -1;
+    size_t leafLen = strlen(leaf);
+    if (leafLen < 5 || strcmp(leaf + leafLen - 4, ".xpc") != 0)
+        return -1;
+    int n = snprintf(path, pathsz,
+        "/var/jb/usr/macOS/Frameworks/WebKit.framework/Versions/A/"
+        "XPCServices/%s/%.*s",
+        leaf, (int)(leafLen - 4), leaf);
+    if (n < 0 || (size_t)n >= pathsz) return -1;
+    return access(path, X_OK);
+}
+
+static char **macws_wk_peer_envp(const char *peerName) {
+    int n = 0;
+    if (environ)
+        while (environ[n]) n++;
+    char **envp = calloc((size_t)n + 8, sizeof(char *));
+    if (!envp) return NULL;
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+        if (!environ[i]) continue;
+        if (!strncmp(environ[i], MACWS_WK_PEER_ENV "=", 13))
+            continue;
+        if (!strncmp(environ[i], "XPC_FLAGS=", 10))
+            continue;
+        if (!strncmp(environ[i], "XPC_SERVICE_NAME=", 17))
+            continue;
+        envp[o++] = environ[i];
+    }
+    char *peer = calloc(1, 13 + 64);
+    // Unique peers have no inherited SERVICE_SLOT receive; do not
+    // set XPC_FLAGS=8019. The unsandboxed in-chroot probe delivered
+    // without Application-type managed flags.
+    char *flags = strdup("XPC_FLAGS=0");
+    // Do not set XPC_SERVICE_NAME to the unique peer. The probe had
+    // no service name, and xpc_connection_create(NULL) in a process
+    // whose XPC_SERVICE_NAME is set can bind as a named client
+    // instead of an anonymous listener, so Safari's
+    // create_from_endpoint traffic never shows up as accepts.
+    if (!peer || !flags) {
+        free(peer);
+        free(flags);
+        free(envp);
+        return NULL;
+    }
+    snprintf(peer, 13 + 64, "%s=%s", MACWS_WK_PEER_ENV, peerName);
+    envp[o++] = peer;
+    envp[o++] = flags;
+    envp[o] = NULL;
+    return envp;
+}
+
+static void macws_wk_peer_envp_free(char **envp) {
+    if (!envp) return;
+    for (int i = 0; envp[i]; i++) {
+        if (!strncmp(envp[i], MACWS_WK_PEER_ENV "=", 13) ||
+            !strncmp(envp[i], "XPC_FLAGS=", 10) ||
+            !strncmp(envp[i], "XPC_SERVICE_NAME=", 17))
+            free(envp[i]);
+    }
+    free(envp);
+}
+
+// Unique-name XPC LISTENER objects are not published into the chroot
+// bootstrap (field, net21/net22): bootstrap_look_up returns 1102, and
+// bootstrap_register + create_mach_service LISTENER is "Connection
+// invalid". Hand the helper a COPY_SEND of a parent-owned rendezvous
+// port and receive an anonymous-listener endpoint over xpc_pipe, which
+// is bootstrap-independent. Safari bootstrap_registers the unique name
+// so the helper can look it up after exec when slot 1 is missing
+// (field, net23: Networking connected this way).
+//
+// Do not stall Safari's application-service thread for a long wait
+// times N: pre-spawn the helper pool in parallel and only block to
+// pop an already-started peer. Keep the receive right alive until the
+// child sends or a grace timeout, so a slower WebContent can still
+// deliver the endpoint. Do not check in or listen on the public
+// macosbooter.WebKit.* name.
+#define MACWS_WK_RV_SLOT 1
+#define MACWS_WK_RV_POP_MS 3000
+#define MACWS_WK_RV_GRACE_MS 5000
+#define MACWS_WK_POOL_WEBCONTENT 8
+#define MACWS_WK_PENDING_MAX 32
+extern int posix_spawnattr_set_registered_ports_np(
+    posix_spawnattr_t *attr, mach_port_t *portarray, unsigned int count);
+extern kern_return_t macws_bootstrap_register_raw(
+    mach_port_t bp, const char *name, mach_port_t sp)
+    __asm__("_bootstrap_register");
+extern kern_return_t macws_bootstrap_look_up_raw(
+    mach_port_t bp, const char *name, mach_port_t *sp)
+    __asm__("_bootstrap_look_up");
+extern mach_port_t bootstrap_port;
+extern void *xpc_pipe_create_from_port(mach_port_t port, uint64_t flags);
+extern int xpc_pipe_simpleroutine(void *pipe, xpc_object_t msg);
+extern int xpc_pipe_receive(mach_port_t port, xpc_object_t *msg);
+extern xpc_connection_t macws_xpc_connection_create_raw(
+    const char *, dispatch_queue_t) __asm("_xpc_connection_create");
+extern void macws_xpc_connection_set_event_handler_raw(
+    xpc_connection_t connection, xpc_handler_t handler)
+    __asm("_xpc_connection_set_event_handler");
+
+static void macws_wk_destroy_rendezvous_recv(mach_port_t *recv) {
+    if (!recv || !MACH_PORT_VALID(*recv)) return;
+    (void)mach_port_mod_refs(mach_task_self(), *recv,
+                             MACH_PORT_RIGHT_SEND, -1);
+    (void)mach_port_mod_refs(mach_task_self(), *recv,
+                             MACH_PORT_RIGHT_RECEIVE, -1);
+    *recv = MACH_PORT_NULL;
+}
+
+static mach_port_t macws_wk_rendezvous_send_from_slots(void) {
+    mach_port_array_t ports = NULL;
+    mach_msg_type_number_t count = 0;
+    if (mach_ports_lookup(mach_task_self(), &ports, &count) != KERN_SUCCESS)
+        return MACH_PORT_NULL;
+    mach_port_t p = MACH_PORT_NULL;
+    if (ports && count > MACWS_WK_RV_SLOT)
+        p = ports[MACWS_WK_RV_SLOT];
+    if (ports)
+        (void)vm_deallocate(mach_task_self(), (vm_address_t)ports,
+                            count * sizeof(*ports));
+    return p;
+}
+
+// Prefer an inherited slot-1 COPY_SEND. If the 0755 proxy did not
+// observe that slot (field, net22: all handshakes had [1]=0x0 even
+// though a macOS-minos chroot child does receive it), look up the
+// unique name Safari bootstrap_register'd. That register keeps the
+// receive right in Safari (typ=0x30000); look_up returns a send.
+static mach_port_t macws_wk_rendezvous_send(const char *peerName) {
+    mach_port_t p = macws_wk_rendezvous_send_from_slots();
+    if (MACH_PORT_VALID(p)) return p;
+    if (!peerName || !peerName[0]) return MACH_PORT_NULL;
+    mach_port_t bp = bootstrap_port;
+    mach_port_t looked = MACH_PORT_NULL;
+    kern_return_t kr = macws_bootstrap_look_up_raw(bp, peerName, &looked);
+    if (kr == KERN_SUCCESS && MACH_PORT_VALID(looked))
+        return looked;
+    return MACH_PORT_NULL;
+}
+
+typedef mach_port_t (*macws_wk_ep_copy_port_fn)(xpc_object_t);
+typedef xpc_object_t (*macws_wk_ep_from_port_fn)(mach_port_t);
+
+static macws_wk_ep_copy_port_fn macws_wk_ep_copy_port(void) {
+    static macws_wk_ep_copy_port_fn fn;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (macws_wk_ep_copy_port_fn)dlsym(
+            RTLD_DEFAULT, "xpc_endpoint_copy_listener_port_4sim");
+    });
+    return fn;
+}
+
+static macws_wk_ep_from_port_fn macws_wk_ep_from_port(void) {
+    static macws_wk_ep_from_port_fn fn;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (macws_wk_ep_from_port_fn)dlsym(
+            RTLD_DEFAULT, "xpc_endpoint_create_mach_port_4sim");
+    });
+    return fn;
+}
+
+static int macws_wk_send_peer_endpoint(xpc_object_t endpoint,
+                                       mach_port_t rendezvousSend) {
+    if (!endpoint || !MACH_PORT_VALID(rendezvousSend)) return -1;
+    void *pipe = xpc_pipe_create_from_port(rendezvousSend, 0);
+    if (!pipe) return -1;
+    xpc_object_t payload = xpc_dictionary_create(NULL, NULL, 0);
+    if (!payload) return -1;
+    xpc_dictionary_set_value(payload, "endpoint", endpoint);
+    /* Cross-process probe: embedding the endpoint object does work,
+     * but also COPY a raw send right. xpc_pipe may drop complex
+     * endpoint objects in some sandboxes; set_mach_send is explicit. */
+    macws_wk_ep_copy_port_fn copy_port = macws_wk_ep_copy_port();
+    mach_port_t lport = MACH_PORT_NULL;
+    if (copy_port)
+        lport = copy_port(endpoint);
+    unsigned typ = 0;
+    if (MACH_PORT_VALID(lport)) {
+        (void)mach_port_type(mach_task_self(), lport, &typ);
+        xpc_dictionary_set_mach_send(payload, "port", lport);
+    }
+    macws_xpc_app_logf(
+        "pid=%d wk-peer endpoint-port port=0x%x typ=0x%x copy_fn=%p\n",
+        getpid(), (unsigned)lport, typ, copy_port);
+    int rc = xpc_pipe_simpleroutine(pipe, payload);
+    xpc_release(payload);
+    if (MACH_PORT_VALID(lport))
+        (void)mach_port_deallocate(mach_task_self(), lport);
+    return rc;
+}
+
+typedef struct {
+    int in_use;
+    int done;   /* 0 waiting, 1 endpoint ready, -1 failed */
+    int taken;
+    pid_t child;
+    mach_port_t recv;
+    char leaf[48];
+    char peer[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1];
+    dispatch_semaphore_t ready;
+    xpc_object_t endpoint;
+    /* Send right the 4sim-rebuilt endpoint may still name. Do not
+     * deallocate while the endpoint / connection can be used. */
+    mach_port_t ep_port;
+} macws_wk_pending_t;
+
+static macws_wk_pending_t g_macws_wk_pending[MACWS_WK_PENDING_MAX];
+static struct {
+    char leaf[48];
+    int gave_up;
+} g_macws_wk_leaf_wait[8];
+
+static int macws_wk_leaf_already_waited_locked(const char *leaf) {
+    if (!leaf) return 0;
+    for (int i = 0; i < 8; i++) {
+        if (g_macws_wk_leaf_wait[i].leaf[0] &&
+            strcmp(g_macws_wk_leaf_wait[i].leaf, leaf) == 0)
+            return g_macws_wk_leaf_wait[i].gave_up;
+    }
+    return 0;
+}
+
+static void macws_wk_leaf_mark_waited_locked(const char *leaf, int gave_up) {
+    if (!leaf) return;
+    int free_i = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_macws_wk_leaf_wait[i].leaf[0] &&
+            strcmp(g_macws_wk_leaf_wait[i].leaf, leaf) == 0) {
+            g_macws_wk_leaf_wait[i].gave_up = gave_up;
+            return;
+        }
+        if (free_i < 0 && !g_macws_wk_leaf_wait[i].leaf[0])
+            free_i = i;
+    }
+    if (free_i >= 0) {
+        snprintf(g_macws_wk_leaf_wait[free_i].leaf,
+                 sizeof(g_macws_wk_leaf_wait[free_i].leaf), "%s", leaf);
+        g_macws_wk_leaf_wait[free_i].gave_up = gave_up;
+    }
+}
+
+static dispatch_queue_t macws_wk_pool_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.macwsguide.wk.peer-pool",
+                                  DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+static void macws_wk_pending_fail_locked(macws_wk_pending_t *p, int sigkill) {
+    if (!p || p->done != 0) return;
+    p->done = -1;
+    if (sigkill && p->child > 0) {
+        (void)kill(p->child, SIGKILL);
+        (void)waitpid(p->child, NULL, WNOHANG);
+    }
+    macws_wk_destroy_rendezvous_recv(&p->recv);
+    if (p->ready) dispatch_semaphore_signal(p->ready);
+}
+
+static void macws_wk_arm_pending_receive(macws_wk_pending_t *p) {
+    if (!p || !MACH_PORT_VALID(p->recv)) return;
+    mach_port_t port = p->recv;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        xpc_object_t msg = NULL;
+        int prc = xpc_pipe_receive(port, &msg);
+        dispatch_sync(macws_wk_pool_queue(), ^{
+            if (p->done != 0) {
+                if (msg) xpc_release(msg);
+                return;
+            }
+            xpc_object_t ep = NULL;
+            const char *eptyp = "null";
+            if (prc == 0 && msg)
+                ep = xpc_dictionary_get_value(msg, "endpoint");
+            if (ep) {
+                if (xpc_get_type(ep) == XPC_TYPE_ENDPOINT)
+                    eptyp = "endpoint";
+                else
+                    eptyp = "other";
+            }
+            mach_port_t pport = MACH_PORT_NULL;
+            if (prc == 0 && msg)
+                pport = xpc_dictionary_copy_mach_send(msg, "port");
+            unsigned ptyp = 0;
+            if (MACH_PORT_VALID(pport))
+                (void)mach_port_type(mach_task_self(), pport, &ptyp);
+            xpc_object_t rebuilt = NULL;
+            macws_wk_ep_from_port_fn from_port = macws_wk_ep_from_port();
+            if (from_port && MACH_PORT_VALID(pport))
+                rebuilt = from_port(pport);
+            /* Prefer the authentic xpc_endpoint_create object from the
+             * pipe message. net29 always preferred the 4sim-rebuilt
+             * endpoint whenever the port was valid: Safari popped
+             * create_from_endpoint, skipped set_instance, and sent 30
+             * send_message_with_reply, but helpers saw 0 accepts, 0
+             * xpc events, and 0 replies. A 4sim-rebuilt endpoint can
+             * yield a live-looking connection that does not actually
+             * attach to the helper listener. Keep the send right
+             * either way (net28 deallocated it and Safari vanished).
+             * Use the rebuilt object only if the original is missing. */
+            int kept = 0;
+            const char *epsrc = "none";
+            if (ep && xpc_get_type(ep) == XPC_TYPE_ENDPOINT) {
+                xpc_retain(ep);
+                epsrc = "orig";
+                if (rebuilt)
+                    xpc_release(rebuilt);
+                rebuilt = NULL;
+            } else if (rebuilt) {
+                ep = rebuilt;
+                rebuilt = NULL;
+                epsrc = "rebuilt";
+            } else if (ep) {
+                xpc_retain(ep);
+                epsrc = "other";
+            }
+            if (MACH_PORT_VALID(pport)) {
+                p->ep_port = pport;
+                pport = MACH_PORT_NULL;
+                kept = 1;
+            }
+            macws_xpc_app_logf(
+                "pid=%d wk-peer recv-endpoint typ=%s port=0x%x port_typ=0x%x "
+                "rebuilt_used=%d src=%s kept_port=%d\n",
+                getpid(), eptyp, (unsigned)p->ep_port, ptyp,
+                epsrc[0]=='r' ? 1 : 0, epsrc, kept);
+            if (MACH_PORT_VALID(pport))
+                (void)mach_port_deallocate(mach_task_self(), pport);
+            if (ep) {
+                p->endpoint = ep;
+                p->done = 1;
+                macws_wk_destroy_rendezvous_recv(&p->recv);
+                macws_xpc_app_logf(
+                    "pid=%d wk-peer ready child=%d peer=%s leaf=%s\n",
+                    getpid(), (int)p->child, p->peer, p->leaf);
+                if (p->ready) dispatch_semaphore_signal(p->ready);
+            } else {
+                macws_xpc_app_logf(
+                    "pid=%d wk-peer recv-fail child=%d peer=%s prc=%d\n",
+                    getpid(), (int)p->child, p->peer, prc);
+                macws_wk_pending_fail_locked(p, 1);
+            }
+            if (msg) xpc_release(msg);
+        });
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)MACWS_WK_RV_GRACE_MS * NSEC_PER_MSEC),
+                   macws_wk_pool_queue(), ^{
+        if (p->done != 0) return;
+        macws_xpc_app_logf(
+            "pid=%d wk-peer grace-timeout child=%d peer=%s grace_ms=%d\n",
+            getpid(), (int)p->child, p->peer, MACWS_WK_RV_GRACE_MS);
+        /* Destroy recv to unblock pipe_receive only after the grace
+         * period, so a slower WebContent can still look the name up. */
+        macws_wk_pending_fail_locked(p, 1);
+    });
+}
+
+/* Register + posix_spawn only. The receive right stays alive until the
+ * child sends an endpoint or MACWS_WK_RV_GRACE_MS elapses. */
+static macws_wk_pending_t *macws_wk_start_peer_locked(const char *activate,
+                                                      const char *leaf) {
+    if (!activate || !leaf) return NULL;
+    macws_wk_pending_t *slot = NULL;
+    for (int i = 0; i < MACWS_WK_PENDING_MAX; i++) {
+        if (!g_macws_wk_pending[i].in_use) {
+            slot = &g_macws_wk_pending[i];
+            break;
+        }
+    }
+    if (!slot) {
+        macws_xpc_app_logf("pid=%d wk-peer pool-full leaf=%s\n", getpid(), leaf);
+        return NULL;
+    }
+    memset(slot, 0, sizeof(*slot));
+
+    char peer[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1];
+    macws_wk_peer_make_name(peer, sizeof(peer));
+    if (!macws_wk_peer_name_valid(peer)) {
+        macws_xpc_app_logf("pid=%d wk-peer name-invalid\n", getpid());
+        return NULL;
+    }
+
+    char path[PATH_MAX];
+    if (macws_wk_proxy_executable_path(leaf, path, sizeof(path)) != 0) {
+        macws_xpc_app_logf("pid=%d wk-peer path-fail leaf=%s errno=%d\n",
+                           getpid(), leaf, errno);
+        return NULL;
+    }
+
+    char **envp = macws_wk_peer_envp(peer);
+    if (!envp) return NULL;
+
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) {
+        macws_wk_peer_envp_free(envp);
+        return NULL;
+    }
+    mach_port_t rvrecv = MACH_PORT_NULL;
+    kern_return_t kr = mach_port_allocate(
+        mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rvrecv);
+    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(rvrecv)) {
+        posix_spawnattr_destroy(&attr);
+        macws_wk_peer_envp_free(envp);
+        macws_xpc_app_logf("pid=%d wk-peer rv-alloc kr=%d\n",
+                           getpid(), (int)kr);
+        return NULL;
+    }
+    kr = mach_port_insert_right(mach_task_self(), rvrecv, rvrecv,
+                                MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) {
+        (void)mach_port_mod_refs(mach_task_self(), rvrecv,
+                                 MACH_PORT_RIGHT_RECEIVE, -1);
+        posix_spawnattr_destroy(&attr);
+        macws_wk_peer_envp_free(envp);
+        macws_xpc_app_logf("pid=%d wk-peer rv-insert kr=%d\n",
+                           getpid(), (int)kr);
+        return NULL;
+    }
+    /* Publish a send right under the unique name without giving the
+     * receive to launchd (chroot probe: typ stays 0x30000). The 0755
+     * proxy may not inherit slot 1; the helper can look this up after
+     * exec. Not a public macosbooter check-in. */
+    kr = macws_bootstrap_register_raw(bootstrap_port, peer, rvrecv);
+    macws_xpc_app_logf("pid=%d wk-peer register kr=%d peer=%s recv=0x%x\n",
+                       getpid(), (int)kr, peer, (unsigned)rvrecv);
+    if (kr != KERN_SUCCESS) {
+        macws_xpc_app_logf("pid=%d wk-peer register-fail; trying slots only\n",
+                           getpid());
+    }
+
+    mach_port_array_t pports = NULL;
+    mach_msg_type_number_t pcount = 0;
+    (void)mach_ports_lookup(mach_task_self(), &pports, &pcount);
+    mach_port_t slots[3] = { MACH_PORT_NULL, MACH_PORT_NULL, MACH_PORT_NULL };
+    if (pports && pcount > 0)
+        slots[0] = pports[0];
+    slots[MACWS_WK_RV_SLOT] = rvrecv;
+    if (pports && pcount > 2)
+        slots[2] = pports[2];
+    int sprc = posix_spawnattr_set_registered_ports_np(&attr, slots, 3);
+    if (pports) {
+        (void)vm_deallocate(mach_task_self(), (vm_address_t)pports,
+                            pcount * sizeof(*pports));
+        pports = NULL;
+    }
+    if (sprc != 0) {
+        macws_wk_destroy_rendezvous_recv(&rvrecv);
+        posix_spawnattr_destroy(&attr);
+        macws_wk_peer_envp_free(envp);
+        macws_xpc_app_logf("pid=%d wk-peer set-ports rc=%d errno=%d\n",
+                           getpid(), sprc, errno);
+        return NULL;
+    }
+
+    char *argv[] = { path, NULL };
+    pid_t child = 0;
+    int rc = posix_spawn(&child, path, NULL, &attr, argv, envp);
+    posix_spawnattr_destroy(&attr);
+    macws_wk_peer_envp_free(envp);
+    macws_xpc_app_logf(
+        "pid=%d wk-peer spawn rc=%d errno=%d child=%d leaf=%s peer=%s path=%s\n",
+        getpid(), rc, rc ? errno : 0, (int)child, leaf, peer, path);
+    if (rc != 0 || child <= 0) {
+        macws_wk_destroy_rendezvous_recv(&rvrecv);
+        return NULL;
+    }
+
+    slot->in_use = 1;
+    slot->done = 0;
+    slot->taken = 0;
+    slot->child = child;
+    slot->recv = rvrecv;
+    snprintf(slot->leaf, sizeof(slot->leaf), "%s", leaf);
+    snprintf(slot->peer, sizeof(slot->peer), "%s", peer);
+    slot->ready = dispatch_semaphore_create(0);
+    slot->endpoint = NULL;
+    macws_wk_arm_pending_receive(slot);
+    return slot;
+}
+
+static void macws_wk_prewarm_if_needed(void) {
+    static _Atomic int started = 0;
+    if (atomic_exchange_explicit(&started, 1, memory_order_acq_rel))
+        return;
+    macws_xpc_app_logf("pid=%d wk-peer prewarm wc=%d net=1 gpu=1 sandbox=1\n",
+                       getpid(), MACWS_WK_POOL_WEBCONTENT);
+    dispatch_sync(macws_wk_pool_queue(), ^{
+        for (int i = 0; i < MACWS_WK_POOL_WEBCONTENT; i++)
+            (void)macws_wk_start_peer_locked(WEBKIT_WEBCONTENT_SERVICE_NEW,
+                                             "WebContentProxy.xpc");
+        (void)macws_wk_start_peer_locked(WEBKIT_NETWORKING_SERVICE_NEW,
+                                         "WebNetworkingProxy.xpc");
+        (void)macws_wk_start_peer_locked(WEBKIT_GPU_SERVICE_NEW,
+                                         "WebGPUProxy.xpc");
+        (void)macws_wk_start_peer_locked(SAFARI_SANDBOX_BROKER_SERVICE_NEW,
+                                         "SafariSandboxProxy.xpc");
+    });
+}
+
+static macws_wk_pending_t *macws_wk_claim_or_start_locked(const char *activate,
+                                                          const char *leaf) {
+    macws_wk_pending_t *ready = NULL;
+    macws_wk_pending_t *inflight = NULL;
+    for (int i = 0; i < MACWS_WK_PENDING_MAX; i++) {
+        macws_wk_pending_t *p = &g_macws_wk_pending[i];
+        if (!p->in_use || p->taken) continue;
+        if (strcmp(p->leaf, leaf) != 0) continue;
+        if (p->done == 1 && p->endpoint) {
+            ready = p;
+            break;
+        }
+        if (p->done == 0 && !inflight)
+            inflight = p;
+    }
+    macws_wk_pending_t *got = ready ? ready : inflight;
+    if (got && strcmp(leaf, "WebContentProxy.xpc") == 0) {
+        int unused = 0;
+        for (int i = 0; i < MACWS_WK_PENDING_MAX; i++) {
+            macws_wk_pending_t *p = &g_macws_wk_pending[i];
+            if (p->in_use && !p->taken && p != got &&
+                strcmp(p->leaf, leaf) == 0 && p->done != -1)
+                unused++;
+        }
+        if (unused < MACWS_WK_POOL_WEBCONTENT)
+            (void)macws_wk_start_peer_locked(activate, leaf);
+    }
+    if (got) return got;
+    return macws_wk_start_peer_locked(activate, leaf);
+}
+
+// Spawn (or take a pre-warmed) unique-name helper and connect via the
+// inherited / looked-up rendezvous port. iOS launchd/xpcproxy starts
+// the proxy without a SERVICE_SLOT receive right (field, net19). Do
+// not check in or listen on the public macosbooter.WebKit.* name.
+// Caller-thread wait is at most MACWS_WK_RV_POP_MS for a peer that
+// has usually already been starting in the parallel pool.
+static xpc_connection_t macws_xpc_spawn_webkit_peer(
+        const char *activate, const char *leaf, dispatch_queue_t targetq) {
+    if (!activate || !leaf) return NULL;
+    if (strcmp(activate, WEBKIT_WEBCONTENT_SERVICE_NEW) &&
+        strcmp(activate, WEBKIT_NETWORKING_SERVICE_NEW) &&
+        strcmp(activate, WEBKIT_GPU_SERVICE_NEW) &&
+        strcmp(activate, SAFARI_SANDBOX_BROKER_SERVICE_NEW))
+        return NULL;
+
+    macws_wk_prewarm_if_needed();
+
+    __block macws_wk_pending_t *slot = NULL;
+    dispatch_sync(macws_wk_pool_queue(), ^{
+        slot = macws_wk_claim_or_start_locked(activate, leaf);
+    });
+    if (!slot) return NULL;
+
+    __block int already_waited = 0;
+    dispatch_sync(macws_wk_pool_queue(), ^{
+        already_waited = macws_wk_leaf_already_waited_locked(leaf);
+    });
+    if (slot->done == 0 && already_waited) {
+        macws_xpc_app_logf(
+            "pid=%d wk-peer pop-timeout child=%d peer=%s leaf=%s "
+            "pop_ms=%d skipped (already waited; recv kept until grace)\n",
+            getpid(), (int)slot->child, slot->peer, leaf,
+            MACWS_WK_RV_POP_MS);
+        return NULL;
+    }
+    if (slot->done == 0 && slot->ready) {
+        long waited = dispatch_semaphore_wait(
+            slot->ready,
+            dispatch_time(DISPATCH_TIME_NOW,
+                          (int64_t)MACWS_WK_RV_POP_MS * NSEC_PER_MSEC));
+        if (waited != 0) {
+            dispatch_sync(macws_wk_pool_queue(), ^{
+                macws_wk_leaf_mark_waited_locked(leaf, 1);
+            });
+            macws_xpc_app_logf(
+                "pid=%d wk-peer pop-timeout child=%d peer=%s leaf=%s "
+                "pop_ms=%d (recv kept until grace)\n",
+                getpid(), (int)slot->child, slot->peer, leaf,
+                MACWS_WK_RV_POP_MS);
+            /* Do not SIGKILL and do not destroy recv here. The child may
+             * still reach xpc_main and send during the grace period. */
+            return NULL;
+        }
+    }
+
+    __block xpc_object_t endpoint = NULL;
+    __block pid_t child = 0;
+    char peerbuf[MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1];
+    peerbuf[0] = 0;
+    char *peerbufp = peerbuf;
+    dispatch_sync(macws_wk_pool_queue(), ^{
+        child = slot->child;
+        snprintf(peerbufp, MACWS_WK_PEER_PREFIX_LEN + MACWS_WK_PEER_HEX_LEN + 1,
+                 "%s", slot->peer);
+        if (slot->done == 1 && slot->endpoint && !slot->taken) {
+            endpoint = slot->endpoint;
+            slot->endpoint = NULL;
+            slot->taken = 1;
+            /* Leave slot->ep_port allocated. create_from_endpoint and
+             * the resulting connection may still name that send right. */
+            macws_wk_leaf_mark_waited_locked(leaf, 0);
+        }
+    });
+    if (!endpoint) {
+        macws_xpc_app_logf(
+            "pid=%d wk-peer pop-miss child=%d peer=%s leaf=%s\n",
+            getpid(), (int)child, peerbuf, leaf);
+        return NULL;
+    }
+
+    xpc_connection_t conn = xpc_connection_create_from_endpoint(endpoint);
+    xpc_release(endpoint);
+    if (conn && targetq)
+        xpc_connection_set_target_queue(conn, targetq);
+    macws_xpc_app_logf("pid=%d wk-peer connected peer=%s conn=%p child=%d\n",
+                       getpid(), peerbuf, conn, (int)child);
+    if (!conn) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, WNOHANG);
+        return NULL;
+    }
+    macws_xpc_remember_app_conn(conn, peerbuf);
+    return conn;
+}
+
+/* Public WebKit / Safari SandboxBroker names only. Not macosbooter.*
+ * remaps — those can re-enter this hook from create_fn fallback and
+ * must not start a second unique-name helper. */
+static const char *macws_wk_leaf_for_public_name(const char *name) {
+    if (!name) return NULL;
+    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
+        return "WebContentProxy.xpc";
+    if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
+        return "WebNetworkingProxy.xpc";
+    if (!strcmp(name, WEBKIT_GPU_SERVICE))
+        return "WebGPUProxy.xpc";
+    if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
+        return "SafariSandboxProxy.xpc";
+    return NULL;
+}
+
+static const char *macws_wk_activate_for_public_name(const char *name) {
+    if (!name) return NULL;
+    if (!strcmp(name, WEBKIT_WEBCONTENT_SERVICE))
+        return WEBKIT_WEBCONTENT_SERVICE_NEW;
+    if (!strcmp(name, WEBKIT_NETWORKING_SERVICE))
+        return WEBKIT_NETWORKING_SERVICE_NEW;
+    if (!strcmp(name, WEBKIT_GPU_SERVICE))
+        return WEBKIT_GPU_SERVICE_NEW;
+    if (!strcmp(name, SAFARI_SANDBOX_BROKER_SERVICE))
+        return SAFARI_SANDBOX_BROKER_SERVICE_NEW;
+    return NULL;
+}
+
+// ---------------------------------------------------------------------
+// Generic Application-type XPC activation through launchd-managed overlay
+// bundles (field notes §58/§59).
+//
+// Ventura xpc_main obtains its XPCService dictionary (launchd routine 718)
+// and its listener RECEIVE (bootstrap_check_in3) from iOS launchd by pid,
+// after exec. A receive right placed in SERVICE_SLOT cannot survive any exec
+// (xnu cloneproc → fresh IPC space), so the only working shape is the stock
+// one: a job in this client's process domain (xpc_add_bundle(path, 2)) whose
+// iOS first image (MacWSXPCProxy, 0755 + setuid .priv sibling) only crosses
+// into the chroot and execs the stock macOS executable with XPC_* unchanged.
+//
+// For a requested service name, look for <bundle>/XPCServices/<name>.xpc (or
+// an XPCServices entry whose identifier matches) in the main bundle and every
+// loaded framework/bundle. The host-side generator
+// (/var/jb/usr/macOS/bin/macws_xpc_overlay_gen.py) mirrors such bundles into
+//   host  /var/jb/usr/macOS/libexec/macws-xpc-overlay/<key>/<leaf>.xpc
+//   index /usr/local/var/macws-xpc-overlay/<key>   (chroot; content = id)
+// where <key> = FNV-1a-64 of the bundle's chroot realpath. The chroot cannot
+// see jbroot, so the index is the only existence check available here.
+// Register the overlay once, then fall through to the caller's stock create
+// with the ORIGINAL name: no macosbooter.* name, no LaunchDaemon, no listener.
+#define MACWS_XPC_OVERLAY_HOST_ROOT "/var/jb/usr/macOS/libexec/macws-xpc-overlay"
+#define MACWS_XPC_OVERLAY_INDEX "/usr/local/var/macws-xpc-overlay"
+#define MACWS_XPC_OVERLAY_DISABLE "/usr/local/etc/macws-xpc-overlay.disable"
+#define MACWS_XPC_OVERLAY_REQUESTS "/usr/local/var/macws-xpc-overlay-requests"
+
+static uint64_t macws_xpc_overlay_fnv1a64(const char *s) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (; s && *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Read the index marker for a bundle realpath. Returns 1 and fills id when
+// the overlay exists.
+// Index row: "<identifier>\t<bundle realpath>[\t<launchd alias>]\n". The
+// alias is set by the generator when iOS launchd reserves the identifier
+// (it denies every com.apple.WebKit.* pid-domain lookup with "Sandbox
+// restriction", field notes §60); the overlay bundle is registered under
+// the alias and the client connects to it.
+static int macws_xpc_overlay_index_read(const char *bundleReal, char *key,
+                                        size_t keysz, char *ident,
+                                        size_t identsz, char *alias,
+                                        size_t aliassz) {
+    snprintf(key, keysz, "%016llx",
+             (unsigned long long)macws_xpc_overlay_fnv1a64(bundleReal));
+    char marker[PATH_MAX];
+    snprintf(marker, sizeof(marker), "%s/%s", MACWS_XPC_OVERLAY_INDEX, key);
+    int fd = open(marker, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char row[PATH_MAX + 512];
+    ssize_t n = read(fd, row, sizeof(row) - 1);
+    close(fd);
+    if (n < 0) n = 0;
+    row[n] = 0;
+    char *nl = strchr(row, '\n');
+    if (nl) *nl = 0;
+    char *f2 = strchr(row, '\t');
+    if (f2) *f2++ = 0;
+    char *f3 = f2 ? strchr(f2, '\t') : NULL;
+    if (f3) *f3++ = 0;
+    snprintf(ident, identsz, "%s", row);
+    if (alias && aliassz) snprintf(alias, aliassz, "%s", f3 ? f3 : "");
+    return 1;
+}
+
+static void macws_xpc_overlay_request(const char *bundleReal) {
+    // Ask the host generator (next run) to mirror a bundle we found but
+    // could not activate. Append-only, best effort, never blocks.
+    int fd = open(MACWS_XPC_OVERLAY_REQUESTS,
+                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    if (fd < 0) return;
+    char line[PATH_MAX + 2];
+    int len = snprintf(line, sizeof(line), "%s\n", bundleReal);
+    if (len > 0) (void)write(fd, line, (size_t)len);
+    close(fd);
+}
+
+// Resolve <base>/XPCServices for one loaded image path. Frameworks:
+// dirname(image). Apps/bundles: the enclosing ".../Contents".
+static int macws_xpc_overlay_services_dir(const char *image, char *out,
+                                          size_t outsz) {
+    if (!image || image[0] != '/') return 0;
+    const char *contents = strstr(image, ".app/Contents/");
+    if (!contents) contents = strstr(image, ".bundle/Contents/");
+    if (!contents) contents = strstr(image, ".appex/Contents/");
+    if (!contents) contents = strstr(image, ".xpc/Contents/");
+    if (contents) {
+        const char *c = strstr(contents, "/Contents/");
+        size_t n = (size_t)(c - image) + strlen("/Contents");
+        if (n + strlen("/XPCServices") + 1 > outsz) return 0;
+        memcpy(out, image, n);
+        out[n] = 0;
+        strlcat(out, "/XPCServices", outsz);
+        return 1;
+    }
+    if (!strstr(image, ".framework/")) return 0;
+    const char *slash = strrchr(image, '/');
+    if (!slash) return 0;
+    size_t n = (size_t)(slash - image);
+    if (n + strlen("/XPCServices") + 1 > outsz) return 0;
+    memcpy(out, image, n);
+    out[n] = 0;
+    strlcat(out, "/XPCServices", outsz);
+    return 1;
+}
+
+typedef struct {
+    char name[160];
+    char alias[192]; // launchd identifier when it differs from name
+    int state; // 1 = registered overlay, -1 = no overlay
+} MacWSXpcOverlayCacheEntry;
+#define MACWS_XPC_OVERLAY_CACHE_MAX 64
+static MacWSXpcOverlayCacheEntry g_macws_xpc_overlay_cache[MACWS_XPC_OVERLAY_CACHE_MAX];
+static int g_macws_xpc_overlay_cache_n = 0;
+static pthread_mutex_t g_macws_xpc_overlay_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int macws_xpc_overlay_try_dir(const char *servicesDir,
+                                     const char *name, char *hostPath,
+                                     size_t hostsz, char *real,
+                                     size_t realsz, char *alias,
+                                     size_t aliassz) {
+    char ident[192];
+    char key[32];
+    char candidate[PATH_MAX];
+    struct stat st;
+    // Fast path: <name>.xpc.
+    snprintf(candidate, sizeof(candidate), "%s/%s.xpc", servicesDir, name);
+    if (stat(candidate, &st) == 0 && S_ISDIR(st.st_mode) &&
+        realpath(candidate, real)) {
+        if (macws_xpc_overlay_index_read(real, key, sizeof(key), ident,
+                                         sizeof(ident), alias, aliassz)) {
+            const char *leaf = strrchr(real, '/');
+            snprintf(hostPath, hostsz, "%s/%s%s", MACWS_XPC_OVERLAY_HOST_ROOT,
+                     key, leaf ? leaf : "/x.xpc");
+            return 1;
+        }
+        macws_xpc_overlay_request(real);
+        return -1;
+    }
+    // Slow path: an XPCServices entry whose identifier (from the index) is
+    // the requested name.
+    DIR *d = opendir(servicesDir);
+    if (!d) return 0;
+    int result = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t len = strlen(e->d_name);
+        if (len < 5 || strcmp(e->d_name + len - 4, ".xpc")) continue;
+        snprintf(candidate, sizeof(candidate), "%s/%s", servicesDir,
+                 e->d_name);
+        if (!realpath(candidate, real)) continue;
+        if (!macws_xpc_overlay_index_read(real, key, sizeof(key), ident,
+                                          sizeof(ident), alias, aliassz))
+            continue;
+        if (strcmp(ident, name)) continue;
+        const char *leaf = strrchr(real, '/');
+        snprintf(hostPath, hostsz, "%s/%s%s", MACWS_XPC_OVERLAY_HOST_ROOT,
+                 key, leaf ? leaf : "/x.xpc");
+        result = 1;
+        break;
+    }
+    closedir(d);
+    (void)realsz;
+    return result;
+}
+
+__attribute__((visibility("hidden")))
+int macws_xpc_overlay_supersedes_tsv(const char *name) {
+    return name && macws_xpc_app_services_lookup(name) != NULL;
+}
+
+// Returns 1 when an overlay bundle for `name` is registered in this
+// process's launchd domain (now or earlier); the caller then performs the
+// stock xpc_connection_create(name) unchanged.
+__attribute__((visibility("hidden")))
+int macws_xpc_overlay_activate(const char *name) {
+    if (!name || !name[0] || strlen(name) >= 160) return 0;
+    if (!strncmp(name, "com.apple.macosbooter.", 22) ||
+        !strncmp(name, "com.macwsguide.wk.", 18))
+        return 0;
+    pthread_mutex_lock(&g_macws_xpc_overlay_mu);
+    for (int i = 0; i < g_macws_xpc_overlay_cache_n; i++) {
+        if (!strcmp(g_macws_xpc_overlay_cache[i].name, name)) {
+            int st = g_macws_xpc_overlay_cache[i].state;
+            pthread_mutex_unlock(&g_macws_xpc_overlay_mu);
+            return st > 0;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_xpc_overlay_mu);
+
+    if (access(MACWS_XPC_OVERLAY_DISABLE, F_OK) == 0) return 0;
+    // Services with a dedicated MacWS proxy/listener keep that route.
+    static const char *const dedicated[] = {
+        "com.apple.dock.helper", "com.apple.FileCoordination",
+        "com.apple.ProgressReporting", "com.apple.quicklook.satellite",
+        "com.apple.geod", "com.apple.carboncore.csnameddata",
+        "com.apple.ViewBridgeAuxiliary", "com.apple.extensionkitservice",
+        "com.apple.hiservices-xpcservice", "com.apple.authd",
+    };
+    for (size_t i = 0; i < sizeof(dedicated) / sizeof(dedicated[0]); i++)
+        if (!strcmp(name, dedicated[i])) return 0;
+    // Names with an explicit chroot remap (private Mach listeners such as
+    // cfprefsd/lsd/iconservices) keep their established route. Rows of the
+    // Application-type TSV (WebKit) are superseded by the overlay route.
+    if (!macws_xpc_app_services_lookup(name) &&
+        macws_private_bootstrap_service_name(name) != name)
+        return 0;
+
+    char hostPath[PATH_MAX];
+    char real[PATH_MAX];
+    char alias[192] = "";
+    char servicesDir[PATH_MAX];
+    char seen[24][PATH_MAX / 4];
+    int nseen = 0;
+    int found = 0;
+    uint32_t count = _dyld_image_count();
+    // Image 0 is the main executable: its bundle wins over frameworks.
+    for (uint32_t i = 0; i < count && found == 0; i++) {
+        const char *image = _dyld_get_image_name(i);
+        if (!macws_xpc_overlay_services_dir(image, servicesDir,
+                                            sizeof(servicesDir)))
+            continue;
+        int dup = 0;
+        for (int k = 0; k < nseen; k++)
+            if (!strncmp(seen[k], servicesDir, sizeof(seen[k]) - 1)) dup = 1;
+        if (dup) continue;
+        if (nseen < 24)
+            snprintf(seen[nseen++], sizeof(seen[0]), "%s", servicesDir);
+        struct stat st;
+        if (stat(servicesDir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        int r = macws_xpc_overlay_try_dir(servicesDir, name, hostPath,
+                                          sizeof(hostPath), real,
+                                          sizeof(real), alias,
+                                          sizeof(alias));
+        if (r != 0) found = r;
+    }
+
+    pthread_mutex_lock(&g_macws_xpc_overlay_mu);
+    int already = 0;
+    for (int i = 0; i < g_macws_xpc_overlay_cache_n; i++)
+        if (!strcmp(g_macws_xpc_overlay_cache[i].name, name)) already = 1;
+    if (!already && g_macws_xpc_overlay_cache_n < MACWS_XPC_OVERLAY_CACHE_MAX) {
+        MacWSXpcOverlayCacheEntry *e =
+            &g_macws_xpc_overlay_cache[g_macws_xpc_overlay_cache_n++];
+        snprintf(e->name, sizeof(e->name), "%s", name);
+        snprintf(e->alias, sizeof(e->alias), "%s", found > 0 ? alias : "");
+        e->state = found > 0 ? 1 : -1;
+    }
+    pthread_mutex_unlock(&g_macws_xpc_overlay_mu);
+    if (already) return found > 0;
+
+    if (found > 0) {
+        macws_xpc_app_logf(
+            "pid=%d overlay add_bundle name=%s alias=%s bundle=%s host=%s\n",
+            getpid(), name, alias[0] ? alias : "-", real, hostPath);
+        xpc_add_bundle(hostPath, 2);
+        macws_issue_mach_extension_unchecked(alias[0] ? alias : name);
+        return 1;
+    }
+    if (found < 0)
+        macws_xpc_app_logf(
+            "pid=%d overlay missing name=%s bundle=%s (requested)\n",
+            getpid(), name, real);
+    return 0;
+}
+
+// Name to pass to the stock create after macws_xpc_overlay_activate(name)
+// returned 1: the generator's launchd alias, or `name` itself.
+__attribute__((visibility("hidden")))
+const char *macws_xpc_overlay_service_name(const char *name) {
+    if (!name) return name;
+    const char *out = name;
+    pthread_mutex_lock(&g_macws_xpc_overlay_mu);
+    for (int i = 0; i < g_macws_xpc_overlay_cache_n; i++) {
+        if (!strcmp(g_macws_xpc_overlay_cache[i].name, name)) {
+            if (g_macws_xpc_overlay_cache[i].state > 0 &&
+                g_macws_xpc_overlay_cache[i].alias[0])
+                out = g_macws_xpc_overlay_cache[i].alias;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_xpc_overlay_mu);
+    return out;
+}
+
+xpc_connection_t macws_xpc_create_application_service(
+        const char *name, dispatch_queue_t targetq,
+        xpc_connection_t (*create_fn)(const char *, dispatch_queue_t)) {
+    if (!name || !create_fn) return NULL;
+    {
+        static _Atomic unsigned macws_app_xpc_trace = 0;
+        unsigned n = atomic_fetch_add_explicit(&macws_app_xpc_trace, 1,
+                                               memory_order_relaxed);
+        if (n < 64) {
+            int fd = open("/tmp/macws-xpc-app.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                char line[320];
+                int len = snprintf(line, sizeof(line),
+                    "pid=%d app-xpc name=%s\n", getpid(), name);
+                if (len > 0) (void)write(fd, line, (size_t)len);
+                close(fd);
+            }
+        }
+    }
+    const MacWSXpcAppServiceRow *row = macws_xpc_app_services_lookup(name);
+    const char *leaf = macws_wk_leaf_for_public_name(name);
+    const char *activate = macws_wk_activate_for_public_name(name);
+    // Unique-name spawn for WebKit / SandboxBroker only, and *before*
+    // the TSV-hit add_bundle / create_fn return so iOS launchd is not
+    // also asked to start a helper with no receive right. Other TSV
+    // rows are unchanged. Skip xpc_add_bundle on the success path.
+    if (leaf && activate) {
+        xpc_connection_t spawned =
+            macws_xpc_spawn_webkit_peer(activate, leaf, targetq);
+        if (spawned) return spawned;
+        macws_xpc_app_logf(
+            "pid=%d wk-peer fallback activate=%s leaf=%s tsv=%s\n",
+            getpid(), activate, leaf, row ? "hit" : "miss");
+    }
+    if (row) {
+        macws_register_xpc_app_proxy_bundle(row->relativeProxy);
+        {
+            int fd = open("/tmp/macws-xpc-app.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                char line[400];
+                int len = snprintf(line, sizeof(line),
+                    "pid=%d TSV-hit orig=%s activate=%s proxy=%s\n",
+                    getpid(), row->original, row->privateName,
+                    row->relativeProxy);
+                if (len > 0) (void)write(fd, line, (size_t)len);
+                close(fd);
+            }
+        }
+        macws_issue_macosbooter_mach_extension(row->privateName);
+        xpc_connection_t conn = create_fn(row->privateName, targetq);
+        macws_xpc_app_logf("pid=%d created activate=%s conn=%p\n",
+                           getpid(), row->privateName, conn);
+        macws_xpc_remember_app_conn(conn, row->privateName);
+        return conn;
+    }
+    // Hardcoded WebKit / Safari SandboxBroker bootstrap when the TSV is
+    // missing. Spawn already tried above for public names.
+    if (!leaf) return NULL;
+    if (!activate)
+        activate = name;
+    macws_register_webkit_bundle_if_needed(leaf);
+    // Fallback: previous add_bundle + macosbooter name activation.
+    // Avoids colliding with iOS WebKit peers that own the public names.
+    // Seatbelt: macws_sandbox_check_* allows com.apple.macosbooter.* lookups
+    // for all libmachook chroot processes (system-level, not per-app re-sign).
+    macws_issue_macosbooter_mach_extension(activate);
+    xpc_connection_t conn = create_fn(activate, targetq);
+    macws_xpc_app_logf("pid=%d created activate=%s conn=%p leaf=%s\n",
+                       getpid(), activate, conn, leaf);
+    macws_xpc_remember_app_conn(conn, activate);
+    return conn;
+}
+
 #define GEOD_XPC_SERVICE "com.apple.geod"
 #define GEOD_XPC_SERVICE_NEW "com.apple.macosbooter.geod"
 #define DISKARBITRATIOND_SERVICE_ORIG \
@@ -14295,6 +16845,11 @@ static const char *macws_private_bootstrap_lsd_service_name(const char *name) {
 
 static const char *macws_private_bootstrap_service_name(const char *name) {
     if (!name) return name;
+    // Generic TSV Application-type remaps (same table as xpc_connection_create).
+    {
+        const MacWSXpcAppServiceRow *row = macws_xpc_app_services_lookup(name);
+        if (row) return row->privateName;
+    }
     // The settings-extension launch proxy is the first iOS image submitted to
     // RunningBoard, so launchd allocates its managed endpoints under the proxy
     // unique bundle identifier. Ventura derives each peer name from the real
@@ -14435,6 +16990,10 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
     // com.apple.geod executable.
     if (!strcmp(name, GEOD_XPC_SERVICE))
         return GEOD_XPC_SERVICE_NEW;
+    // WebKit/Safari SandboxBroker: do not bootstrap-remap to macosbooter.*;
+    // Application-type activation keeps the stock name for seatbelt checks
+    // (see macws_xpc_create_application_service).
+
     // CoreFoundation's Ventura _CFVolumeObserver asks DiskArbitration for the
     // initial mounted-volume set and a terminal "existing events received"
     // event.  Runtime sampling of the stock Ventura sharedfilelistd on
@@ -14461,6 +17020,10 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return HISERVICES_SERVICE_NEW;
     if (!strcmp(name, AUTHD_SERVICE_ORIG))
         return AUTHD_SERVICE_NEW;
+    if (!strcmp(name, TRUSTD_SERVICE_ORIG))
+        return TRUSTD_SERVICE_NEW;
+    if (!strcmp(name, SECURITYSERVER_SERVICE_ORIG))
+        return SECURITYSERVER_SERVICE_NEW;
     // RE-confirmed against Ventura 13.4 DesktopServicesPriv at
     // TDSHelperContext::LaunchDesktopServicesHelper +0x7c..+0xa8: Finder
     // resolves this exact launchd Mach service before sending its Handshake.
@@ -15107,6 +17670,7 @@ kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_
     macws_trace_xpc_name("bootstrap_look_up", originalName);
     if (name != originalName)
         macws_trace_xpc_name("bootstrap_look_up.mapped", name);
+    bool carender = originalName && strstr(originalName, "CARenderServer");
     bool steamRendezvous =
         macws_is_steam_mach_rendezvous_name(originalName);
     // The iPadOS bootstrap namespace cannot provide Chromium's per-browser
@@ -15122,6 +17686,24 @@ kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_
     if (!steamRendezvous && result != KERN_SUCCESS)
         result = macws_steam_mach_rendezvous_look_up(
             originalName, sp, result);
+    if (carender || macws_is_webcontent_process()) {
+        bool should_log = carender;
+        if (!should_log) {
+            static _Atomic unsigned n;
+            should_log = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed) < 48;
+        }
+        if (should_log) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "bootstrap_look_up '%s'%s%s%s -> %#x port=%#x",
+                     originalName ?: "(null)",
+                     name != originalName ? " -> '" : "",
+                     name != originalName ? name : "",
+                     name != originalName ? "'" : "",
+                     result, sp ? *sp : MACH_PORT_NULL);
+            macws_paint_log(msg);
+        }
+    }
     if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr,
                 "#### BOOTSTRAP look_up '%s'%s%s%s -> %#x port=%#x\n",
@@ -15362,6 +17944,14 @@ xpc_connection_t macws_xpc_connection_create_early(
         return macws_xpc_connection_create_mach_service_raw(
             AUTHD_SERVICE_NEW, targetq, 0);
     }
+    if (name && !strcmp(name, TRUSTD_SERVICE_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            TRUSTD_SERVICE_NEW, targetq, 0);
+    }
+    if (name && !strcmp(name, SECURITYSERVER_SERVICE_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            SECURITYSERVER_SERVICE_NEW, targetq, 0);
+    }
     // CarbonCore resolves its named-data helper with xpc_connection_create,
     // not the Mach-service constructor used by lsd/IconServices. Route this
     // early static-interpose entry point explicitly so Dock cannot cache a
@@ -15397,6 +17987,19 @@ xpc_connection_t macws_xpc_connection_create_early(
         return macws_xpc_connection_create_mach_service_raw(
             GEOD_XPC_SERVICE_NEW, targetq, 0);
     }
+    // Generic Application-type XPC: launchd-managed overlay bundle in this
+    // process's domain, then the stock create under the ORIGINAL name.
+    if (macws_xpc_overlay_activate(name))
+        return xpc_connection_create(macws_xpc_overlay_service_name(name),
+                                     targetq);
+    // Application-type XPC (WebKit/Safari + TSV): activate via xpc_add_bundle
+    // under the stock name when possible so App Sandbox mach-lookup sees the
+    // original id. Shared-cache callers also take this path via Metal_hooks.
+    {
+        xpc_connection_t app = macws_xpc_create_application_service(
+            name, targetq, xpc_connection_create);
+        if (app) return app;
+    }
     return xpc_connection_create(name, targetq);
 }
 
@@ -15416,6 +18019,15 @@ void macws_xpc_connection_set_instance_early(
         // runtime-confirmed to deliver "Connection invalid" before the
         // listener saw a peer. Consume only this activation metadata; the
         // stock setup/request dictionaries and reply protocol remain intact.
+        return;
+    }
+    /* Unique-peer connections are already bound via create_from_endpoint.
+     * An instance UUID is launchd MultipleInstances metadata and does
+     * not apply; forwarding it can invalidate the endpoint peer. */
+    const char *wkPeer = macws_xpc_lookup_app_conn_name(connection);
+    if (wkPeer && !strncmp(wkPeer, "com.macwsguide.wk.i.", 20)) {
+        macws_xpc_app_logf("pid=%d wk-peer skip-set-instance peer=%s\n",
+                           getpid(), wkPeer);
         return;
     }
     macws_xpc_connection_set_instance_raw(connection, instance);
@@ -15510,6 +18122,129 @@ static BOOL macws_install_qlsatellite_connection_owner(void) {
 // pass each connection to the original service handler.  Listener-name
 // requests, anonymous sublisteners, replies and protocol delegates remain the
 // unmodified Ventura implementations.
+// Function pointer (xpc_connection_handler_t is not a block type).
+// One xpc_main per process; the captured user handler is process-local.
+// After the setuid proxy execve, classic environ may have been overwritten
+// by libxpc unpacking xpcproxy's packed launch context (binprefs / registered
+// ports). On a real Mac, Application-type WebKit helpers keep XPC_FLAGS=8019
+// and stock xpc_main consumes the one-shot receive right from
+// mach_ports_lookup. Re-apply 8019 immediately before stock xpc_main and
+// inventory the inherited rights. Do not bootstrap_check_in the public
+// macosbooter name.
+#if !defined(MACWS_HAS_MACH_PORTS_LOOKUP)
+extern kern_return_t mach_ports_lookup(
+    task_t target_task, mach_port_array_t *init_port_set,
+    mach_msg_type_number_t *init_port_setCnt);
+#endif
+
+static int macws_xpc_flags_are_zero(const char *value) {
+    if (!value || !*value) return 1;
+    if (value[0] == '0' && (value[1] == 'x' || value[1] == 'X'))
+        value += 2;
+    if (!*value) return 1;
+    while (*value) {
+        if (*value != '0') return 0;
+        value++;
+    }
+    return 1;
+}
+
+static int macws_webkit_reapply_packed_xpc_flags(void) {
+    char msg[400];
+    mach_port_array_t ports = NULL;
+    mach_msg_type_number_t count = 0;
+    kern_return_t kr = mach_ports_lookup(mach_task_self(), &ports, &count);
+    int recv = 0;
+    int used = snprintf(msg, sizeof(msg), "ports_lookup kr=%d count=%u",
+                        (int)kr, (unsigned)count);
+    if (kr == KERN_SUCCESS && ports) {
+        for (mach_msg_type_number_t i = 0; i < count; i++) {
+            mach_port_type_t typ = 0;
+            kern_return_t tr = mach_port_type(mach_task_self(), ports[i], &typ);
+            int isrecv = (tr == KERN_SUCCESS &&
+                          (typ & MACH_PORT_TYPE_RECEIVE) != 0);
+            if (isrecv) recv++;
+            if (used > 0 && (size_t)used + 48 < sizeof(msg)) {
+                int w = snprintf(msg + used, sizeof(msg) - (size_t)used,
+                                 " [%u]=0x%x typ=0x%x%s",
+                                 (unsigned)i, (unsigned)ports[i],
+                                 (unsigned)typ, isrecv ? " RECV" : "");
+                if (w > 0) used += w;
+            }
+        }
+        // The names stay registered on the task; only the returned array
+        // is vm-allocated.
+        (void)vm_deallocate(mach_task_self(), (vm_address_t)ports,
+                            (vm_size_t)count * sizeof(*ports));
+    }
+    macws_webkit_init_log(msg);
+
+    used = snprintf(msg, sizeof(msg), "inherited_fds");
+    for (int fd = 0; fd < 32; fd++) {
+        if (fcntl(fd, F_GETFD) < 0) continue;
+        if (used > 0 && (size_t)used + 8 < sizeof(msg)) {
+            int w = snprintf(msg + used, sizeof(msg) - (size_t)used, " %d", fd);
+            if (w > 0) used += w;
+        }
+    }
+    macws_webkit_init_log(msg);
+
+    mach_port_t bootstrap = MACH_PORT_NULL;
+    kr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT,
+                               &bootstrap);
+    snprintf(msg, sizeof(msg), "bootstrap_special kr=%d port=0x%x recv_rights=%d",
+             (int)kr, (unsigned)bootstrap, recv);
+    macws_webkit_init_log(msg);
+
+    // §60: no longer rewrite XPC_FLAGS to 8019. §58 showed the SERVICE_SLOT
+    // receive never survives exec, and stock xpc_main of a launchd-managed
+    // bundle job gets its listener from bootstrap_check_in3 with the
+    // launchd-provided flags (0x0). Forcing 8019 here made every overlay
+    // WebContent sit in xpc_main without ever accepting Safari's connection.
+    const char *flags = getenv("XPC_FLAGS");
+    snprintf(msg, sizeof(msg),
+             "kept XPC_FLAGS=%s before xpc_main recv_rights=%d",
+             flags && *flags ? flags : "(unset)", recv);
+    macws_webkit_init_log(msg);
+    (void)macws_xpc_flags_are_zero;
+    return recv;
+}
+
+static xpc_connection_handler_t g_macws_webkit_xpc_main_user;
+
+static void macws_webkit_xpc_main_connection(xpc_connection_t conn) {
+    char m[192];
+    int unique_in = macws_xpc_app_conn_is_unique_incoming(conn);
+    snprintf(m, sizeof(m),
+             "xpc_main accepted connection=%p main=%d target=%s "
+             "(InitializeWebProcess/CreateWebPage ride this conn)",
+             conn, pthread_main_np(),
+             unique_in ? "incoming-serial" : "main");
+    macws_webkit_init_log(m);
+    if (conn && macws_is_overlay_xpc_helper()) {
+        // §61: launchd-managed overlay helper == stock macOS xpcproxy
+        // contract. WebKit's XPCServiceEventHandler runs the bootstrap on
+        // the connection's own queue and dispatch_sync()s the initializer
+        // onto the main queue; retargeting the peer to main (or bouncing
+        // its events onto main) made that dispatch_sync trap with
+        // "already owned by current thread" (SIGTRAP in every WebContent
+        // and Networking, net39e). Leave queue and handler untouched.
+        (void)macws_overlay_remember_accepted;
+        if (g_macws_webkit_xpc_main_user)
+            g_macws_webkit_xpc_main_user(conn);
+        return;
+    }
+    if (conn) {
+        /* Unique accepted peers stay on a live background serial
+         * queue; the wrap bounces the stock handler onto main. */
+        xpc_connection_set_target_queue(
+            conn, unique_in ? macws_wk_unique_incoming_queue()
+                            : dispatch_get_main_queue());
+    }
+    if (g_macws_webkit_xpc_main_user)
+        g_macws_webkit_xpc_main_user(conn);
+}
+
 void macws_xpc_main(xpc_connection_handler_t handler) {
     const char *program = getprogname();
     const char *service = getenv("XPC_SERVICE_NAME");
@@ -15533,11 +18268,34 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
     } else if (program && strcmp(program, "authd") == 0 && service &&
                strcmp(service, "com.macwsguide.authd") == 0) {
         privateMachService = AUTHD_SERVICE_NEW;
+    } else if (program && strcmp(program, "trustd") == 0 && service &&
+               strcmp(service, "com.macwsguide.trustd") == 0) {
+        privateMachService = TRUSTD_SERVICE_NEW;
+    } else if (program && strcmp(program, "securityd") == 0 && service &&
+               strcmp(service, "com.macwsguide.securityd") == 0) {
+        privateMachService = SECURITYSERVER_SERVICE_NEW;
     } else if (program && strcmp(program, "QuickLookSatellite") == 0 &&
                service && strcmp(service,
                     "com.macwsguide.quicklook-satellite") == 0) {
         privateMachService = QUICKLOOK_SATELLITE_NEW;
         (void)macws_install_qlsatellite_connection_owner();
+    } else if (program &&
+               (!strcmp(program, "com.apple.WebKit.WebContent") ||
+                !strcmp(program, "com.apple.WebKit.Networking") ||
+                !strcmp(program, "com.apple.WebKit.GPU") ||
+                !strcmp(program, "com.apple.Safari.SandboxBroker"))) {
+        // Application-type (_MultipleInstances + _NSApplicationMain).
+        // xpc_add_bundle + the setuid proxy execve preserves xpcproxy's
+        // one-shot receive right in XPC_FLAGS / XPC_SERVICE_NAME. A new
+        // launchd Mach listener on the same macosbooter.* name check-in
+        // orphans that inherited connection: Safari already holds the
+        // xpcproxy port, WebContent sits in dispatch_main() with no
+        // peer, and InitializeWebProcess / CreateWebPage never arrive.
+        // Do not use the HIServices-style listener fallback here even
+        // when the service name matches. Stock xpc_main consumes the
+        // inherited context; the incoming-connection wrapper below puts
+        // the peer on the main queue (Apple xpcproxy policy).
+        privateMachService = NULL;
     }
     if (privateMachService && getuid() == 0 && geteuid() == 0) {
         xpc_connection_t listener =
@@ -15552,6 +18310,141 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
             xpc_connection_resume(listener);
             dispatch_main();
         }
+    }
+    // WebKit helpers: consume the inherited xpcproxy connection via stock
+    // xpc_main, and set the peer's target queue to main before the service
+    // handler installs its message callback. set_target_queue is called
+    // from this dylib (not a shared-cache interpose), so later
+    // InitializeWebProcess / CreateWebPage events meet WebKit's
+    // isMainThread assertion without hooking InitializeWebKit2 or adding
+    // a constructor main-queue dispatch_after.
+    if (macws_is_webkit_helper_process() && handler) {
+        const char *peer = getenv(MACWS_WK_PEER_ENV);
+        const int uniquePeer = macws_wk_peer_name_valid(peer);
+        // Fallback helpers still reconstitute Application-type flags
+        // for stock xpc_main. Unique peers have no inherited
+        // SERVICE_SLOT receive (proxy handshake: recv_rights=0,
+        // slot 2 empty). Do not advertise Application-type
+        // XPC_FLAGS=8019 to libxpc — the unsandboxed in-chroot
+        // probe delivered CONNECTION + dictionaries without those
+        // managed flags.
+        if (!uniquePeer)
+            (void)macws_webkit_reapply_packed_xpc_flags();
+        const char *flags = getenv("XPC_FLAGS");
+        if (uniquePeer && !macws_xpc_flags_are_zero(flags)) {
+            setenv("XPC_FLAGS", "0", 1);
+            flags = getenv("XPC_FLAGS");
+            macws_webkit_init_log(
+                "xpc_main WebKit unique peer cleared XPC_FLAGS "
+                "(no inherited receive, skip 8019 reconstitution)");
+        }
+        if (uniquePeer) {
+            // Drop a leftover service name before create(NULL) so the
+            // anonymous listener is not created as a named client of
+            // the unique peer (the unsandboxed probe had no
+            // XPC_SERVICE_NAME and got CONNECTION + dictionaries).
+            unsetenv("XPC_SERVICE_NAME");
+            macws_webkit_init_log(
+                "xpc_main WebKit unique peer omitted XPC_SERVICE_NAME "
+                "(anonymous listener, not a named service)");
+        }
+        const char *serviceNow = getenv("XPC_SERVICE_NAME");
+        char msg[320];
+        snprintf(msg, sizeof(msg),
+                 "xpc_main WebKit inherited path service=%s flags=%s "
+                 "uid=%d euid=%d peer=%s (no public macosbooter check-in)",
+                 serviceNow ? serviceNow : "(null)",
+                 flags ? flags : "(null)",
+                 (int)getuid(), (int)geteuid(),
+                 peer ? peer : "(null)");
+        macws_webkit_init_log(msg);
+        g_macws_webkit_xpc_main_user = handler;
+        if (uniquePeer) {
+            // Anonymous peer via xpc_connection_create(NULL) + endpoint over
+            // the inherited / looked-up rendezvous send right. Not a
+            // bootstrap name, and not a named Mach LISTENER / public
+            // macosbooter check-in (create_mach_service LISTENER on the
+            // unique name is not look-up-able in this chroot, net21).
+            //
+            // net26: Safari skipped set_instance, resumed, and
+            // send_message_with_reply on the create_from_endpoint conn,
+            // helpers had armed a handler and resumed, but 0 xpc event
+            // begin arrived. xpc_connection_create(NULL) is an
+            // anonymous LISTENER: the client attach shows up as
+            // XPC_TYPE_CONNECTION, and InitializeWebProcess dictionaries
+            // ride the accepted connection. net25/net26 handed the
+            // listener itself to WebKit's xpc_main handler (a
+            // dictionary callback) before endpoint-send, so accepts
+            // never reached a connection handler. Arm a CONNECTION
+            // accept handler, resume the listener, send the endpoint,
+            // drain with dispatch_main(), and hand only accepted
+            // connections to the stock handler. Do not call NSApp on
+            // this stack.
+            mach_port_t rv = macws_wk_rendezvous_send(peer);
+            /* Receive accepts on a live serial queue, not the main
+             * queue. The helper wrap of set_event_handler forces unique
+             * peers onto main; if the listener itself is on main,
+             * Safari can connect and send before dispatch_main() is
+             * draining. A same-chroot cross-process probe with
+             * libmachook delivered CONNECTION + dictionaries on a
+             * non-main serial queue (got_peer=2 got_msg=2). Incoming
+             * conns are still handed to WebKit and targeted at main. */
+            dispatch_queue_t lq = dispatch_queue_create(
+                "com.macwsguide.wk.peer-listener", DISPATCH_QUEUE_SERIAL);
+            xpc_connection_t listener = macws_xpc_connection_create_raw(
+                NULL, lq);
+            snprintf(msg, sizeof(msg),
+                     "xpc_main WebKit unique peer anonymous listener=%p "
+                     "rv=0x%x name=%s",
+                     listener, rv, peer);
+            macws_webkit_init_log(msg);
+            if (listener) {
+                macws_xpc_remember_unique_listener(listener, peer);
+                const char *peer_for_accept = peer;
+                macws_xpc_connection_set_event_handler_raw(listener, ^(xpc_object_t event) {
+                    if (event && xpc_get_type(event) == XPC_TYPE_CONNECTION) {
+                        xpc_connection_t incoming = (xpc_connection_t)event;
+                        char amsg[256];
+                        snprintf(amsg, sizeof(amsg),
+                                 "xpc_main WebKit unique peer incoming "
+                                 "connection=%p listener=%p",
+                                 incoming, listener);
+                        macws_webkit_init_log(amsg);
+                        macws_xpc_remember_app_conn(incoming, peer_for_accept);
+                        macws_webkit_xpc_main_connection(incoming);
+                    } else {
+                        const char *typ = "other";
+                        if (!event)
+                            typ = "null";
+                        else if (xpc_get_type(event) == XPC_TYPE_ERROR)
+                            typ = "error";
+                        char amsg[192];
+                        snprintf(amsg, sizeof(amsg),
+                                 "xpc_main WebKit unique peer listener "
+                                 "event type=%s", typ);
+                        macws_webkit_init_log(amsg);
+                    }
+                });
+                xpc_connection_resume(listener);
+                macws_webkit_init_log(
+                    "xpc_main WebKit unique peer listening for incoming "
+                    "connection");
+                xpc_object_t endpoint = xpc_endpoint_create(listener);
+                int src = macws_wk_send_peer_endpoint(endpoint, rv);
+                if (endpoint) xpc_release(endpoint);
+                snprintf(msg, sizeof(msg),
+                         "xpc_main WebKit unique peer endpoint-send rc=%d "
+                         "rv=0x%x",
+                         src, rv);
+                macws_webkit_init_log(msg);
+                macws_webkit_init_log(
+                    "xpc_main WebKit unique peer entering dispatch_main");
+                dispatch_main();
+            }
+            macws_webkit_init_log(
+                "xpc_main WebKit unique peer listener failed; stock xpc_main");
+        }
+        macws_xpc_main_raw(macws_webkit_xpc_main_connection);
     }
     macws_xpc_main_raw(handler);
 }
@@ -15591,6 +18484,18 @@ DYLD_INTERPOSE(macws_xpc_connection_create_mach_service_early,
                macws_xpc_connection_create_mach_service_raw);
 DYLD_INTERPOSE(macws_xpc_connection_set_instance_early,
                macws_xpc_connection_set_instance_raw);
+
+extern void macws_xpc_connection_set_event_handler_raw(
+    xpc_connection_t connection, xpc_handler_t handler)
+    __asm("_xpc_connection_set_event_handler");
+
+void macws_xpc_connection_set_event_handler_early(
+        xpc_connection_t connection, xpc_handler_t handler) {
+    macws_xpc_wrap_app_event_handler(
+        connection, handler, macws_xpc_connection_set_event_handler_raw);
+}
+DYLD_INTERPOSE(macws_xpc_connection_set_event_handler_early,
+               macws_xpc_connection_set_event_handler_raw);
 DYLD_INTERPOSE(macws_xpc_connection_create_listener_early,
                macws_xpc_connection_create_listener_raw);
 DYLD_INTERPOSE(macws_xpc_connection_create_early, xpc_connection_create);
@@ -16640,6 +19545,14 @@ DYLD_INTERPOSE(macws_IOSurfaceGetAddressFormatOfPlane,
 // CFGetTypeID == CFDictionaryGetTypeID, and (b) gate the rewrite on the
 // IOSurfaceName key being EXACTLY "CA Framebuffer" plus the FourCC's high byte
 // being 0x26 (Apple compression marker), which excludes every other surface.
+// MACWS_MEMDIAG purgeable census (Diagnostics/MacWSPurgeableDiag.m).
+extern IOSurfaceRef macws_purgediag_api_surface(IOSurfaceRef surface);
+extern void macws_purgediag_ioconnect(io_connect_t c, uint32_t selector,
+    const uint64_t *in, uint32_t inCnt, const uint64_t *out,
+    const uint32_t *outCnt, const void *outStruct, const size_t *outStructCnt,
+    IOReturn r, int isIOGPU, void *returnAddress);
+extern void macws_purgediag_release(io_connect_t c, uint32_t surfaceID,
+    IOReturn r);
 IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     bool traceIOSurfaceCreate = getenv("MACWS_IOSURF_TRACE") != NULL;
     if (traceIOSurfaceCreate) {
@@ -16779,7 +19692,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     // CoreImage sometimes passes a CFDictionary whose -objectForKey: is not a
     // real NSDictionary bridge — fall back to the raw CFDictionaryGetValue.
     if (CFGetTypeID(properties_cf) != CFDictionaryGetTypeID()) {
-        return IOSurfaceCreate(properties_cf);
+        return macws_purgediag_api_surface(IOSurfaceCreate(properties_cf));
     }
     CFNumberRef pfNum = (CFNumberRef)CFDictionaryGetValue(properties_cf,
         (const void *)CFSTR("IOSurfacePixelFormat"));
@@ -16795,7 +19708,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
         is_ca_fb = (CFStringCompare(name, CFSTR("CA Framebuffer"), 0) == kCFCompareEqualTo);
     }
     if (!(is_apple_compressed && is_ca_fb)) {
-        return IOSurfaceCreate(properties_cf);
+        return macws_purgediag_api_surface(IOSurfaceCreate(properties_cf));
     }
     // Rebuild as plain BGRA8 — drop the compression-metadata plane and the
     // private FourCC so MTLSimDriverHost can wrap it as MTLPixelFormatBGRA8Unorm.
@@ -16805,7 +19718,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     if (wNum && CFGetTypeID(wNum) == CFNumberGetTypeID()) CFNumberGetValue(wNum, kCFNumberSInt32Type, &w);
     if (hNum && CFGetTypeID(hNum) == CFNumberGetTypeID()) CFNumberGetValue(hNum, kCFNumberSInt32Type, &h);
     if (w <= 0 || h <= 0) {
-        return IOSurfaceCreate(properties_cf);
+        return macws_purgediag_api_surface(IOSurfaceCreate(properties_cf));
     }
     const int bpe = 4;                         // BGRA8 = 4 bytes/pixel
     size_t bytesPerRow = (size_t)w * (size_t)bpe;
@@ -16840,7 +19753,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     IOSurfaceRef result = IOSurfaceCreate((CFDictionaryRef)np);
     fprintf(stderr, "#### IOSURF/CA_FB rewrote %dx%d pf=0x%x->BGRA8 result=%p\n",
         w, h, pf, (void *)result);
-    return result;
+    return macws_purgediag_api_surface(result);
 }
 DYLD_INTERPOSE(IOSurfaceCreate_safe, IOSurfaceCreate);
 
@@ -17408,11 +20321,13 @@ static struct macws_agx_t82_request
     g_macwsAgxT82Requests[MACWS_AGX_T82_REQUEST_CAP];
 static uint64_t g_macwsAgxT82RequestSequence;
 
+extern BOOL macws_memdiag_enabled(void);
 static bool macws_agx_life_diagnostics_enabled(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
         value = macws_runtime_diagnostics_enabled() ||
+            macws_memdiag_enabled() ||
             getenv("MACWS_AGX_LIFE_VERBOSE") != NULL ||
             macws_iogpu_error_diag_enabled() ||
             macws_submit_ring_enabled() ||
@@ -17613,6 +20528,38 @@ static void macws_agx_life_destroy(uint64_t gid, IOReturn kr) {
                                           surface_id, bytes, kr);
     }
     pthread_mutex_unlock(&g_agxLifeLock);
+}
+
+// MACWS_MEMDIAG periodic summary of the kernel-accepted IOGPU resource
+// lifecycle table above.  Returns the formatted length, or 0 when the
+// lifecycle table is not being maintained in this process.
+int macws_agx_life_memdiag_format(char *buffer, size_t length) {
+    if (!buffer || length == 0 || !macws_agx_life_diagnostics_enabled())
+        return 0;
+    pthread_mutex_lock(&g_agxLifeLock);
+    uint64_t live_total = 0, bytes_total = 0;
+    for (unsigned i = 0; i < 256; i++) {
+        live_total += g_agxLifeLive[i];
+        bytes_total += g_agxLifeBytes[i];
+    }
+    int written = snprintf(buffer, length,
+        "live=%llu/%lluMB t0=%llu/%lluMB t80=%llu/%lluMB t82=%llu/%lluMB "
+        "okC=%llu okD=%llu failC=%llu unmatchedD=%llu full=%llu",
+        (unsigned long long)live_total,
+        (unsigned long long)(bytes_total >> 20),
+        (unsigned long long)g_agxLifeLive[0],
+        (unsigned long long)(g_agxLifeBytes[0] >> 20),
+        (unsigned long long)g_agxLifeLive[0x80],
+        (unsigned long long)(g_agxLifeBytes[0x80] >> 20),
+        (unsigned long long)g_agxLifeLive[0x82],
+        (unsigned long long)(g_agxLifeBytes[0x82] >> 20),
+        (unsigned long long)g_agxLifeCreateOK,
+        (unsigned long long)g_agxLifeDestroyOK,
+        (unsigned long long)g_agxLifeCreateFail,
+        (unsigned long long)g_agxLifeUnmatchedDestroy,
+        (unsigned long long)g_agxLifeTableFull);
+    pthread_mutex_unlock(&g_agxLifeLock);
+    return written > 0 ? written : 0;
 }
 
 static const struct macws_agx_life_entry *
@@ -22189,6 +25136,14 @@ struct macws_iosurface_release_pair {
 static __thread struct macws_iosurface_release_pair
     g_macws_iosurface_release_pair;
 
+enum {
+    MACWS_IOSURFACE_RELEASE_UNKNOWN = 0,
+    MACWS_IOSURFACE_RELEASE_SELECTOR1 = 1,
+    MACWS_IOSURFACE_RELEASE_NATIVE = 2,
+};
+static _Atomic int g_macws_iosurface_release_mode =
+    MACWS_IOSURFACE_RELEASE_UNKNOWN;
+
 static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
                                      const uint8_t expected[16]) {
     if (!header || header->magic != MH_MAGIC_64)
@@ -22339,11 +25294,49 @@ kern_return_t IOConnectTrap1_new(io_connect_t connect, uint32_t index,
     BOOL exact_second = exact_image && return_offset == 0x4bf4 &&
         call_instruction == 0x940035fe && index == 5;
 
+    // The selector-1 translation is only correct for kernels whose own
+    // IOSurface framework releases with IOConnectCallMethod(conn, 1, ...).
+    // iOS 16.5 (iPad14,5 20F66; static disasm of its dyld cache 2026-11-09)
+    // uses exactly the macOS trap pair, IOConnectTrap1(conn, 4/5, surfaceID),
+    // and rejects selector 1 for every surface: MACWS_MEMDIAG recorded
+    // 476/476 failed releases while WindowServer's mapped nonvolatile
+    // IOSurface memory grew to 4.5 GB within 20 s of opening Weather.
+    // Decide once, functionally: the first pair tries selector 1; if the
+    // kernel rejects it, the same surface is released with the native
+    // traps and, when trap 5 succeeds, every later pair is passed through
+    // unchanged.  A kernel that accepts selector 1 keeps the translation.
+    int release_mode = atomic_load_explicit(&g_macws_iosurface_release_mode,
+                                            memory_order_acquire);
+    if (release_mode == MACWS_IOSURFACE_RELEASE_NATIVE &&
+        (exact_first || exact_second)) {
+        // A pair whose first half was swallowed before the mode was decided
+        // still owes the kernel its trap 4.
+        if (exact_second && g_macws_iosurface_release_pair.armed &&
+            g_macws_iosurface_release_pair.connect == connect &&
+            g_macws_iosurface_release_pair.surface_id == p1)
+            IOConnectTrap1(connect, 4, p1);
+        g_macws_iosurface_release_pair.armed = NO;
+        kern_return_t result = IOConnectTrap1(connect, index, p1);
+        if (exact_second)
+            macws_purgediag_release(connect, (uint32_t)p1, result);
+        if (result != KERN_SUCCESS) {
+            static _Atomic unsigned long native_failures = 0;
+            unsigned long n = atomic_fetch_add(&native_failures, 1) + 1;
+            if (n <= 16 || (n % 500) == 0)
+                dprintf(STDERR_FILENO,
+                    "#### IOSURFACE-RELEASE-ABI native trap%u failure #%lu: "
+                    "conn=%u surfaceID=%llu -> %#x\n", index, n, connect,
+                    (unsigned long long)p1, result);
+        }
+        return result;
+    }
+
     if (exact_first) {
         g_macws_iosurface_release_pair =
             (struct macws_iosurface_release_pair){connect, p1, YES};
-        // iOS has no first operation.  Its sole release selector belongs at
-        // the second call site, after macOS has released client+0x60.
+        // iOS 16.3 has no first operation.  Its sole release selector
+        // belongs at the second call site, after macOS has released
+        // client+0x60.
         return KERN_SUCCESS;
     }
 
@@ -22354,16 +25347,44 @@ kern_return_t IOConnectTrap1_new(io_connect_t connect, uint32_t index,
         uint64_t surface_id = p1;
         kern_return_t result = IOConnectCallScalarMethod(
             connect, 1, &surface_id, 1, NULL, NULL);
+        if (release_mode == MACWS_IOSURFACE_RELEASE_UNKNOWN) {
+            if (result == KERN_SUCCESS) {
+                atomic_store_explicit(&g_macws_iosurface_release_mode,
+                    MACWS_IOSURFACE_RELEASE_SELECTOR1, memory_order_release);
+                dprintf(STDERR_FILENO,
+                    "#### IOSURFACE-RELEASE-ABI mode=selector1 (sel=1 accepted "
+                    "for surfaceID=%llu)\n", (unsigned long long)p1);
+            } else {
+                kern_return_t trap4 = IOConnectTrap1(connect, 4, p1);
+                kern_return_t trap5 = IOConnectTrap1(connect, 5, p1);
+                if (trap5 == KERN_SUCCESS) {
+                    atomic_store_explicit(&g_macws_iosurface_release_mode,
+                        MACWS_IOSURFACE_RELEASE_NATIVE, memory_order_release);
+                }
+                dprintf(STDERR_FILENO,
+                    "#### IOSURFACE-RELEASE-ABI probe surfaceID=%llu sel=1 -> "
+                    "%#x; native trap4 -> %#x trap5 -> %#x; mode=%s\n",
+                    (unsigned long long)p1, result, trap4, trap5,
+                    trap5 == KERN_SUCCESS ? "native-traps" : "undecided");
+                if (trap5 == KERN_SUCCESS) result = KERN_SUCCESS;
+            }
+        }
+        macws_purgediag_release(connect, (uint32_t)p1, result);
         static _Atomic unsigned long release_count = 0;
         unsigned long release_n = macws_runtime_diagnostics_enabled()
             ? atomic_fetch_add(&release_count, 1) + 1 : 0;
         if ((release_n &&
              (release_n <= 16 || (release_n % 250) == 0)) ||
             result != KERN_SUCCESS) {
-            fprintf(stderr,
-                "#### IOSURFACE-RELEASE-ABI pair #%lu: conn=%u "
-                "surfaceID=%llu sel=1 -> %#x\n",
-                release_n, connect, (unsigned long long)p1, result);
+            static _Atomic unsigned long failure_count = 0;
+            unsigned long failure_n = result != KERN_SUCCESS
+                ? atomic_fetch_add(&failure_count, 1) + 1 : 0;
+            if (release_n || failure_n <= 16 || (failure_n % 500) == 0)
+                dprintf(STDERR_FILENO,
+                    "#### IOSURFACE-RELEASE-ABI pair #%lu: conn=%u "
+                    "surfaceID=%llu sel=1 -> %#x (failures=%lu)\n",
+                    release_n, connect, (unsigned long long)p1, result,
+                    failure_n);
         }
         return result;
     }
@@ -22526,6 +25547,7 @@ __thread struct MacWSNoCopyScope *g_macws_nocopy_scope;
 // record. Runtime-confirmed native probes:
 //   * iPadOS 16.0/16.3 rejects 0x78 and accepts the legacy 0x70 shape.
 //   * iPadOS 16.5.1 / 20F75 accepts exactly 0x78 and rejects 0x70.
+//   * iPadOS 16.5 / 20F66 (iPad14,5) behaves like 20F75 (0x78 accepted).
 // Negotiate at the read-only query boundary: preserve the producer's native
 // request first and retry the known legacy size only after the kernel returns
 // kIOReturnBadArgument. This is capability-based and fail-closed; other
@@ -23692,6 +26714,11 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         }
     }
     if (qbuf) free(qbuf);
+    if (macws_memdiag_enabled())
+        macws_purgediag_ioconnect(client, selector, in, inCnt, out, outCnt,
+                                  outStruct, outStructCnt, r,
+                                  IOConnectIsIOGPU(client) ? 1 : 0,
+                                  __builtin_return_address(0));
     return r;
 }
 IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt) {
