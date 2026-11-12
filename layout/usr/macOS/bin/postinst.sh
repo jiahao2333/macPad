@@ -1941,6 +1941,20 @@ if [ -d "$ROOTFS/opt/local" ]; then
     echo "[INFO] Processed $MACHO_COUNT MacPorts files"
 fi
 
+# Field notes §62: persist the Safari-over-HTTPS route proven in §61 (r93).
+# All three steps are idempotent and non-fatal for the package install.
+#  - macOS trustd/securityd: project signature once (backup kept), CDHashes
+#    admitted; macos_gui.sh re-admits them and bootstraps the jobs per start.
+#  - WebKit/Safari overlay XPC bundles + chroot index (WebKit only, not --all),
+#    MacWSXPCProxy 0755 + MacWSXPCProxy.priv 4755.
+#  - Optional: Safari first-run onboarding state (one key, backup kept).
+bash /var/jb/usr/macOS/bin/macws_macos_trust_services.sh --install ||
+    echo "[WARN] macOS trustd/securityd install step reported errors (HTTPS may fail)"
+bash /var/jb/usr/macOS/bin/macws_webkit_overlay_install.sh ||
+    echo "[WARN] WebKit overlay route install reported errors"
+/var/jb/usr/bin/python3 /var/jb/usr/macOS/bin/macws_safari_first_run.py ||
+    echo "[WARN] Safari onboarding pre-seed failed (optional)"
+
 # Input protocol receivers map libmachook/macwsinputd for their complete
 # lifetime.  Replacing the files on disk cannot update a running Dock or input
 # broker; runtime disassembly on 2026-09-07 showed a live ABI-5 Dock rejecting

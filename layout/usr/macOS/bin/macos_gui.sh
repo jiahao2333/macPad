@@ -3759,6 +3759,28 @@ publish_settings_service_contracts() {
     log "Private macOS ViewBridge, ExtensionKit, HIServices and GeoServices contracts ready."
 }
 
+# macOS trustd/securityd back TLS for Safari/WebKit (field notes §61.6, §62).
+# Their CDHashes live in Dopamine's reboot-volatile trustcache and the jobs
+# are not RunAtLoad-scanned, so re-admit the on-disk hashes (computed now from
+# the rootfs images, never hard-coded) and bootstrap both into the system
+# domain on every GUI start. Idempotent: running jobs are left alone.
+# Non-fatal by design: without them only HTTPS breaks (-1202/-9807), the
+# desktop itself does not depend on them.
+ensure_macos_trust_services() {
+    local helper=/var/jb/usr/macOS/bin/macws_macos_trust_services.sh
+    if [ ! -f "$helper" ]; then
+        log "WARN: $helper missing; macOS trustd/securityd not started (HTTPS will fail)."
+        return 0
+    fi
+    if bash "$helper" --start >> "$LOGDIR/macos-trust-services.log" 2>&1; then
+        log "macOS trustd/securityd ready (com.macwsguide.trustd / com.macwsguide.securityd)."
+    else
+        log "WARN: macOS trustd/securityd not fully ready; HTTPS may fail. See $LOGDIR/macos-trust-services.log"
+        tail -n 8 "$LOGDIR/macos-trust-services.log" 2>/dev/null || true
+    fi
+    return 0
+}
+
 publish_desktop_operation_services() {
     local plist="" label="" authd_pid="" waited=0
     [ -x "$CSNAMEDDATA_PROXY" ] || {
@@ -4893,6 +4915,8 @@ start_macos() {
     publish_settings_service_contracts || return 1
     log "Publishing Ventura authorization and DesktopServices helpers..."
     publish_desktop_operation_services || return 1
+    log "Publishing macOS trustd/securityd for TLS (non-fatal)..."
+    ensure_macos_trust_services
 
     log "Loading legacy macOS launchservicesd..."
     launchctl load "$LAUNCHSERVICESD_PLIST" || return 1

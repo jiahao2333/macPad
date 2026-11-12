@@ -2253,3 +2253,69 @@ Three crash causes and one trust-stack gap were fixed in order:
 * MacWSXPCProxy unchanged (`125451486bdee2858e5845a6ef3ec344dd37d202`).
 * Unchanged: `com.macwsguide.webkit.*` LaunchDaemons unloaded, no public `macosbooter.WebKit.*` listeners,
   no `XPC_FLAGS=8019` in helpers, IconServices 1724 / 53067 (uid 240) / 53071, GIGACAGE_ENABLED=0.
+
+## 62. Persisting the Safari-over-HTTPS route: trustd/securityd at GUI start, WebKit overlays in postinst (net62) (2026-11-12 11:27–11:30 CST)
+
+§61 got Safari painting HTTPS (r93), but part of that state was set up by hand and would not survive a reboot or a reinstall.
+net62 moves each manual step into the startup or install path. Only scripts changed: libmachook stays net39i
+(arm64e `5511ed9a…`, arm64 `b09c891e…`), MacWSXPCProxy stays `12545148…`, and no Apple binaries are in the repo.
+
+### What was persisted where
+| §61 manual step | now | survives |
+|---|---|---|
+| `jbctl trustcache add` trustd `e593548e…` / securityd `80cc8210…` | `macws_macos_trust_services.sh --start`, called from `macos_gui.sh` `start_macos` → `ensure_macos_trust_services` (after `publish_desktop_operation_services`). CDHashes are **computed at runtime** with `ldid -arch arm64e/arm64 -h` from the rootfs files and checked against `jbctl trustcache info`; only missing ones are added. The step also covers the launch images HIServicesProxy `d8c80286…` and MacWSXPCProxy `12545148…`. | reboot (re-run on every GUI start) |
+| `launchctl bootstrap system …/com.macwsguide.{trustd,securityd}.plist` | same helper: a job that is already running is skipped; a job that is loaded but has no pid is removed and re-bootstrapped; otherwise `bootstrap system` (falls back to `load`), then a wait of up to 10 s for a pid. Logs go to `/var/mobile/macws-trust-services.log` and `$LOGDIR/macos-trust-services.log`. **Non-fatal:** `ensure_macos_trust_services` always returns 0, so a failure only breaks HTTPS, not the desktop. | reboot |
+| trustd/securityd project signature (done on 2026-11-10 with `macws_admit_rootfs_binary.sh`) | `postinst.sh` → `macws_macos_trust_services.sh --install`: runs `macws_admit_rootfs_binary.sh` (backup, thin arm64e, project + native entitlements, trustcache) only when the `graphics-restart-no-kill` marker is missing. | fresh install |
+| WebKit overlays `1f63cdec…`/`4769e823…`/`81b3b853…`/`a41f7ab3…` + index (net39 `gen.sh`) | `postinst.sh` → `macws_webkit_overlay_install.sh`: MacWSXPCProxy root:wheel 0755; `.priv` byte copy, root:wheel 4755; CDHash admitted; `macws_xpc_overlay_gen.py` run for WebContent/Networking/GPU + Safari SandboxBroker **only** (never `--all`); verifies every overlay hard link matches the proxy (0755) and `.priv` (4755). `--remove` deletes only these overlays. | fresh install (the overlays live on disk and already survive a reboot) |
+| MacWSXPCProxy binary | `Makefile` SUBPROJECTS now includes `XPCOverlayChrootProxy`, so the package ships `/var/jb/usr/macOS/libexec/MacWSXPCProxy`. A rebuild from this tree matches the deployed proxy's `__text` byte for byte (0x37d8 bytes, otool sha1 `95d7ef05…`). The CDHash differs only because the on-device copy was re-signed with the device's entitlements.plist. | fresh install |
+| Safari `WBSOnboardingStatesDefaultsKeyV0.2` | `postinst.sh` → `macws_safari_first_run.py` (optional): writes the one key only if it is absent and backs up to `/var/mobile/macws-rollback/com.apple.Safari.plist.pre-onboarding-<ts>`. This is app UI, not a system fix: it is kept only so that a fresh install does not stop on a modal sheet, and it can be skipped. cfprefsd picks it up at its next start. | fresh install |
+
+Why trust admission does not go into `macws_admit_rootfs_binary.sh`: that script **re-signs** the file, which changes the CDHash and writes a new backup every run.
+It is a one-time install step. The per-boot step must only re-admit the existing on-disk hashes, which is what `--start` does.
+Why it does not go into `restore_cold_boot_trust`: that path is fatal for GUI start, and TLS must not be.
+
+### Verification on the device (no reboot)
+* 11:27:50 CST deployed `macos_gui.sh` (repo version) and the three helpers. Backup tag `pre-net62-20261112-112750`
+  holds the old `macos_gui.sh`, a tar of the overlays and index, and the Safari plist.
+* 11:28:14–11:28:24 CST simulated a cold start. `launchctl bootout` of both jobs left both unloaded after 4 s. Then the `ensure_macos_trust_services`
+  function, extracted verbatim from the deployed `macos_gui.sh`, ran in 1 s: trustd pid 40989 and securityd pid 41003 came up and were still alive 5 s later.
+  A second `--start` skipped both jobs (idempotent). All four CDHashes were already present, so the "trust added" branch could not be exercised without a reboot.
+* 11:28:31 CST ran the postinst steps live: trust `--install` reported "already project-signed" and made no change. The overlay install regenerated the same 4 keys and index
+  (`SUMMARY ok=4`, link count 5 kept), and the onboarding step left the existing key untouched.
+* 11:29:03–11:29:41 CST, run r62: one guarded Safari run (net39 `safari.sh` harness, example.com only, 20 s capture timeout). `LAUNCH_WINDOW_OK`, `CAPTURE_OK`.
+  Screenshot `~/net62-shots/r62-example.png` (Mac, not committed) shows example.com painted with the padlock. The 23 new helper logs
+  (1 GPU, 1 Networking, 1 Safari, 20 WebContent) contain 0 `-9807`/`-1202`/"Failed to talk to trustd" lines and 0 crash markers. CORE_OK, `com.macwsguide.webkit.*` still unloaded,
+  IconServices 1724/53067/53071 untouched. Free memory fell to 28 MB during the load and was back to 1399 MB after cleanup (same pattern as §61).
+
+### Still needs a real reboot
+* The "missing CDHash → `jbctl trustcache add`" branch, and the first GUI start after the jailbreak with trustd/securityd absent.
+* Whether Dopamine restores MacWSXPCProxy/HIServicesProxy trust by itself. `--start` re-admits both anyway.
+
+### Device drift found (repo vs `/var/jb/usr/macOS`)
+* The deployed `macos_gui.sh` was the `8b53f0a` version: it still set the legacy WebKit `*Proxy` images to 4755 instead of 0755 + `.priv` 4755. It is now replaced by the repo version.
+* The deployed `postinst.sh` predates `95dc8da` (it has no `ensure_cydia_substrate_rootfs`). It was **not** replaced, because a full postinst run re-signs many files. The net62 postinst steps were run individually.
+* Several `*-entitlements.plist` files and LaunchDaemon plists differ from the repo (runtime-rewritten or older package). `macws_xpc_overlay_gen.py` and the trustd/securityd plists match the repo.
+
+### Rollback
+* Scripts: `sh /var/mobile/net62/rollback.sh pre-net62-20261112-112750` restores the old `macos_gui.sh` and overlays, removes the helpers, and keeps trustd/securityd running.
+* Stop the services: `launchctl bootout system/com.macwsguide.trustd` and `…/com.macwsguide.securityd`.
+* WebKit overlays only: `bash macws_webkit_overlay_install.sh --remove`.
+
+## How it works (中文摘要)
+
+Safari 在 iPad 上加载 HTTPS 页面的完整链路：
+
+1. **拦截**：libmachook 注入 macOS 进程。Safari/WebKit 调用 `xpc_connection_create("com.apple.WebKit.*")` 去连接自己 `XPCServices` 里的 helper 时，libmachook 查 chroot 内的索引
+   `/usr/local/var/macws-xpc-overlay/<key>`（key = bundle realpath 的 FNV-1a-64）。
+2. **注册**：libmachook 用 `xpc_add_bundle` 把对应的 overlay bundle（`/var/jb/usr/macOS/libexec/macws-xpc-overlay/<key>/<leaf>.xpc`）注册成由 iOS launchd 管理的 Application 类型任务。
+   `com.apple.WebKit.*` 这个前缀被 iOS 保留，所以改用别名 `com.macwsguide.xpc.com.apple.WebKit.*` 注册和连接。
+3. **启动**：iOS 的 xpcproxy 启动 bundle 里的 `MacWSXPCProxy`（0755，这样才能拿到一次性 receive right）。它再经 `.priv`（setuid 4755）获得 chroot 权限，
+   然后 chroot 到 macOS rootfs，带着 libmachook `exec` 原版的 macOS helper（WebContent / Networking / GPU / SandboxBroker），原版的 `xpc_main` 照常运行。
+4. **WebKit helper 修复**（libmachook，§61）：不把队列改到主线程（否则 `dispatch_sync` 主线程死锁）；不对 WebKit 做偏移 hook（会写坏共享缓存代码）；
+   `AuxiliaryProcess::initializeSandbox` 改为空操作（iOS 内核不支持 macOS sandbox）。
+5. **TLS**：Networking 进程验证证书靠 macOS trustd/securityd。它们由 `com.macwsguide.trustd/securityd` 在私有 Mach 名
+   `com.apple.macosbooter.trustd` / `com.apple.macosbooter.SecurityServer` 上提供，libmachook 把 `com.apple.trustd` 重定向到这些名字。
+
+固化方式：第 1–4 步的 overlay 文件留在磁盘上，重启后仍在；全新安装时由 `postinst.sh` → `macws_webkit_overlay_install.sh` 重新生成。
+第 5 步的 trustcache 和 launchd 任务重启后会丢失，所以每次 GUI 启动都由 `macos_gui.sh` → `macws_macos_trust_services.sh --start` 重新登记 CDHash（运行时现算）并拉起服务。
+这一步失败不会阻塞桌面启动。
