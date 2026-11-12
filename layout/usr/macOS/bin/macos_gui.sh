@@ -3781,6 +3781,31 @@ ensure_macos_trust_services() {
     return 0
 }
 
+# macOS Safari's Safe Browsing lookup has no working provider here: the
+# com.apple.Safari.SafeBrowsing.Service Mach name resolves to the iPadOS
+# service, which accepts the connection and never answers the Ventura client.
+# WebKit holds every http(s) main-frame navigation until both the policy
+# delegate and the Safe Browsing result arrive, so once Safari had fetched its
+# remote configuration (first successful TLS session, field notes §63) every
+# page stayed blank with a spinning address bar. Turn the lookup off through
+# the live macOS cfprefsd (a direct plist edit would be overwritten by its
+# cache). Idempotent; non-fatal (only Safari's fraud warning depends on it).
+ensure_safari_safe_browsing_off() {
+    local key value
+    for key in WarnAboutFraudulentWebsites \
+               com.apple.Safari.ContentPageGroupIdentifier.WebKit2SafeBrowsingEnabled; do
+        value=$(HOME=/var/root run_defaults_utility read com.apple.Safari "$key" 2>/dev/null | tail -n 1)
+        [ "$value" = 0 ] && continue
+        if HOME=/var/root run_defaults_utility write com.apple.Safari "$key" -bool false >/dev/null 2>&1 &&
+           [ "$(HOME=/var/root run_defaults_utility read com.apple.Safari "$key" 2>/dev/null | tail -n 1)" = 0 ]; then
+            log "Safari Safe Browsing lookup disabled ($key=0; iPadOS provider never replies)."
+        else
+            log "WARN: could not set Safari $key=0; Safari page loads may hang (field notes §63)."
+        fi
+    done
+    return 0
+}
+
 publish_desktop_operation_services() {
     local plist="" label="" authd_pid="" waited=0
     [ -x "$CSNAMEDDATA_PROXY" ] || {
@@ -4917,6 +4942,7 @@ start_macos() {
     publish_desktop_operation_services || return 1
     log "Publishing macOS trustd/securityd for TLS (non-fatal)..."
     ensure_macos_trust_services
+    ensure_safari_safe_browsing_off
 
     log "Loading legacy macOS launchservicesd..."
     launchctl load "$LAUNCHSERVICESD_PLIST" || return 1

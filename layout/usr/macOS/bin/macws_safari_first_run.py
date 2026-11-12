@@ -30,6 +30,12 @@ VALUE = {
 }
 
 
+SAFE_BROWSING_OFF = {
+    "WarnAboutFraudulentWebsites": False,
+    "com.apple.Safari.ContentPageGroupIdentifier.WebKit2SafeBrowsingEnabled": False,
+}
+
+
 def main(argv):
     root_prefs = os.path.dirname(PLIST)
     if not os.path.isdir(os.path.dirname(root_prefs)):
@@ -41,11 +47,17 @@ def main(argv):
             raw = f.read()
         fmt = plistlib.FMT_XML if raw.lstrip().startswith(b"<") else plistlib.FMT_BINARY
         data = plistlib.loads(raw)
-    if KEY in data:
-        print("[INFO] Safari onboarding state already present; unchanged")
+    # §63: Safe Browsing lookups go to the iPadOS service, which never
+    # replies, and WebKit then holds every http(s) navigation. macos_gui.sh
+    # enforces this through cfprefsd on every start; seed it here too.
+    missing = {k: v for k, v in SAFE_BROWSING_OFF.items() if data.get(k) != v}
+    if KEY not in data:  # onboarding: only when absent, never overwrite Safari's own state
+        missing[KEY] = VALUE
+    if not missing:
+        print("[INFO] Safari onboarding/Safe Browsing state already present; unchanged")
         return 0
     if "--check" in argv:
-        print("[INFO] Safari onboarding state absent")
+        print("[INFO] Safari onboarding/Safe Browsing state incomplete: %s" % sorted(missing))
         return 1
     if os.path.exists(PLIST):
         os.makedirs(ROLLBACK, exist_ok=True)
@@ -55,7 +67,7 @@ def main(argv):
         print("[INFO] backup %s" % backup)
     else:
         os.makedirs(root_prefs, exist_ok=True)
-    data[KEY] = VALUE
+    data.update(missing)
     tmp = PLIST + ".macws-new"
     with open(tmp, "wb") as f:
         plistlib.dump(data, f, fmt=fmt)

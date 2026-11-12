@@ -2319,3 +2319,38 @@ Safari 在 iPad 上加载 HTTPS 页面的完整链路：
 固化方式：第 1–4 步的 overlay 文件留在磁盘上，重启后仍在；全新安装时由 `postinst.sh` → `macws_webkit_overlay_install.sh` 重新生成。
 第 5 步的 trustcache 和 launchd 任务重启后会丢失，所以每次 GUI 启动都由 `macos_gui.sh` → `macws_macos_trust_services.sh --start` 重新登记 CDHash（运行时现算）并拉起服务。
 这一步失败不会阻塞桌面启动。
+
+## 63. After a macOS GUI restart, Safari loads no web pages: Safe Browsing lookup never answered (2026-11-12 CST)
+
+**Symptom.** At about 11:36 CST the user restarted the macOS GUI (not the iPad). Safari opened, but every http(s) page stayed blank and the address bar kept spinning. TLS was fine: trustd/securityd from §62 were running, and the trust evaluation result was 0. Screenshot: `net62-shots/r63-user-now.png`.
+
+**Diagnosis (11:36–11:50 CST).**
+- WebKit logged `decidePolicyForNavigationAction` for each http(s) main-frame load, but the listener was never called.
+- Back/forward and local loads decided normally.
+- Removing the SandboxBroker overlay (restored afterwards) did not help, and neither did restarting the iOS `com.apple.Safari.SafeBrowsing.Service`.
+- Safari's prefs showed that its remote configuration (UserAgentQuirks, AutoplayPolicy, …) had been fetched after 11:34, the first time TLS worked end to end. After that, Safe Browsing lookups became active.
+- The `com.apple.Safari.SafeBrowsing.Service` Mach name resolves to the **iPadOS** service. It accepts the Ventura client's connection but never answers, and WebKit holds the navigation until the Safe Browsing verdict arrives.
+
+**Fix.** Safe Browsing is turned off through the live macOS cfprefsd. A direct plist edit would be overwritten by cfprefsd's cache. The keys, in domain `com.apple.Safari` for root, are:
+- `WarnAboutFraudulentWebsites = false`
+- `com.apple.Safari.ContentPageGroupIdentifier.WebKit2SafeBrowsingEnabled = false`
+
+Manual test r63e at 11:50:21 CST: decide=30 and listener=29; example.com and baidu rendered with the padlock (`r63e-example.png`, `r63e-baidu.png`).
+
+**Persisted.**
+- `macos_gui.sh`: new `ensure_safari_safe_browsing_off()`, called in `start_macos` right after `ensure_macos_trust_services`. It reads each key with `run_defaults_utility` (HOME=/var/root) and writes `-bool false` only when the value is not already 0. It is non-fatal.
+- `macws_safari_first_run.py` (postinst) also seeds both keys. The onboarding key is still only written when absent, and a backup is taken first.
+
+**Verification.**
+- Deployed at 11:53:47 CST. Rollback tag `pre-net63-20261112-115347`, which holds the previous `macos_gui.sh` and `macws_safari_first_run.py`, is under `/var/mobile/macws-rollback/`.
+- Function harness at 11:53:52 CST: both keys were forced to true, then the function set them back to 0 with rc=0. A second run was a no-op, and `macws_safari_first_run.py --check` passed (rc=0).
+- Safari was relaunched for the user at 11:54:16 CST and baidu.com rendered fully (`r63f-user-safari.png`).
+
+**Rollback.**
+- Copy the two files back from the rollback tag.
+- To re-enable Safe Browsing, run `run_bash.sh -c 'HOME=/var/root defaults write com.apple.Safari WarnAboutFraudulentWebsites -bool true'` and do the same for the WebKit2 key. The pre-change plist is in `/var/mobile/macws-rollback/com.apple.Safari.plist.pre-net63-*`.
+
+**Cost.** Safari no longer shows fraudulent-site warnings. A real Safe Browsing provider would need a macOS SafeBrowsing service published on a private Mach name, like trustd in §62.
+
+### 中文摘要
+重启 macOS 后网页打不开，并不是 TLS 的问题。原因是 Safari 拿到远程配置以后开始做“安全浏览（Safe Browsing）”查询，而这个服务名指向的是 iPadOS 自带的服务，它对 macOS Safari 的请求永远不回复，所以每次导航都卡在策略决策这一步。现在每次启动 macos_gui.sh 都会通过 cfprefsd 把两个 Safe Browsing 开关设为 false（幂等、失败不影响启动），postinst 也会写入这两个值。代价是 Safari 不再显示“欺诈网站”警告。
